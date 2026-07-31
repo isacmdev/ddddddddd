@@ -1,0 +1,110 @@
+<Page
+    x:Class="ControlParental.App.UI.DemoStepPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="using:Microsoft.UI.Xaml.Controls">
+    <Grid>
+        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24">
+            <StackPanel MaxWidth="600" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <!-- Header -->
+                <TextBlock
+                    Text="{x:Bind Strings.DemoTitle, Mode=OneTime}"
+                    FontSize="28"
+                    FontWeight="Bold"
+                    Foreground="#1A1A1A"
+                    HorizontalAlignment="Center"
+                    Margin="0,24,0,16" />
+
+                <TextBlock
+                    Text="{x:Bind Strings.DemoDescription, Mode=OneTime}"
+                    FontSize="16"
+                    TextWrapping="Wrap"
+                    Foreground="#666666"
+                    HorizontalAlignment="Center"
+                    Margin="0,0,0,48" />
+
+                <!-- Demo Card -->
+                <Border Background="White" CornerRadius="8" Padding="32" Margin="0,0,0,24" HorizontalAlignment="Center">
+                    <StackPanel HorizontalAlignment="Center">
+                        <!-- Demo Animation / Icon -->
+                        <Border Width="120" Height="120" CornerRadius="60" Background="#0078D4" HorizontalAlignment="Center" Margin="0,0,0,24">
+                            <Grid>
+                                <TextBlock
+                                    Text="3"
+                                    FontSize="48"
+                                    FontWeight="Bold"
+                                    Foreground="White"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Visibility="{Binding IsDemoRunning, Converter={StaticResource BoolToVisibility}}" />
+                                <TextBlock
+                                    Text="!"
+                                    FontSize="48"
+                                    FontWeight="Bold"
+                                    Foreground="White"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Visibility="{Binding IsCompleted, Converter={StaticResource BoolToVisibility}}" />
+                            </Grid>
+                        </Border>
+
+                        <!-- Countdown Text -->
+                        <TextBlock
+                            Text="{Binding CountdownText}"
+                            FontSize="72"
+                            FontWeight="Bold"
+                            Foreground="#0078D4"
+                            HorizontalAlignment="Center"
+                            Margin="0,0,0,8"
+                            Visibility="{Binding IsDemoRunning, Converter={StaticResource BoolToVisibility}}" />
+
+                        <TextBlock
+                            Text="{x:Bind Strings.DemoSeconds, Mode=OneTime}"
+                            FontSize="16"
+                            Foreground="#666666"
+                            HorizontalAlignment="Center"
+                            Margin="0,0,0,24"
+                            Visibility="{Binding IsDemoRunning, Converter={StaticResource BoolToVisibility}}" />
+
+                        <!-- Status Text -->
+                        <TextBlock
+                            Text="{x:Bind Strings.DemoInProgress, Mode=OneTime}"
+                            FontSize="18"
+                            Foreground="#1A1A1A"
+                            HorizontalAlignment="Center"
+                            Visibility="{Binding IsDemoRunning, Converter={StaticResource BoolToVisibility}}" />
+
+                        <TextBlock
+                            Text="{x:Bind Strings.DemoCompleted, Mode=OneTime}"
+                            FontSize="18"
+                            FontWeight="SemiBold"
+                            Foreground="#107C10"
+                            HorizontalAlignment="Center"
+                            Visibility="{Binding IsCompleted, Converter={StaticResource BoolToVisibility}}" />
+
+                        <!-- Error Message -->
+                        <TextBlock
+                            Text="{Binding ErrorMessage}"
+                            Foreground="#D13438"
+                            FontSize="14"
+                            TextWrapping="Wrap"
+                            HorizontalAlignment="Center"
+                            Visibility="{Binding HasError, Converter={StaticResource BoolToVisibility}}"
+                            Margin="0,16,0,0" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Run Demo Button -->
+                <Button
+                    Content="{x:Bind Strings.DemoRunAction, Mode=OneTime}"
+                    Padding="32,16"
+                    Background="#0078D4"
+                    Foreground="White"
+                    FontSize="16"
+                    HorizontalAlignment="Center"
+                    Command="{Binding RunDemoCommand}"
+                    IsEnabled="{Binding IsDemoRunning, Converter={StaticResource InverseBool}}" />
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

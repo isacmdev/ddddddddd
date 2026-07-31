@@ -1,0 +1,56 @@
+schema: spec-driven
+
+context: |
+  Tech stack: .NET 9.0, C#, WinUI 3 (Windows App SDK 1.6.0), EF Core 9.0 + SQLite
+  Architecture: Clean/Hexagonal — Domain (pure net9.0), Service (windows-specific), SessionAgent (overlay), App.UI (WinUI 3)
+  Testing: xUnit 2.9.2, Moq 4.20.72, NSubstitute 5.1.0, FluentAssertions 6.12.2, RichardSzalay.MockHttp 1.1.2, EF Core InMemory
+  Quality: StyleCop.Analyzers, .editorconfig, TreatWarningsAsErrors in CI, Central Package Management
+  Persistence: openspec (B1) — interactive mode, ask-always delivery, 400-line review budget
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns
+    tdd: false
+    test_command: dotnet test --no-build --verbosity normal
+  verify:
+    test_command: dotnet test --verbosity normal
+    build_command: dotnet build --no-restore
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
+
+strict_tdd: false
+
+testing:
+  unit:
+    available: true
+    runner: xunit
+    command: dotnet test --no-build --verbosity normal
+    frameworks:
+      - xunit 2.9.2
+      - Moq 4.20.72
+      - NSubstitute 5.1.0
+      - FluentAssertions 6.12.2
+  integration:
+    available: true
+    tools:
+      - Microsoft.EntityFrameworkCore.InMemory 9.0.0
+      - Microsoft.Extensions.DependencyInjection 9.0.0
+  e2e:
+    available: false
+    reason: Appium.WebDriver present but unconfigured
+  coverage:
+    available: true
+    tool: coverlet.collector 6.0.2
+    command: dotnet test --collect:"XPlat Code Coverage"

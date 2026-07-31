@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Puro .NET: Domain y sus tests no dependen de Windows SDK -->
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>ControlParental.Domain.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- CPM deshabilitado: usamos referencias directas para tests -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SelfContained>false</SelfContained>
+    <Platforms>AnyCPU;x64</Platforms>
+  </PropertyGroup>
+
+  <!-- Tests puros: DI + xunit para tests descubribles -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <!-- Asegurar que los paquetes se copien al output para el test host -->
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ControlParental.Domain\ControlParental.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

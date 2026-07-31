@@ -1,0 +1,106 @@
+# EditorConfig for ControlParental
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{cs,csx}]
+indent_size = 4
+
+[*.{props,targets,yml,yaml,json,jsonc}]
+indent_size = 2
+
+[*.{resx,resw}]
+indent_size = 2
+
+# C# formatting
+[*.cs]
+# Naming
+dotnet_naming_rule.interface_should_be_begins_with_i.severity = warning
+dotnet_naming_rule.interface_should_be_begins_with_i.symbols = interface
+dotnet_naming_rule.interface_should_be_begins_with_i.style = begins_with_i
+
+dotnet_naming_symbols.interface.applicable_kinds = interface
+dotnet_naming_symbols.interface.applicable_accessibilities = public, internal
+
+dotnet_naming_style.begins_with_i.required_prefix = I
+dotnet_naming_style.begins_with_i.capitalization = pascal_case
+
+# Style rules
+dotnet_analyzer_diagnostic.category-C#-Style.severity = warning
+dotnet_analyzer_diagnostic.SA0001.severity = none
+dotnet_analyzer_diagnostic.SA1101.severity = none
+dotnet_analyzer_diagnostic.SA1200.severity = none
+dotnet_analyzer_diagnostic.SA1201.severity = warning
+dotnet_analyzer_diagnostic.SA1202.severity = warning
+dotnet_analyzer_diagnostic.SA1203.severity = warning
+dotnet_analyzer_diagnostic.SA1204.severity = warning
+dotnet_analyzer_diagnostic.SA1309.severity = warning
+dotnet_analyzer_diagnostic.SA1310.severity = none
+dotnet_analyzer_diagnostic.SA1500.severity = warning
+dotnet_analyzer_diagnostic.SA1505.severity = warning
+dotnet_analyzer_diagnostic.SA1507.severity = warning
+dotnet_analyzer_diagnostic.SA1600.severity = none
+dotnet_analyzer_diagnostic.SA1601.severity = none
+dotnet_analyzer_diagnostic.SA1633.severity = none
+
+# Nullable
+dotnet_diagnostic.nullable.severity = warning
+dotnet_diagnostic.CS8618.severity = warning
+dotnet_diagnostic.CS8599.severity = warning
+
+# ImplicitUsings
+dotnet_diagnostic.IDE0060.severity = none
+dotnet_diagnostic.IDE0005.severity = suggestion
+
+# Roslyn analyzers
+dotnet_diagnostic.CA1062.severity = warning
+dotnet_diagnostic.CA1303.severity = none
+dotnet_diagnostic.CA2007.severity = warning
+
+# JSON files
+[*.json]
+indent_size = 2
+
+# XML files
+[*.xml]
+indent_size = 2
+
+# Project files
+[*.csproj]
+indent_size = 2
+
+# Solution files
+[*.sln]
+indent_size = 2
+
+# Code quality
+[*.cs]
+dotnet_diagnostic.CA1000.severity = warning
+dotnet_diagnostic.CA1018.severity = warning
+dotnet_diagnostic.CA1065.severity = warning
+dotnet_diagnostic.CA1707.severity = warning
+dotnet_diagnostic.CA1711.severity = warning
+dotnet_diagnostic.CA1720.severity = warning
+dotnet_diagnostic.CA1812.severity = warning
+dotnet_diagnostic.CA1822.severity = suggestion
+dotnet_diagnostic.CA2000.severity = warning
+dotnet_diagnostic.CA2200.severity = warning
+dotnet_diagnostic.CA2254.severity = warning
+
+# Async
+dotnet_diagnostic.CA2007.severity = warning
+
+# Security
+dotnet_diagnostic.CA5360.severity = warning
+dotnet_diagnostic.CA5370.severity = warning
+dotnet_diagnostic.CA5371.severity = warning
+dotnet_diagnostic.CA5376.severity = warning
+dotnet_diagnostic.CA5377.severity = warning
+dotnet_diagnostic.CA5378.severity = warning

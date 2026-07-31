@@ -1,0 +1,108 @@
+<Page
+    x:Class="ControlParental.App.UI.TransparencyPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Background="#F3F3F3">
+        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24">
+            <StackPanel MaxWidth="600" HorizontalAlignment="Center">
+
+                <!-- Header -->
+                <TextBlock
+                    Text="¿Qué se monitorea?"
+                    FontSize="28"
+                    FontWeight="Bold"
+                    Foreground="#1A1A1A"
+                    Margin="0,24,0,8" />
+
+                <TextBlock
+                    Text="Información transparente sobre el monitoreo."
+                    FontSize="14"
+                    Foreground="#666666"
+                    Margin="0,0,0,24" />
+
+                <!-- What We Monitor -->
+                <Border Background="White" CornerRadius="8" Padding="24" Margin="0,0,0,16">
+                    <StackPanel>
+                        <TextBlock
+                            Text="Lo que monitoreamos"
+                            FontSize="18"
+                            FontWeight="SemiBold"
+                            Foreground="#107C10"
+                            Margin="0,0,0,16" />
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Clock" FontFamily="Segoe MDL2 Assets" Foreground="#0078D4" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Qué apps usás y cuánto tiempo" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Calendar" FontFamily="Segoe MDL2 Assets" Foreground="#0078D4" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Horarios de uso" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="List" FontFamily="Segoe MDL2 Assets" Foreground="#0078D4" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Límites de tiempo configurados por tus padres" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- What We Don't Monitor -->
+                <Border Background="White" CornerRadius="8" Padding="24" Margin="0,0,0,16">
+                    <StackPanel>
+                        <TextBlock
+                            Text="Lo que NO monitoreamos"
+                            FontSize="18"
+                            FontWeight="SemiBold"
+                            Foreground="#D13438"
+                            Margin="0,0,0,16" />
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Cancel" FontFamily="Segoe MDL2 Assets" Foreground="#D13438" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="El contenido de tus mensajes" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Cancel" FontFamily="Segoe MDL2 Assets" Foreground="#D13438" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Lo que escribís o buscás" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Cancel" FontFamily="Segoe MDL2 Assets" Foreground="#D13438" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Tus contraseñas" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Cancel" FontFamily="Segoe MDL2 Assets" Foreground="#D13438" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Fotos o archivos personales" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,8">
+                            <TextBlock Text="Cancel" FontFamily="Segoe MDL2 Assets" Foreground="#D13438" Margin="0,0,12,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Tu ubicación" TextWrapping="Wrap" Foreground="#1A1A1A" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Privacy Note -->
+                <Border Background="#F3F3F3" CornerRadius="8" Padding="16" Margin="0,0,0,24">
+                    <TextBlock
+                        Text="Esta información solo se comparte con tus padres o tutors para tu protección. No se vende ni se comparte con terceros con fines publicitarios."
+                        FontSize="14"
+                        Foreground="#666666"
+                        TextWrapping="Wrap"
+                        TextAlignment="Center" />
+                </Border>
+
+                <!-- Back Button -->
+                <Button
+                    Content="Volver"
+                    Padding="24,12"
+                    HorizontalAlignment="Stretch"
+                    Background="Transparent"
+                    Foreground="#0078D4"
+                    Click="OnBackClick" />
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

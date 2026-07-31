@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>ControlParental.Obfuscation.Smoke</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <!-- CPM disabled: smoke is a standalone executable that brings its
+         own EF SQLite / JSON dependencies explicitly to avoid clashing
+         with the Domain project (which uses central package management). -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <Platforms>AnyCPU;x64</Platforms>
+    <PublishAot>false</PublishAot>
+    <SelfContained>false</SelfContained>
+    <!-- CA2263 (prefer generic Property<T>) and CA2000 (SqliteConnection
+         ownership is delegated to EF Core) are unavoidable for the
+         reflection-heavy EF model wiring; the smoke is not shipped. -->
+    <NoWarn>$(NoWarn);CA2263;CA2000</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    T23 Obfuscation Closure: Smoke project.
+
+    The smoke project deliberately does NOT ProjectReference the
+    Domain or Service projects: the obfuscated Domain.dll is supplied
+    at runtime via the [domain-dll] argument and loaded into a
+    dedicated `AssemblyLoadContext`. This guarantees that the JSON
+    round-trip and EF Core save/query exercised below operate on the
+    obfuscated types rather than the unobfuscated reference assembly.
+    Property/column names are hardcoded inside SmokeDbContext.cs to
+    keep the smoke self-contained.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.0" />
+  </ItemGroup>
+
+</Project>

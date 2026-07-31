@@ -1,0 +1,14 @@
+<Page
+    x:Class="ControlParental.App.UI.ServiceSetupPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Padding="24">
+        <StackPanel MaxWidth="600" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+            <TextBlock Text="Verify protection setup" FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="The Service will verify that protection and the session agent are active. This step advances only after a confirmed check." TextWrapping="Wrap" />
+            <ProgressRing x:Name="VerificationProgress" IsActive="False" />
+            <TextBlock x:Name="StatusText" TextWrapping="Wrap" />
+            <Button x:Name="VerifyButton" Content="Verify setup" Click="OnVerifyClick" />
+        </StackPanel>
+    </Grid>
+</Page>

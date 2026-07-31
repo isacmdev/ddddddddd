@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <RootNamespace>ControlParental.Service</RootNamespace>
+    <Description>Windows Service - owns SQLite, engine, sync, heartbeat, and hard enforcement</Description>
+    <OutputType>Exe</OutputType>
+    <ApplicationIcon />
+    <StartupObject />
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>AnyCPU;x64</Platforms>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
+
+  <!-- Expose internals to test project for test-only access (StopTimer, etc.) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="ControlParental.Service.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="DotNetEnv" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <PackageReference Include="System.Reactive" />
+    <PackageReference Include="Grpc.Net.Client" />
+    <PackageReference Include="supabase-csharp" />
+    <PackageReference Include="TaskScheduler" />
+    <PackageReference Include="System.Security.Principal.Windows" />
+    <PackageReference Include="System.IO.FileSystem.AccessControl" />
+    <PackageReference Include="System.Management" />
+    <PackageReference Include="StyleCop.Analyzers" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ControlParental.Domain\ControlParental.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

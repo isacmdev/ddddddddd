@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="DisclosureTitle" xml:space="preserve">
+    <value>Data Disclosure</value>
+  </data>
+  <data name="DisclosureBody" xml:space="preserve">
+    <value>This app monitors app usage on this device to protect minors. We collect: time spent per app, names of apps used, and time of use. We do not collect message content or sensitive information.</value>
+  </data>
+  <data name="TransparencyTitle" xml:space="preserve">
+    <value>What is monitored?</value>
+  </data>
+  <data name="TransparencyBody" xml:space="preserve">
+    <value>We monitor which apps you use and for how long. We cannot see what you do inside each app, your messages, or your passwords.</value>
+  </data>
+  <data name="AcceptButton" xml:space="preserve">
+    <value>I accept</value>
+  </data>
+  <data name="ViewTransparencyButton" xml:space="preserve">
+    <value>See what is monitored</value>
+  </data>
+  <data name="PairYourDeviceTitle" xml:space="preserve">
+    <value>Pair your device</value>
+  </data>
+  <data name="PairingDescription" xml:space="preserve">
+    <value>Enter the code your parent gave you to pair this device.</value>
+  </data>
+  <data name="PairingAgeBandPrompt" xml:space="preserve">
+    <value>How old are you?</value>
+  </data>
+  <data name="PairingAgeBandPlaceholder" xml:space="preserve">
+    <value>Select your age</value>
+  </data>
+  <data name="Common.AgeBand_7_12" xml:space="preserve">
+    <value>7-12 years</value>
+  </data>
+  <data name="Common.AgeBand_13_16" xml:space="preserve">
+    <value>13-16 years</value>
+  </data>
+  <data name="Common.AgeBand_17_18" xml:space="preserve">
+    <value>17-18 years</value>
+  </data>
+  <data name="PairingCodePrompt" xml:space="preserve">
+    <value>Pairing code</value>
+  </data>
+  <data name="PairingAction" xml:space="preserve">
+    <value>Pair</value>
+  </data>
+  <data name="BackButton" xml:space="preserve">
+    <value>Back</value>
+  </data>
+  <data name="AccountTitle" xml:space="preserve">
+    <value>Child account</value>
+  </data>
+  <data name="AccountDescription" xml:space="preserve">
+    <value>Create a standard account for the child or convert an existing one.</value>
+  </data>
+  <data name="AccountElevationRequired" xml:space="preserve">
+    <value>Your parent needs to authorize account creation. Ask them to open the app.</value>
+  </data>
+  <data name="AccountUsernameLabel" xml:space="preserve">
+    <value>Username</value>
+  </data>
+  <data name="AccountUsernamePlaceholder" xml:space="preserve">
+    <value>Child's name</value>
+  </data>
+  <data name="AccountPasswordLabel" xml:space="preserve">
+    <value>Password</value>
+  </data>
+  <data name="AccountExistingHeader" xml:space="preserve">
+    <value>Existing accounts</value>
+  </data>
+  <data name="AccountUseAction" xml:space="preserve">
+    <value>Use</value>
+  </data>
+  <data name="AccountCreateNew" xml:space="preserve">
+    <value>Create new account</value>
+  </data>
+  <data name="AccountCreate" xml:space="preserve">
+    <value>Create</value>
+  </data>
+  <data name="AccountConvertExisting" xml:space="preserve">
+    <value>Convert account</value>
+  </data>
+  <data name="AccountConvert" xml:space="preserve">
+    <value>Convert</value>
+  </data>
+  <data name="AccountCancel" xml:space="preserve">
+    <value>Cancel</value>
+  </data>
+  <data name="AccountConvertDescription" xml:space="preserve">
+    <value>Select the child's account to convert it to a standard account.</value>
+  </data>
+  <data name="DemoTitle" xml:space="preserve">
+    <value>Let's test your protection</value>
+  </data>
+  <data name="DemoDescription" xml:space="preserve">
+    <value>Let's see how the protection works in real time.</value>
+  </data>
+  <data name="DemoSeconds" xml:space="preserve">
+    <value>seconds</value>
+  </data>
+  <data name="DemoInProgress" xml:space="preserve">
+    <value>Demo running...</value>
+  </data>
+  <data name="DemoCompleted" xml:space="preserve">
+    <value>Demo completed!</value>
+  </data>
+  <data name="DemoRunAction" xml:space="preserve">
+    <value>Start demo</value>
+  </data>
+  <data name="ManagedTitle" xml:space="preserve">
+    <value>Step it up</value>
+  </data>
+  <data name="ManagedDescription" xml:space="preserve">
+    <value>If you want, you can add the preventive layer for stronger protection. If not, you can finish with the standard protection.</value>
+  </data>
+  <data name="ManagedCurrentLevelHeader" xml:space="preserve">
+    <value>Current level</value>
+  </data>
+  <data name="ManagedActivateCardTitle" xml:space="preserve">
+    <value>Activate reinforced mode</value>
+  </data>
+  <data name="ManagedActivateDescription" xml:space="preserve">
+    <value>The preventive layer (WDAC) blocks apps that are not allowed even if you are a local administrator.</value>
+  </data>
+  <data name="ManagedActivateAction" xml:space="preserve">
+    <value>Activate reinforced mode</value>
+  </data>
+  <data name="ManagedNotAvailableInEdition" xml:space="preserve">
+    <value>Reinforced mode not available on this edition</value>
+  </data>
+  <data name="ManagedNotAvailableDescription" xml:space="preserve">
+    <value>Your version of Windows does not allow the preventive layer. Standard protection remains active.</value>
+  </data>
+  <data name="ManagedFinishOnboarding" xml:space="preserve">
+    <value>Finish onboarding</value>
+  </data>
+  <data name="ConsentRecordFailure" xml:space="preserve">
+    <value>We couldn't record your consent. Ask your parent to review the installation.</value>
+  </data>
+  <data name="ProgressUnknown" xml:space="preserve">
+    <value>Unknown status</value>
+  </data>
+  <data name="ProgressLabelFormat" xml:space="preserve">
+    <value>Protection {0} of {1}</value>
+  </data>
+  <data name="ProtectionActiveOverlay" xml:space="preserve">
+    <value>Your protection is active!</value>
+  </data>
+  <data name="ConsentPersistFailedShort" xml:space="preserve">
+    <value>We couldn't save your consent. Try again.</value>
+  </data>
+</root>

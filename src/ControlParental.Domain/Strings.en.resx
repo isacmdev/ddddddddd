@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" msdata:Ordinal="0" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter</value>
+  </resheader>
+  <data name="DisclosureTitle" xml:space="preserve">
+    <value>Data Disclosure</value>
+  </data>
+  <data name="DisclosureBody" xml:space="preserve">
+    <value>This app monitors app usage on this device to protect minors. We collect: time spent per app, names of apps used, and time of use. We do not collect message content or sensitive information.</value>
+  </data>
+  <data name="TransparencyTitle" xml:space="preserve">
+    <value>What is monitored?</value>
+  </data>
+  <data name="TransparencyBody" xml:space="preserve">
+    <value>We monitor which apps you use and for how long. We cannot see what you do inside each app, your messages, or your passwords.</value>
+  </data>
+  <data name="AcceptButton" xml:space="preserve">
+    <value>I accept</value>
+  </data>
+  <data name="ViewTransparencyButton" xml:space="preserve">
+    <value>See what is monitored</value>
+  </data>
+  <data name="ReasonBlocked" xml:space="preserve">
+    <value>Blocked by parent</value>
+  </data>
+  <data name="ReasonDowntime" xml:space="preserve">
+    <value>Rest time</value>
+  </data>
+  <data name="ReasonLimitReached" xml:space="preserve">
+    <value>Time limit reached</value>
+  </data>
+  <data name="ReasonAdminDetected" xml:space="preserve">
+    <value>Account without administrator privileges</value>
+  </data>
+</root>

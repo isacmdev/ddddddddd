@@ -1,0 +1,665 @@
+﻿{
+    "schema":  "controlparental.t00-t26.audit-snapshot/v1",
+    "captured_utc":  "2026-07-29T16:41:20.8457613Z",
+    "post_captured_utc":  "2026-07-29T16:46:02.0827400Z",
+    "canonical_root":  "C:/Users/Usuario/Desktop/Proyectos/ControlParental",
+    "head":  "9bfdc98568653e61f1fb53641f273b99dec054c4",
+    "tools":  {
+                  "git":  "git version 2.54.0.windows.1",
+                  "dotnet":  "9.0.315",
+                  "powershell":  "5.1.26100.8894",
+                  "os":  "Microsoft Windows NT 10.0.26200.0"
+              },
+    "pre_workspace_identity":  {
+                                   "captured_utc":  "2026-07-29T16:41:20.8457613Z",
+                                   "canonical_root":  "C:/Users/Usuario/Desktop/Proyectos/ControlParental",
+                                   "head":  "9bfdc98568653e61f1fb53641f273b99dec054c4",
+                                   "tracked_diff_sha256":  "e9953f4dde412554b0a2ab29c8da3a1491cba71e700ffaded9d098b8de0cbf20",
+                                   "tracked_status":  [
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  ".atl/.skill-registry.cache.json",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  ".atl/skill-registry.md",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/App.xaml.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " D",
+                                                              "path":  "src/ControlParental.App.UI/ConsentDialog.cs",
+                                                              "mode":  "missing"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/Converters/BoolToVisibilityConverter.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/IUIPipeClient.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/MainWindow.xaml",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/MainWindow.xaml.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/NamedPipeUIAdapter.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/OnboardingViewModel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/RealtimeChannelAdapter.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/RealtimeSubscriber.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/StatusViewModel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.App.UI/packages.lock.json",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/AccountCreationResult.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/AppPolicy.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/CategoryLimit.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/ConsentStatus.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/DayOfWeek.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Decision.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Enums.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Grant.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/GrantScope.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IAccountManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IAclHardener.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IChildAccountStore.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IConsentService.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IEnforcementEngine.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IEnforcementLevelMonitor.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IIpcChannel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IOverlayPersistenceManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IPolicyRepository.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  "A ",
+                                                              "path":  "src/ControlParental.Domain/IPreventiveLayerDetector.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IPrivilegeInspector.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IProcessTerminator.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IProtectedProcessReporter.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IRealtimeChannel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IRealtimeSubscriber.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IScmController.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IServiceHealthMonitor.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IServiceRecoveryManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/ITaskSchedulerBackup.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/ITimeProvider.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IUsageAccumulator.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IUsageReconciler.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IWindowLifecycleObserver.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IWorkstationLockManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/IpcMessage.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/OnboardingState.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/OnboardingStep.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/PairingResult.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Policy.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/PolicyDbEntity.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/PrivilegeLevel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/RulesEngine.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Schedule.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/UsageSnapshot.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Domain/Window.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/AccountManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/AgentLauncher.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/CertificatePinningValidator.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ChildAccountStore.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ConfigurationLoader.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ConsentDbEntity.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ConsentService.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ControlParentalDbContext.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/EnforcementEngine.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/EnforcementLevelMonitor.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ForegroundEventDbEntity.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/Interop/AppIdentityResolver.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/Interop/Extensions.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/Interop/NamedPipeServer.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/Interop/WinTrust.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/OverlayPersistenceManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/PolicyRepository.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/PrivilegeInspector.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ProcessTerminator.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/Program.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ProtectedProcessReporter.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ScheduledWorkService.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ScmController.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/ServiceRecoveryManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/SessionWatcher.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/TaskSchedulerBackupService.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/TimeProvider.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/UsageAccumulator.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/UsageReconciler.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/UsageStateQueryHandler.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/WnsHostedService.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.Service/WorkstationLockManager.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/ForegroundWatcher.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/IForegroundWatcher.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/Interop/AppIdentityResolver.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/Interop/NamedPipeClient.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/Interop/Win32Api.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/OverlayWindow.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "src/ControlParental.SessionAgent/Program.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.App.UI.Tests/FakeRealtimeChannel.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.App.UI.Tests/FakeWindowLifecycleObserver.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.App.UI.Tests/OnboardingViewModelTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.App.UI.Tests/RealtimeSubscriberTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Domain.Tests/DependencyInjectionTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Domain.Tests/PolicyRoundTripTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Domain.Tests/PolicyValidationTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Domain.Tests/PrivilegeLevelTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Domain.Tests/RulesEngineTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/AclHardenerTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/ConsentServiceTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/EnforcementEngineTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  "A ",
+                                                              "path":  "tests/ControlParental.Service.Tests/EnforcementLevelMonitorClassificationTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/EnforcementLevelMonitorTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  "A ",
+                                                              "path":  "tests/ControlParental.Service.Tests/EnforcementLevelQueryHandlerTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/PolicyRepositoryTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/ServiceHealthMonitorTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/TaskSchedulerBackupServiceTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/TimeProviderTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/UsageAccumulatorTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/WnsHostedServiceTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.Service.Tests/WorkstationLockManagerTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.SessionAgent.Tests/AppIdentityResolverTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.SessionAgent.Tests/ForegroundWatcherTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.SessionAgent.Tests/OverlayManagerTests.cs",
+                                                              "mode":  "-a----"
+                                                          },
+                                                          {
+                                                              "status":  " M",
+                                                              "path":  "tests/ControlParental.SessionAgent.Tests/SessionAgentHostTests.cs",
+                                                              "mode":  "-a----"
+                                                          }
+                                                      ],
+                                   "untracked_manifest_sha256":  "837e2ea237a7f8c34d209ce7fc7c95c76874b05be09d61685ebc7fcf59da6763",
+                                   "untracked_count":  468,
+                                   "tool_versions":  {
+                                                         "git":  "git version 2.54.0.windows.1",
+                                                         "dotnet":  "9.0.315",
+                                                         "powershell":  "5.1.26100.8894",
+                                                         "os":  "Microsoft Windows NT 10.0.26200.0"
+                                                     }
+                               },
+    "untracked_manifest":  "receipts/untracked-manifest.jsonl",
+    "untracked_manifest_sha256":  "837e2ea237a7f8c34d209ce7fc7c95c76874b05be09d61685ebc7fcf59da6763",
+    "post_identity":  {
+                          "tracked_diff_sha256":  "e9953f4dde412554b0a2ab29c8da3a1491cba71e700ffaded9d098b8de0cbf20",
+                          "untracked_non_audit_manifest_sha256":  "e9ee8b7ec39dceca647a53d388ec6f3a340f199630738d163ed97db4e64f5554",
+                          "pre_tracked_diff_same":  true,
+                          "pre_untracked_non_audit_same":  true,
+                          "product_test_config_mutation":  "not observed; filtered product/test/config identity unchanged",
+                          "audit_only_additions":  true,
+                          "allowed_sdd_paths":  [
+                                                    "openspec/changes/t00-t26-backend-readiness-audit/audit/",
+                                                    "openspec/changes/t00-t26-backend-readiness-audit/tasks.md",
+                                                    "openspec/changes/t00-t26-backend-readiness-audit/apply-progress.md"
+                                                ]
+                      },
+    "allowed_mutation_root":  "openspec/changes/t00-t26-backend-readiness-audit/audit/",
+    "non_mutation":  "PASS: product/test/config/backend source bytes, paths, modes, tracked diff, and generated directories were not changed by the audit; only declared SDD artifacts were created/updated.",
+    "known_blockers":  [
+                           "src/ControlParental.App.UI/Program.cs",
+                           "tests/ControlParental.Service.Tests/AgentLauncherLaunchSeamTests.cs"
+                       ]
+}

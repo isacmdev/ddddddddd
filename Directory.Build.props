@@ -1,0 +1,59 @@
+<Project>
+  <PropertyGroup>
+    <!-- Lenguaje y análisis -->
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- Target Windows 10 22H2+ - cada proyecto define el suyo -->
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <WindowsSdkPackageVersion>10.0.19041.41</WindowsSdkPackageVersion>
+
+    <!-- Tratar advertencias como errores en CI -->
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+    <WarningsAsErrors></WarningsAsErrors>
+
+    <!-- Output -->
+    <OutputType>Library</OutputType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- AOT/R2R para Release -->
+    <PublishSingleFile Condition="'$(Configuration)' == 'Release'">false</PublishSingleFile>
+    <SelfContained Condition="'$(Configuration)' == 'Release'">true</SelfContained>
+    <PublishReadyToRun Condition="'$(Configuration)' == 'Release'">true</PublishReadyToRun>
+    <PublishTrimmed Condition="'$(Configuration)' == 'Release'">false</PublishTrimmed>
+
+    <!-- Platform -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+
+    <!-- NuGet -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+
+    <!-- Source generators -->
+    <CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)Generated</CompilerGeneratedFilesOutputPath>
+
+    <!-- StyleCop global -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <!-- Configuración común de análisis -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Optimize>true</Optimize>
+    <InvariantLocalization>true</InvariantLocalization>
+  </PropertyGroup>
+
+</Project>

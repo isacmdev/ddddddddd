@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  T23 Obfuscation Closure — Obfuscar configuration for ControlParental.Domain.dll.
+
+  This file is a TEMPLATE: MSBuild substitutes the placeholders below with absolute
+  paths at build time before invoking the tool. Obfuscar 2.2.50 requires absolute
+  paths for InPath, OutPath, Module file, and LogFile, and does not perform
+  environment-variable expansion.
+
+  Placeholders (case-sensitive):
+    {InPath}        Absolute path of the input directory containing
+                    ControlParental.Domain.dll.
+    {OutPath}       Absolute path of the staging directory where the obfuscated
+                    ControlParental.Domain.dll and mapping file are written.
+    {ModuleFile}    Absolute path to the input ControlParental.Domain.dll.
+    {LogFile}       Absolute path to the mapping file (Mapping.txt).
+
+  Scope rules:
+    - KeepPublicApi=true ensures every public type/member is preserved, which
+      covers all EF Core entity types, all source-generated JSON record types,
+      and every public service/UI/session-agent contract.
+    - Explicit SkipType entries defensively pin the source-generated
+      PolicyJsonContext and UIMessagesJsonContext (both are partial classes
+      whose generated members are referenced by name from the source-generated
+      metadata) and the internal Strings resource accessor (whose embedded
+      resource lookup uses a literal namespace+type-name string).
+    - No other assembly is referenced; Service, App.UI, SessionAgent, backend,
+      TPM, and DHA code never enters Obfuscar.
+
+  See sdd/t23-obfuscation-closure/{proposal,spec,design,tasks} for rationale.
+-->
+<Obfuscator>
+  <Var name="InPath" value="{InPath}" />
+  <Var name="OutPath" value="{OutPath}" />
+  <Var name="LogFile" value="{LogFile}" />
+  <Var name="KeepPublicApi" value="true" />
+  <Var name="HidePrivateApi" value="true" />
+  <Var name="RenameFields" value="true" />
+  <Var name="RenameProperties" value="true" />
+  <Var name="RenameEvents" value="true" />
+  <Var name="ReuseNames" value="true" />
+  <Var name="HideStrings" value="true" />
+  <Var name="Optimize" value="true" />
+  <Var name="SuppressIldasm" value="true" />
+  <Var name="XmlMapping" value="false" />
+  <Var name="RegenerateDebugInfo" value="false" />
+  <Var name="AnalyzeXaml" value="false" />
+
+  <Module file="{ModuleFile}">
+    <!-- Source-generated JSON contexts: their generated members are referenced
+         by the System.Text.Json source generator using the original type names.
+         Renaming the type would break JsonTypeInfo registration. -->
+    <SkipType name="ControlParental.Domain.PolicyJsonContext" />
+    <SkipType name="ControlParental.Domain.UIMessagesJsonContext" />
+
+    <!-- Internal resource accessor: Strings.Designer.cs embeds the literal
+         resource name "ControlParental.Domain.Strings" and constructs the
+         ResourceManager against the type's assembly. Keep the type stable. -->
+    <SkipType name="ControlParental.Domain.Strings" />
+  </Module>
+</Obfuscator>

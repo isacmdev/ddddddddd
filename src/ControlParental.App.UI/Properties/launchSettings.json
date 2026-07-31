@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ControlParental.App.UI": {
+      "commandName": "Project",
+      "nativeDebugging": false
+    }
+  }
+}
