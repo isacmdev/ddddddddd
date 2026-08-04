@@ -7,8 +7,7 @@ namespace ControlParental.Service.Tests;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Reflection;
-using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 using ControlParental.Domain;
@@ -34,9 +33,8 @@ public sealed class AgentLauncherLaunchSeamTests
         var launcher = new AgentLauncher(
             "ControlParental.SessionAgent.exe",
             "SessionAgent",
-            null,
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
             _ => true,
-            _ => { },
             _ => { },
             () => { },
             sessionUserTokenProvider: _ => new IntPtr(0x1111),
@@ -74,13 +72,12 @@ public sealed class AgentLauncherLaunchSeamTests
         var launcher = new AgentLauncher(
             "ControlParental.SessionAgent.exe",
             "SessionAgent",
-            null,
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
             _ => true,
-            _ => { },
             _ => { },
             () => { },
             sessionUserTokenProvider: _ => new IntPtr(0x1111),
-            ipcChannelFactory: () => new FakeNamedPipeServiceChannel(),
+            ipcChannelFactory: () => new FakeIpcChannel(),
             processLaunchApi: api);
 
         var sessionManager = new SessionManager(
@@ -90,29 +87,24 @@ public sealed class AgentLauncherLaunchSeamTests
             _ => { },
             _ => { },
             _ => { },
-            _ => { });
-
-        var field = typeof(SessionManager).GetField("agentLauncher", BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(field);
-        field!.SetValue(sessionManager, launcher);
-
-        var method = typeof(SessionManager).GetMethod("OnSessionStarted", BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(method);
+            launcher);
 
         // Act
-        var task = (Task)method!.Invoke(sessionManager, new object[] { 7 })!;
+        var task = sessionManager.OnSessionStarted(7);
         var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(2)));
 
         // Assert
         Assert.Same(task, completed);
         await task;
         Assert.True(api.CreateProcessCalled);
+        Assert.Contains(new IntPtr(0x1111), api.ClosedHandles);
     }
 
     [Fact]
     public async Task SessionManager_RecoverAgentAsync_UsesCurrentSessionAndRelaunchesAgent()
     {
         // Arrange
+        var requestedSessionIds = new List<int>();
         var api = new FakeProcessLaunchApi
         {
             DuplicateTokenResult = true,
@@ -123,13 +115,16 @@ public sealed class AgentLauncherLaunchSeamTests
         var launcher = new AgentLauncher(
             "ControlParental.SessionAgent.exe",
             "SessionAgent",
-            null,
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
             _ => true,
             _ => { },
-            _ => { },
             () => { },
-            sessionUserTokenProvider: _ => new IntPtr(0x1111),
-            ipcChannelFactory: () => new FakeNamedPipeServiceChannel(),
+            sessionUserTokenProvider: sessionId =>
+            {
+                requestedSessionIds.Add(sessionId);
+                return new IntPtr(0x1111);
+            },
+            ipcChannelFactory: () => new FakeIpcChannel(),
             processLaunchApi: api);
 
         var sessionManager = new SessionManager(
@@ -139,12 +134,8 @@ public sealed class AgentLauncherLaunchSeamTests
             _ => { },
             _ => { },
             _ => { },
-            _ => { });
-
-        typeof(SessionManager).GetField("agentLauncher", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(sessionManager, launcher);
-        typeof(SessionManager).GetField("currentSessionId", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(sessionManager, 7);
+            launcher);
+        await sessionManager.OnSessionStarted(7);
 
         // Act
         var success = await sessionManager.RecoverAgentAsync();
@@ -152,17 +143,16 @@ public sealed class AgentLauncherLaunchSeamTests
         // Assert
         Assert.True(success);
         Assert.True(api.CreateProcessCalled);
+        Assert.Equal(new[] { 7, 7 }, requestedSessionIds);
     }
 
-    private sealed class FakeNamedPipeServiceChannel : INamedPipeServiceChannel
+    private sealed class FakeIpcChannel : IIpcChannel, IDisposable
     {
         public bool IsConnected { get; private set; }
 
         public event Action? Disconnected;
 
         public event Action<IIpcMessage>? MessageReceived;
-
-        public event Action<IIpcMessage>? UIMessageReceived;
 
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -264,9 +254,6 @@ public sealed class AgentLauncherLaunchSeamTests
             this.DestroyEnvironmentBlockCalled = true;
             return true;
         }
-
-        public IntPtr StringToHGlobalUni(string value)
-            => Marshal.StringToHGlobalUni(value);
 
         public Process GetProcessById(int processId)
             => throw new ArgumentException("Process exited immediately.");

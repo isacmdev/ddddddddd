@@ -13,7 +13,7 @@ using ControlParental.Domain;
 public sealed class ServiceRecoveryManager : IServiceRecoveryManager
 {
     private readonly IServiceHealthMonitor healthMonitor;
-    private readonly Func<Task<bool>> recoverAgentFunc;
+    private Func<Task<bool>> recoverAgentFunc;
     private readonly Action<string> onRecoveryFailed;
     private readonly Action onRecoverySucceeded;
 
@@ -46,6 +46,12 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
 
         // Subscribe to health monitor events
         this.healthMonitor.AgentDied += this.OnAgentDied;
+    }
+
+    internal void SetRecoverAgentFunc(Func<Task<bool>> recoverAgentFunc)
+    {
+        this.recoverAgentFunc = recoverAgentFunc ??
+            throw new ArgumentNullException(nameof(recoverAgentFunc));
     }
 
     /// <inheritdoc />

@@ -121,14 +121,17 @@ public sealed class LocalizationTests
         foreach (Match match in matches)
         {
             var literal = match.Groups[1].Value;
-            literal.Should().NotBe("7-12 años", "PairingPage must bind the 7-12 band through Strings.AgeBand_7_12.");
-            literal.Should().NotBe("13-16 años", "PairingPage must bind the 13-16 band through Strings.AgeBand_13_16.");
-            literal.Should().NotBe("17-18 años", "PairingPage must bind the 17-18 band through Strings.AgeBand_17_18.");
+            literal.Should().NotBe("7-12 años", "PairingPage must bind the 7-12 band through StringsAdapter.");
+            literal.Should().NotBe("13-16 años", "PairingPage must bind the 13-16 band through StringsAdapter.");
+            literal.Should().NotBe("17-18 años", "PairingPage must bind the 17-18 band through StringsAdapter.");
         }
 
-        content.Should().Contain("Strings.AgeBand_7_12");
-        content.Should().Contain("Strings.AgeBand_13_16");
-        content.Should().Contain("Strings.AgeBand_17_18");
+        foreach (var propertyName in new[] { "AgeBand712", "AgeBand1316", "AgeBand1718" })
+        {
+            content.Should().Contain($"Strings.{propertyName}");
+            typeof(StringsAdapter).GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public)
+                .Should().NotBeNull($"the compiled XAML binding Strings.{propertyName} must resolve");
+        }
     }
 
     [Fact]

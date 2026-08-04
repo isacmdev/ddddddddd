@@ -17,6 +17,8 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
     private readonly IServiceHealthMonitor healthMonitor;
     private readonly ITimeProvider timeProvider;
     private readonly Action<EnforcementIssue> onIssueDetected;
+    private readonly IPreventiveLayerDetector? preventiveLayerDetector;
+    private readonly IAccountManager? accountManager;
 
     private Timer? evaluationTimer;
     private EnforcementLevel currentLevel = EnforcementLevel.Unknown;
@@ -40,13 +42,17 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
         IScmController scmController,
         IServiceHealthMonitor healthMonitor,
         ITimeProvider timeProvider,
-        Action<EnforcementIssue>? onIssueDetected = null)
+        Action<EnforcementIssue>? onIssueDetected = null,
+        IPreventiveLayerDetector? preventiveLayerDetector = null,
+        IAccountManager? accountManager = null)
     {
         this.privilegeInspector = privilegeInspector ?? throw new ArgumentNullException(nameof(privilegeInspector));
         this.scmController = scmController ?? throw new ArgumentNullException(nameof(scmController));
         this.healthMonitor = healthMonitor ?? throw new ArgumentNullException(nameof(healthMonitor));
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.onIssueDetected = onIssueDetected ?? (_ => { });
+        this.preventiveLayerDetector = preventiveLayerDetector;
+        this.accountManager = accountManager;
     }
 
     /// <inheritdoc />
@@ -184,15 +190,16 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
             });
         }
 
-        // Check if child is administrator
-        var isChildStandard = await this.privilegeInspector.IsChildStandardAsync(cancellationToken);
+        var isChildStandard = await this.IsConfiguredChildStandardAsync(cancellationToken);
         if (!isChildStandard)
         {
             newIssues.Add(new EnforcementIssue
             {
                 Type = EnforcementIssueType.ChildIsAdministrator,
                 Severity = EnforcementIssueSeverity.Critical,
-                Description = "Child account has administrator privileges",
+                Description = this.accountManager == null && this.preventiveLayerDetector != null
+                    ? "No configured child account authority"
+                    : "Child account has administrator privileges or could not be verified",
                 DetectedAt = this.timeProvider.WallClockNow,
             });
         }
@@ -213,17 +220,17 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
             }
         }
 
-        // Check preventive layer (WDAC/AppLocker/MDM) - placeholder
-        // In production, this would check for actual preventive mechanisms
-        var hasPreventiveLayer = this.CheckPreventiveLayer();
-        if (!hasPreventiveLayer)
+        var preventiveLayer = await this.DetectPreventiveLayerAsync(cancellationToken);
+        if (preventiveLayer.Status != PreventiveLayerDetectionStatus.Present)
         {
-            // Only add as info, not a critical issue
             newIssues.Add(new EnforcementIssue
             {
                 Type = EnforcementIssueType.PreventiveLayerUnavailable,
-                Severity = EnforcementIssueSeverity.Info,
-                Description = "No preventive layer (WDAC/AppLocker/MDM) detected",
+                Severity = preventiveLayer.Status is PreventiveLayerDetectionStatus.Absent
+                    or PreventiveLayerDetectionStatus.Unsupported
+                    ? EnforcementIssueSeverity.Info
+                    : EnforcementIssueSeverity.Severe,
+                Description = preventiveLayer.Detail,
                 DetectedAt = this.timeProvider.WallClockNow,
             });
         }
@@ -336,31 +343,72 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
         // Check if service is running
         if (!issues.Any(i => i.Type == EnforcementIssueType.ServiceNotRunning))
         {
-            // Check preventive layer
-            if (!issues.Any(i => i.Type == EnforcementIssueType.PreventiveLayerUnavailable) ||
-                issues.All(i => i.Severity == EnforcementIssueSeverity.Info))
-            {
-                // Has preventive layer = MANAGED
-                // No preventive layer but service running = STANDARD
-                var hasPreventiveLayer = this.CheckPreventiveLayer();
-                return hasPreventiveLayer
-                    ? EnforcementLevel.Managed
-                    : EnforcementLevel.Standard;
-            }
+            return issues.Any(i => i.Type == EnforcementIssueType.PreventiveLayerUnavailable)
+                ? EnforcementLevel.Standard
+                : EnforcementLevel.Managed;
         }
 
         // Something is wrong but not critical
         return EnforcementLevel.Standard;
     }
 
-    private bool CheckPreventiveLayer()
+    private async Task<bool> IsConfiguredChildStandardAsync(CancellationToken cancellationToken)
     {
-        // Placeholder: In production, this would check for:
-        // - WDAC policies
-        // - AppLocker policies
-        // - MDM enrollment
-        // For now, return false (no preventive layer detected)
-        return false;
+        if (this.accountManager == null)
+        {
+            return this.preventiveLayerDetector == null
+                ? await this.privilegeInspector.IsChildStandardAsync(cancellationToken)
+                : false;
+        }
+
+        try
+        {
+            var childName = this.accountManager.GetChildAccountName();
+            if (string.IsNullOrWhiteSpace(childName))
+            {
+                return false;
+            }
+
+            return await this.accountManager.IsAccountStandardAsync(childName, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[EnforcementLevelMonitor] Child account check failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task<PreventiveLayerDetectionResult> DetectPreventiveLayerAsync(
+        CancellationToken cancellationToken)
+    {
+        if (this.preventiveLayerDetector == null)
+        {
+            return new PreventiveLayerDetectionResult(
+                PreventiveLayerDetectionStatus.Absent,
+                null,
+                "No preventive layer (WDAC/AppLocker/MDM) detected");
+        }
+
+        try
+        {
+            return await this.preventiveLayerDetector.DetectAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new PreventiveLayerDetectionResult(
+                PreventiveLayerDetectionStatus.Indeterminate,
+                null,
+                $"Preventive-layer detection failed: {ex.Message}");
+        }
     }
 
     private async Task<bool> IsServiceRunningAsync(CancellationToken cancellationToken)

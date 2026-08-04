@@ -48,6 +48,11 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     /// </summary>
     public const int PolicySyncIntervalSeconds = 30;
 
+    /// <summary>
+    /// Maximum time allowed for in-flight work during shutdown.
+    /// </summary>
+    public const int ShutdownBudgetSeconds = 30;
+
     // ── Dependencies ────────────────────────────────────────────────
 
     private readonly IBackendClient backendClient;
@@ -67,11 +72,13 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     private Timer? outboxPushTimer;
     private Timer? reconciliationTimer;
     private Timer? policySyncTimer;
+    private CancellationTokenSource? workCancellation;
     private bool isRunning;
     private bool disposed;
 
     private readonly object lockObj = new();
     private readonly Dictionary<WorkType, int> backoffByWorkType = new();
+    private readonly Dictionary<WorkType, Task> inFlightWork = new();
 
     // ── Types ──────────────────────────────────────────────────────
 
@@ -80,6 +87,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         Heartbeat,
         OutboxPush,
         Reconciliation,
+        PolicySync,
     }
 
     // ── Constructor ───────────────────────────────────────────────
@@ -159,57 +167,50 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             }
 
             this.isRunning = true;
+
+            this.workCancellation = new CancellationTokenSource();
+
+            this.heartbeatTimer = new Timer(
+                callback: _ => this.OnHeartbeatTimer(),
+                state: null,
+                dueTime: TimeSpan.FromSeconds(HeartbeatIntervalSeconds),
+                period: TimeSpan.FromSeconds(HeartbeatIntervalSeconds));
+
+            this.outboxPushTimer = new Timer(
+                callback: _ => this.OnOutboxPushTimer(),
+                state: null,
+                dueTime: TimeSpan.FromSeconds(OutboxPushIntervalSeconds),
+                period: TimeSpan.FromSeconds(OutboxPushIntervalSeconds));
+
+            this.reconciliationTimer = new Timer(
+                callback: _ => this.OnReconciliationTimer(),
+                state: null,
+                dueTime: TimeSpan.FromSeconds(ReconciliationIntervalSeconds),
+                period: TimeSpan.FromSeconds(ReconciliationIntervalSeconds));
+
+            this.policySyncTimer = new Timer(
+                callback: _ => this.OnPolicySyncTimer(),
+                state: null,
+                dueTime: TimeSpan.FromSeconds(PolicySyncIntervalSeconds),
+                period: TimeSpan.FromSeconds(PolicySyncIntervalSeconds));
         }
 
         // Register Task Scheduler backup tasks (T10 chain)
         this.RegisterTaskSchedulerTasks();
 
         // T18: Initial policy sync on startup
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await this.ExecutePolicySyncAsync();
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Initial policy sync failed: {ex.Message}");
-            }
-        });
-
-        // Start timers
-        this.heartbeatTimer = new Timer(
-            callback: _ => this.OnHeartbeatTimer(),
-            state: null,
-            dueTime: TimeSpan.FromSeconds(HeartbeatIntervalSeconds),
-            period: TimeSpan.FromSeconds(HeartbeatIntervalSeconds));
-
-        this.outboxPushTimer = new Timer(
-            callback: _ => this.OnOutboxPushTimer(),
-            state: null,
-            dueTime: TimeSpan.FromSeconds(OutboxPushIntervalSeconds),
-            period: TimeSpan.FromSeconds(OutboxPushIntervalSeconds));
-
-        this.reconciliationTimer = new Timer(
-            callback: _ => this.OnReconciliationTimer(),
-            state: null,
-            dueTime: TimeSpan.FromSeconds(ReconciliationIntervalSeconds),
-            period: TimeSpan.FromSeconds(ReconciliationIntervalSeconds));
-
-        // T19: Backup polling timer for policy sync
-        this.policySyncTimer = new Timer(
-            callback: _ => this.OnPolicySyncTimer(),
-            state: null,
-            dueTime: TimeSpan.FromSeconds(PolicySyncIntervalSeconds),
-            period: TimeSpan.FromSeconds(PolicySyncIntervalSeconds));
+        this.TryDispatchScheduledWork(WorkType.PolicySync, this.ExecutePolicySyncAsync);
 
         System.Diagnostics.Debug.WriteLine("[ScheduledWorkService] Started.");
         return Task.CompletedTask;
     }
 
     /// <inheritdoc />
-    public Task StopAsync(CancellationToken cancellationToken = default)
+    public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        CancellationTokenSource? cancellation;
+        Task[] tasks;
+
         lock (this.lockObj)
         {
             this.isRunning = false;
@@ -218,10 +219,30 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             this.outboxPushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
             this.reconciliationTimer?.Change(Timeout.Infinite, Timeout.Infinite);
             this.policySyncTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
+            cancellation = this.workCancellation;
+            tasks = this.inFlightWork.Values.ToArray();
+        }
+
+        cancellation?.Cancel();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (tasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(tasks)
+                    .WaitAsync(TimeSpan.FromSeconds(ShutdownBudgetSeconds), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[ScheduledWorkService] In-flight work exceeded the shutdown budget.");
+            }
         }
 
         System.Diagnostics.Debug.WriteLine("[ScheduledWorkService] Stopped.");
-        return Task.CompletedTask;
     }
 
     // ── Timer Callbacks ───────────────────────────────────────────
@@ -233,15 +254,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        try
-        {
-            this.ExecuteHeartbeatAsync().Wait(TimeSpan.FromSeconds(30));
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Heartbeat error: {ex.Message}");
-        }
+        this.TryDispatchScheduledWork(WorkType.Heartbeat, this.ExecuteHeartbeatAsync);
     }
 
     private void OnOutboxPushTimer()
@@ -251,15 +264,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        try
-        {
-            this.ExecuteOutboxPushAsync().Wait(TimeSpan.FromSeconds(60));
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Outbox push error: {ex.Message}");
-        }
+        this.TryDispatchScheduledWork(WorkType.OutboxPush, this.ExecuteOutboxPushAsync);
     }
 
     private void OnReconciliationTimer()
@@ -269,43 +274,81 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        try
-        {
-            this.ExecuteReconciliationAsync().Wait(TimeSpan.FromSeconds(120));
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Reconciliation error: {ex.Message}");
-        }
+        this.TryDispatchScheduledWork(WorkType.Reconciliation, this.ExecuteReconciliationAsync);
     }
 
     // T19: Backup polling callback — does not trust WNS payload, always fetches fresh
     private void OnPolicySyncTimer()
     {
+        this.TryDispatchScheduledWork(WorkType.PolicySync, this.ExecutePolicySyncAsync);
+    }
+
+    private void TryDispatchWork(WorkType workType, Func<Task> work)
+    {
+        this.TryDispatchWorkCore(workType, _ => work());
+    }
+
+    private void TryDispatchScheduledWork(
+        WorkType workType,
+        Func<CancellationToken, Task> work)
+    {
+        this.TryDispatchWorkCore(workType, work);
+    }
+
+    private void TryDispatchWorkCore(
+        WorkType workType,
+        Func<CancellationToken, Task> work)
+    {
+        TaskCompletionSource completion;
+        CancellationToken cancellationToken;
+
         lock (this.lockObj)
         {
-            if (!this.isRunning || this.disposed)
+            if (!this.isRunning || this.disposed || this.inFlightWork.ContainsKey(workType))
             {
                 return;
             }
+
+            cancellationToken = this.workCancellation?.Token ?? CancellationToken.None;
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            this.inFlightWork.Add(workType, completion.Task);
         }
 
-        try
-        {
-            this.ExecutePolicySyncAsync().Wait(TimeSpan.FromSeconds(30));
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Policy sync timer error: {ex.Message}");
-        }
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    await work(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[ScheduledWorkService] {workType} error: {ex.Message}");
+                }
+                finally
+                {
+                    lock (this.lockObj)
+                    {
+                        if (this.inFlightWork.TryGetValue(workType, out var current)
+                            && ReferenceEquals(current, completion.Task))
+                        {
+                            this.inFlightWork.Remove(workType);
+                        }
+                    }
+
+                    completion.TrySetResult();
+                }
+            },
+            CancellationToken.None);
     }
 
     // ── Work Execution ────────────────────────────────────────────
 
-    private async Task ExecuteHeartbeatAsync()
+    internal async Task ExecuteHeartbeatAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!IsNetworkAvailable())
         {
             this.ApplyBackoff(WorkType.Heartbeat);
@@ -324,7 +367,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 : 0,
         };
 
-        var result = await this.backendClient.SendHeartbeatAsync(heartbeat);
+        var result = await this.backendClient.SendHeartbeatAsync(heartbeat, cancellationToken);
 
         if (result.Success)
         {
@@ -345,13 +388,13 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 {
                     try
                     {
-                        await this.ExecutePolicySyncAsync();
+                        await this.ExecutePolicySyncAsync(cancellationToken);
                     }
                     catch (Exception ex)
                     {
                         System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy sync failed: {ex.Message}");
                     }
-                });
+                }, cancellationToken);
             }
         }
         else
@@ -362,8 +405,10 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         }
     }
 
-    private async Task ExecuteOutboxPushAsync()
+    private async Task ExecuteOutboxPushAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!IsNetworkAvailable())
         {
             this.ApplyBackoff(WorkType.OutboxPush);
@@ -372,7 +417,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        var pending = await this.outboxManager.GetPendingEntriesAsync(100);
+        var pending = await this.outboxManager.GetPendingEntriesAsync(100, cancellationToken);
 
         if (pending.Count == 0)
         {
@@ -433,7 +478,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             {
                 System.Diagnostics.Debug.WriteLine(
                     $"[ScheduledWorkService] Failed to parse outbox entry {entry.Id}: {ex.Message}");
-                await this.outboxManager.MarkFailedAsync(entry.Id, ex.Message);
+                await this.outboxManager.MarkFailedAsync(entry.Id, ex.Message, cancellationToken);
             }
         }
 
@@ -442,12 +487,12 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         // Push usage logs
         if (usageLogs.Count > 0)
         {
-            var result = await this.backendClient.PushUsageLogsAsync(usageLogs);
+            var result = await this.backendClient.PushUsageLogsAsync(usageLogs, cancellationToken);
             if (result.Success)
             {
                 foreach (var entry in pending.Where(e => e.TableName == "usage_logs"))
                 {
-                    await this.outboxManager.MarkSentAsync(entry.Id);
+                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
                 }
             }
             else
@@ -461,12 +506,12 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         // Push device alerts
         if (deviceAlerts.Count > 0)
         {
-            var result = await this.backendClient.PushDeviceAlertsAsync(deviceAlerts);
+            var result = await this.backendClient.PushDeviceAlertsAsync(deviceAlerts, cancellationToken);
             if (result.Success)
             {
                 foreach (var entry in pending.Where(e => e.TableName == "device_alerts"))
                 {
-                    await this.outboxManager.MarkSentAsync(entry.Id);
+                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
                 }
             }
             else
@@ -480,12 +525,12 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         // Push behavioral events
         if (behavioralEvents.Count > 0)
         {
-            var result = await this.backendClient.PushBehavioralEventsAsync(behavioralEvents);
+            var result = await this.backendClient.PushBehavioralEventsAsync(behavioralEvents, cancellationToken);
             if (result.Success)
             {
                 foreach (var entry in pending.Where(e => e.TableName == "behavioral_events"))
                 {
-                    await this.outboxManager.MarkSentAsync(entry.Id);
+                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
                 }
             }
             else
@@ -512,12 +557,12 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
             foreach (var tr in timeRequests)
             {
-                var ok = await this.backendClient.CreateTimeRequestAsync(tr);
+                var ok = await this.backendClient.CreateTimeRequestAsync(tr, cancellationToken);
                 if (ok)
                 {
                     if (timeRequestEntryIds.TryGetValue(tr.RequestId, out var entryId))
                     {
-                        await this.outboxManager.MarkSentAsync(entryId);
+                        await this.outboxManager.MarkSentAsync(entryId, cancellationToken);
                     }
                 }
                 else
@@ -532,7 +577,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             this.ApplyBackoff(WorkType.OutboxPush);
             foreach (var entry in pending)
             {
-                await this.outboxManager.MarkFailedAsync(entry.Id, "Push failed");
+                await this.outboxManager.MarkFailedAsync(entry.Id, "Push failed", cancellationToken);
             }
         }
         else
@@ -543,8 +588,10 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         }
     }
 
-    private async Task ExecuteReconciliationAsync()
+    internal async Task ExecuteReconciliationAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         // Only reconcile if the reconciler is not already running
         if (this.usageReconciler.IsRunning)
         {
@@ -563,8 +610,8 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
         try
         {
-            await this.usageReconciler.StartAsync();
-            var result = await this.usageReconciler.ReconcileAsync();
+            await this.usageReconciler.StartAsync(cancellationToken);
+            var result = await this.usageReconciler.ReconcileAsync(cancellationToken);
 
             if (result.Success)
             {
@@ -580,6 +627,10 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                     $"[ScheduledWorkService] Reconciliation failed: {result.ErrorMessage}");
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             this.ApplyBackoff(WorkType.Reconciliation);
@@ -590,25 +641,41 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
     // ── Policy Sync ───────────────────────────────────────────────
 
-    private async Task ExecutePolicySyncAsync()
+    internal async Task ExecutePolicySyncAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!IsNetworkAvailable())
         {
             return;
         }
 
-        var currentVersion = await this.policyRepository.GetLocalVersionAsync("default", CancellationToken.None);
-        var fetchResult = await this.backendClient.FetchPolicyAsync("default", currentVersion, CancellationToken.None);
+        var currentVersion = await this.policyRepository.GetLocalVersionAsync("default", cancellationToken);
+        var fetchResult = await this.backendClient.FetchPolicyAsync("default", currentVersion, cancellationToken);
 
         if (fetchResult.Success && !string.IsNullOrEmpty(fetchResult.PolicyJson))
         {
             var policy = JsonSerializer.Deserialize<Policy>(fetchResult.PolicyJson, PolicyJsonContext.Default.Policy);
             if (policy != null)
             {
-                await this.policyRepository.UpsertPolicyAsync(policy, CancellationToken.None);
+                await this.policyRepository.UpsertPolicyAsync(policy, cancellationToken);
                 System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy synced: version {policy.Version}");
             }
         }
+    }
+
+    /// <summary>
+    /// Runs one scheduled operation directly for the Task Scheduler backup path.
+    /// </summary>
+    internal Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default)
+    {
+        return mode switch
+        {
+            BackupMode.Heartbeat => this.ExecuteHeartbeatAsync(cancellationToken),
+            BackupMode.Outbox => this.ExecuteOutboxPushAsync(cancellationToken),
+            BackupMode.Reconciliation => this.ExecuteReconciliationAsync(cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown backup mode."),
+        };
     }
 
     // ── Backoff Logic ─────────────────────────────────────────────
@@ -703,23 +770,31 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
     public void Dispose()
     {
-        if (this.disposed)
+        CancellationTokenSource? cancellation;
+
+        lock (this.lockObj)
         {
-            return;
+            if (this.disposed)
+            {
+                return;
+            }
+
+            this.disposed = true;
+            this.isRunning = false;
+            cancellation = this.workCancellation;
+
+            this.heartbeatTimer?.Dispose();
+            this.outboxPushTimer?.Dispose();
+            this.reconciliationTimer?.Dispose();
+            this.policySyncTimer?.Dispose();
+
+            this.heartbeatTimer = null;
+            this.outboxPushTimer = null;
+            this.reconciliationTimer = null;
+            this.policySyncTimer = null;
         }
 
-        this.disposed = true;
-        this.isRunning = false;
-
-        this.heartbeatTimer?.Dispose();
-        this.outboxPushTimer?.Dispose();
-        this.reconciliationTimer?.Dispose();
-        this.policySyncTimer?.Dispose();
-
-        this.heartbeatTimer = null;
-        this.outboxPushTimer = null;
-        this.reconciliationTimer = null;
-        this.policySyncTimer = null;
+        cancellation?.Cancel();
 
         GC.SuppressFinalize(this);
     }

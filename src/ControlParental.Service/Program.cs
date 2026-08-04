@@ -10,10 +10,12 @@ using System.Net.Security;
 using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using ControlParental.Domain;
+using ControlParental.Service.Interop;
 
 /// <summary>
 /// T19 — WNS configuration loaded from environment variables.
@@ -72,6 +74,30 @@ public static class Program
     /// Name of the IPC pipe between service and agent.
     /// </summary>
     public const string IpcPipeName = "SessionAgent";
+
+    internal static bool TryParseBackupMode(string[]? args, out BackupMode mode)
+    {
+        mode = default;
+        if (args == null || args.Length != 1)
+        {
+            return false;
+        }
+
+        switch (args[0])
+        {
+            case "--backup-heartbeat":
+                mode = BackupMode.Heartbeat;
+                return true;
+            case "--backup-outbox":
+                mode = BackupMode.Outbox;
+                return true;
+            case "--backup-reconcile":
+                mode = BackupMode.Reconciliation;
+                return true;
+            default:
+                return false;
+        }
+    }
 
     /// <summary>
     /// T22 — Creates an HttpClient configured with TLS 1.3 and optional SPKI certificate pinning.
@@ -224,6 +250,7 @@ public static class Program
         builder.Services.AddSingleton<IProcessTerminator, ProcessTerminator>();
 
         // T12: Register EnforcementLevelMonitor
+        builder.Services.AddSingleton<IPreventiveLayerDetector, WindowsPreventiveLayerDetector>();
         builder.Services.AddSingleton<IEnforcementLevelMonitor>((sp) =>
         {
             var privilegeInspector = sp.GetRequiredService<IPrivilegeInspector>();
@@ -240,7 +267,9 @@ public static class Program
                 {
                     System.Diagnostics.Debug.WriteLine(
                         $"[EnforcementLevelMonitor] Issue detected: {issue.Type} - {issue.Description}");
-                });
+                },
+                preventiveLayerDetector: sp.GetRequiredService<IPreventiveLayerDetector>(),
+                accountManager: sp.GetRequiredService<IAccountManager>());
         });
 
         // T11: Enforcement loop
@@ -326,6 +355,24 @@ public static class Program
 
         // T27: Register UsageStateQueryHandler for UI queries
         builder.Services.AddScoped<UsageStateQueryHandler>();
+
+        // T26: Register the App.UI IPC server and its message graph
+        builder.Services.AddSingleton<OnboardingStateService>(sp =>
+            new OnboardingStateService(
+                DataFolderPath,
+                sp.GetRequiredService<IChildAccountStore>(),
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OnboardingStateService>>()));
+        builder.Services.AddSingleton<IOnboardingStateService>(sp =>
+            sp.GetRequiredService<OnboardingStateService>());
+        builder.Services.AddSingleton<EnforcementLevelQueryHandler>();
+        builder.Services.AddSingleton<UIMessageHandler>(sp =>
+            new UIMessageHandler(
+                sp.GetRequiredService<OnboardingStateService>(),
+                sp.GetRequiredService<EnforcementLevelQueryHandler>(),
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<UIMessageHandler>>()));
+        builder.Services.AddSingleton<NamedPipeUIServer>();
+        builder.Services.AddHostedService<NamedPipeUIServerHostedAdapter>();
 
         // T20: Register TaskSchedulerBackupService as safety net for timer failures
         builder.Services.AddSingleton<ITaskSchedulerBackup, TaskSchedulerBackupService>();
@@ -492,6 +539,7 @@ public sealed class SessionManager : IDisposable
     private readonly Action? onAgentDeathDetected;
     private SessionWatcher? sessionWatcher;
     private AgentLauncher? agentLauncher;
+    private int? currentSessionId;
     private bool disposed;
 
     /// <summary>
@@ -546,16 +594,33 @@ public sealed class SessionManager : IDisposable
         this.onAgentDeathDetected = onAgentDeathDetected;
     }
 
+    internal SessionManager(
+        string childUsername,
+        string agentExePath,
+        string pipeName,
+        Action<ForegroundChanged> onForegroundChanged,
+        Action<AgentHeartbeat> onHeartbeat,
+        Action<StateSnapshot> onStateSnapshot,
+        AgentLauncher agentLauncher)
+        : this(childUsername, agentExePath, pipeName, onForegroundChanged, onHeartbeat, onStateSnapshot)
+    {
+        this.agentLauncher = agentLauncher ?? throw new ArgumentNullException(nameof(agentLauncher));
+    }
+
     /// <summary>
     /// Starts watching for sessions and managing the agent.
     /// </summary>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
+        var childSid = (SecurityIdentifier)new NTAccount(this.childUsername)
+            .Translate(typeof(SecurityIdentifier));
+
         // Create the agent launcher
         this.agentLauncher = new AgentLauncher(
             this.agentExePath,
             this.pipeName,
-            sid => this.ValidateChildSid(sid),
+            childSid,
+            sid => string.Equals(sid, childSid.Value, StringComparison.Ordinal),
             message => this.HandleAgentMessage(message),
             () => this.OnAgentDisconnected());
 
@@ -602,38 +667,12 @@ public sealed class SessionManager : IDisposable
         }
     }
 
-    private bool ValidateChildSid(string sid)
-    {
-        // Validate that the connecting client has the expected SID
-        // This is implemented by checking if the SID matches the child user's SID
-        try
-        {
-            var connectingSid = new System.Security.Principal.SecurityIdentifier(sid);
-
-            // For now, accept any local user connection (simplified)
-            // In production, this would compare against the actual child user SID
-            // SecurityIdentifier.IsValid() does not exist; check via GetBinaryForm
-            try
-            {
-                var binaryForm = new byte[connectingSid.BinaryLength];
-                connectingSid.GetBinaryForm(binaryForm, 0);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private async Task OnSessionStarted(int sessionId)
+    internal async Task OnSessionStarted(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             $"[SessionManager] Session started for child user: {sessionId}");
+
+        this.currentSessionId = sessionId;
 
         // Launch the agent in the new session
         if (this.agentLauncher != null)
@@ -646,6 +685,8 @@ public sealed class SessionManager : IDisposable
     {
         System.Diagnostics.Debug.WriteLine(
             "[SessionManager] Session ended for child user.");
+
+        this.currentSessionId = null;
 
         // Kill the agent when the session ends
         if (this.agentLauncher != null)
@@ -738,6 +779,13 @@ public sealed class SessionManager : IDisposable
 
         // If we have a recovery callback, trigger it
         this.onAgentRecoveryNeeded?.Invoke();
+    }
+
+    internal Task<bool> RecoverAgentAsync(CancellationToken cancellationToken = default)
+    {
+        return this.agentLauncher != null && this.currentSessionId is int sessionId
+            ? this.agentLauncher.LaunchAgentAsync(sessionId, cancellationToken)
+            : Task.FromResult(false);
     }
 
     public void Dispose()
@@ -863,6 +911,12 @@ public sealed class ControlParentalService : BackgroundService
                 healthMonitor: this.healthMonitor,
                 onAgentRecoveryNeeded: OnAgentRecoveryNeeded,
                 onAgentDeathDetected: () => this.antiTamperMonitor?.RecordAgentDeath());
+
+            if (this.recoveryManager is ServiceRecoveryManager serviceRecoveryManager)
+            {
+                serviceRecoveryManager.SetRecoverAgentFunc(
+                    () => this.sessionManager.RecoverAgentAsync());
+            }
 
             await this.sessionManager.StartAsync(stoppingToken);
         }

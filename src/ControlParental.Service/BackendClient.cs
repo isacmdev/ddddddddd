@@ -379,6 +379,8 @@ public sealed class BackendClient : IBackendClient
             var payload = new
             {
                 report_hash = report.ReportHash,
+                binary_hash = report.BinaryHash,
+                signature_valid = report.SignatureValid,
                 timestamp = report.Timestamp.ToString("O"),
                 agent_version = report.AgentVersion,
                 platform = report.Platform,

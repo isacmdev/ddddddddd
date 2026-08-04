@@ -172,6 +172,23 @@ public class PairingServiceTests
     }
 
     [Fact]
+    public async Task PairAsync_TooManyRequests_PreservesRateLimitStatus()
+    {
+        var sut = this.CreateSut();
+        this.deviceAuthenticatorMock
+            .Setup(d => d.CreateAnonymousSessionAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DeviceAuthResult.Succeeded("token", "device-123"));
+        this.backendClientMock
+            .Setup(b => b.PairAsync(It.IsAny<PairingRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PairingHttpResult.TooManyRequests());
+
+        var result = await sut.PairAsync("ABC123", AgeBand.Child, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(PairingStatus.TooManyRequests, result.Status);
+    }
+
+    [Fact]
     public async Task PairAsync_SecretStoreWriteFails_ReturnsError()
     {
         // Arrange

@@ -1897,6 +1897,7 @@
           "Microsoft.Extensions.DependencyInjection": "[9.0.0, )",
           "Microsoft.WindowsAppSDK": "[1.8.240802000, )",
           "StyleCop.Analyzers": "[1.2.0-beta.507, )",
+          "System.Management": "[8.0.0, )",
           "System.Reactive": "[6.0.1, )",
           "ZXing.Net": "[0.16.11, )",
           "ZXing.Net.Bindings.Windows.Compatibility": "[0.16.14, )",

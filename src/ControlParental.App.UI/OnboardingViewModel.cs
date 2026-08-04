@@ -192,7 +192,7 @@ public sealed partial class OnboardingViewModel : ObservableObject
     [RelayCommand]
     private async Task GoNextAsync(CancellationToken ct = default)
     {
-        if (this.CurrentStep == null || !this.CanGoNext)
+        if (this.CurrentStep == null)
         {
             return;
         }
@@ -409,8 +409,7 @@ public sealed partial class OnboardingViewModel : ObservableObject
 
     private void UpdateButtonState()
     {
-        this.CanGoNext = this.CurrentStep?.Status == OnboardingStepStatus.Completed
-            || this.CurrentStep?.Status == OnboardingStepStatus.InProgress;
+        this.CanGoNext = this.CurrentStep?.Status == OnboardingStepStatus.Completed;
         this.CanGoBack = this.CurrentStep?.Index > 0;
     }
 

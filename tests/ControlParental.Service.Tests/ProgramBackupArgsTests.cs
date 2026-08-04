@@ -50,6 +50,17 @@ public class ProgramBackupArgsTests
         result.Should().BeFalse();
         mode.Should().Be(default(BackupMode));
     }
+
+    [Fact]
+    public void TryParseBackupMode_WithMultipleModes_ReturnsFalse()
+    {
+        var result = Program.TryParseBackupMode(
+            new[] { "--backup-heartbeat", "--backup-outbox" },
+            out var mode);
+
+        result.Should().BeFalse();
+        mode.Should().Be(default(BackupMode));
+    }
 }
 
 /// <summary>

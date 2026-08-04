@@ -48,4 +48,12 @@ public sealed class AgentLauncherCommandLineTests
         Assert.StartsWith("\"C:\\Program Files\\Agent\\agent.exe\"", commandLine);
         Assert.EndsWith(" --pipe=Pipe", commandLine);
     }
+
+    [Fact]
+    public void BuildCommandLine_EscapesQuotedPipeName()
+    {
+        var commandLine = AgentLauncher.BuildCommandLine("agent.exe", "Child\"Pipe");
+
+        Assert.Equal("\"agent.exe\" \"--pipe=Child\\\"Pipe\"", commandLine);
+    }
 }

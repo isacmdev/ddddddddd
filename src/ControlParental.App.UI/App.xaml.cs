@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Windows.ApplicationModel.DynamicDependency;
+using Microsoft.Windows.ApplicationModel.WindowsAppRuntime;
 using Microsoft.UI.Xaml;
 using ControlParental.App.UI.Interop;
 using ControlParental.Domain;

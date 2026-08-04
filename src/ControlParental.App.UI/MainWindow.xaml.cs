@@ -92,8 +92,6 @@ public sealed partial class MainWindow : Window
             OnboardingRoute.Consent => new ConsentPage(
                 onConsentGranted: () => this.OnStepCompletedAsync("consent"),
                 onTransparencyRequested: () => this.NavigateToTransparencyFromConsent()),
-            OnboardingRoute.Transparency => new TransparencyPage(
-                onBackRequested: () => this.NavigateBackToConsent()),
             OnboardingRoute.Account => new AccountStepPage(
                 onAccountCompleted: () => this.OnStepCompletedAsync("account")),
             OnboardingRoute.ServiceSetup => new ServiceSetupPage(

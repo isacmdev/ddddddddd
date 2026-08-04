@@ -8,6 +8,7 @@
     <!-- Deshabilitar CPM para evitar conflicto con PackageReference con versiones -->
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
     <SelfContained>false</SelfContained>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>
 

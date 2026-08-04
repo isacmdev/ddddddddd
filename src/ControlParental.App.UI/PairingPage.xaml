@@ -52,9 +52,9 @@
                             Width="200"
                             HorizontalAlignment="Left"
                             PlaceholderText="{x:Bind Strings.PairingAgeBandPlaceholder, Mode=OneTime}">
-                            <ComboBoxItem Content="{x:Bind Strings.AgeBand_7_12, Mode=OneTime}" Tag="7-12" />
-                            <ComboBoxItem Content="{x:Bind Strings.AgeBand_13_16, Mode=OneTime}" Tag="13-16" />
-                            <ComboBoxItem Content="{x:Bind Strings.AgeBand_17_18, Mode=OneTime}" Tag="17-18" />
+                            <ComboBoxItem Content="{x:Bind Strings.AgeBand712, Mode=OneTime}" Tag="7-12" />
+                            <ComboBoxItem Content="{x:Bind Strings.AgeBand1316, Mode=OneTime}" Tag="13-16" />
+                            <ComboBoxItem Content="{x:Bind Strings.AgeBand1718, Mode=OneTime}" Tag="17-18" />
                         </ComboBox>
                     </StackPanel>
                 </Border>

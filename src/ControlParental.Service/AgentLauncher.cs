@@ -6,6 +6,7 @@ namespace ControlParental.Service;
 
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using ControlParental.Domain;
 
 /// <summary>
@@ -16,11 +17,15 @@ public sealed class AgentLauncher : IDisposable
 {
     private readonly string agentExePath;
     private readonly string pipeName;
+    private readonly SecurityIdentifier childSid;
     private readonly Func<string, bool> validateClientSid;
     private readonly Action<IIpcMessage> onAgentMessage;
     private readonly Action onAgentDisconnected;
+    private readonly Func<int, IntPtr?> sessionUserTokenProvider;
+    private readonly Func<IIpcChannel> ipcChannelFactory;
+    private readonly IProcessLaunchApi processLaunchApi;
     private Process? agentProcess;
-    private Interop.NamedPipeServer? ipcServer;
+    private IIpcChannel? ipcServer;
     private CancellationTokenSource? cts;
     private bool disposed;
 
@@ -35,21 +40,51 @@ public sealed class AgentLauncher : IDisposable
     /// </summary>
     /// <param name="agentExePath">Path to the Session Agent executable.</param>
     /// <param name="pipeName">Name of the IPC pipe.</param>
+    /// <param name="childSid">SID allowed to connect to the agent pipe.</param>
     /// <param name="validateClientSid">Function to validate the client SID.</param>
     /// <param name="onAgentMessage">Callback when a message is received from the agent.</param>
     /// <param name="onAgentDisconnected">Callback when the agent disconnects.</param>
     public AgentLauncher(
         string agentExePath,
         string pipeName,
+        SecurityIdentifier childSid,
         Func<string, bool> validateClientSid,
         Action<IIpcMessage> onAgentMessage,
         Action onAgentDisconnected)
+        : this(
+            agentExePath,
+            pipeName,
+            childSid,
+            validateClientSid,
+            onAgentMessage,
+            onAgentDisconnected,
+            null,
+            null,
+            null)
+    {
+    }
+
+    internal AgentLauncher(
+        string agentExePath,
+        string pipeName,
+        SecurityIdentifier childSid,
+        Func<string, bool> validateClientSid,
+        Action<IIpcMessage> onAgentMessage,
+        Action onAgentDisconnected,
+        Func<int, IntPtr?>? sessionUserTokenProvider,
+        Func<IIpcChannel>? ipcChannelFactory,
+        IProcessLaunchApi? processLaunchApi)
     {
         this.agentExePath = agentExePath ?? throw new ArgumentNullException(nameof(agentExePath));
         this.pipeName = pipeName ?? throw new ArgumentNullException(nameof(pipeName));
+        this.childSid = childSid ?? throw new ArgumentNullException(nameof(childSid));
         this.validateClientSid = validateClientSid ?? throw new ArgumentNullException(nameof(validateClientSid));
         this.onAgentMessage = onAgentMessage ?? throw new ArgumentNullException(nameof(onAgentMessage));
         this.onAgentDisconnected = onAgentDisconnected ?? throw new ArgumentNullException(nameof(onAgentDisconnected));
+        this.sessionUserTokenProvider = sessionUserTokenProvider ?? this.GetSessionUserToken;
+        this.ipcChannelFactory = ipcChannelFactory ??
+            (() => new Interop.NamedPipeServer(this.pipeName, this.childSid, this.validateClientSid));
+        this.processLaunchApi = processLaunchApi ?? new NativeProcessLaunchApi();
     }
 
     /// <summary>
@@ -69,7 +104,7 @@ public sealed class AgentLauncher : IDisposable
         await this.KillAgentAsync();
 
         // Get the user token for the session
-        var userToken = this.GetSessionUserToken(sessionId);
+        var userToken = this.sessionUserTokenProvider(sessionId);
         if (userToken == null)
         {
             System.Diagnostics.Debug.WriteLine(
@@ -77,31 +112,28 @@ public sealed class AgentLauncher : IDisposable
             return false;
         }
 
-        // Start the IPC server
-        this.cts = new CancellationTokenSource();
-        this.ipcServer = new Interop.NamedPipeServer(this.pipeName, this.validateClientSid);
-        this.ipcServer.MessageReceived += this.onAgentMessage;
-        this.ipcServer.Disconnected += this.onAgentDisconnected;
-        await this.ipcServer.StartAsync(this.cts.Token);
-
-        // Launch the agent with the user's token
-        if (userToken == null)
+        try
         {
-            return false;
+            // Start the IPC server only after obtaining the target user's token.
+            this.cts = new CancellationTokenSource();
+            this.ipcServer = this.ipcChannelFactory();
+            this.ipcServer.MessageReceived += this.onAgentMessage;
+            this.ipcServer.Disconnected += this.onAgentDisconnected;
+            await this.ipcServer.StartAsync(this.cts.Token);
+
+            var success = this.CreateProcessAsUserCore(userToken.Value, sessionId);
+
+            if (!success)
+            {
+                this.StopIpcServer();
+            }
+
+            return success;
         }
-
-        var success = this.CreateProcessAsUser(userToken.Value, sessionId);
-
-        if (!success)
+        finally
         {
-            this.ipcServer.StopAsync().Wait(TimeSpan.FromSeconds(1));
-            this.ipcServer.Dispose();
-            this.ipcServer = null;
-            this.cts.Dispose();
-            this.cts = null;
+            this.processLaunchApi.CloseHandle(userToken.Value);
         }
-
-        return success;
     }
 
     /// <summary>
@@ -128,9 +160,7 @@ public sealed class AgentLauncher : IDisposable
         // Stop IPC server
         if (this.ipcServer != null)
         {
-            this.ipcServer.StopAsync().Wait(TimeSpan.FromSeconds(1));
-            this.ipcServer.Dispose();
-            this.ipcServer = null;
+            this.StopIpcServer();
         }
 
         this.cts?.Cancel();
@@ -159,6 +189,48 @@ public sealed class AgentLauncher : IDisposable
     public bool IsAgentRunning =>
         this.agentProcess != null && !this.agentProcess.HasExited;
 
+    internal static string BuildCommandLine(string executablePath, string pipeName)
+    {
+        ArgumentNullException.ThrowIfNull(executablePath);
+        ArgumentNullException.ThrowIfNull(pipeName);
+
+        return $"{QuoteCommandLineArgument(executablePath)} {QuoteCommandLineArgument($"--pipe={pipeName}")}";
+    }
+
+    private static string QuoteCommandLineArgument(string value)
+    {
+        if (value.Length > 0 && !value.Any(char.IsWhiteSpace) && !value.Contains('"'))
+        {
+            return value.StartsWith("--", StringComparison.Ordinal) ? value : $"\"{value}\"";
+        }
+
+        var result = new System.Text.StringBuilder("\"");
+        var backslashes = 0;
+        foreach (var character in value)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+
+            if (character == '"')
+            {
+                result.Append('\\', (backslashes * 2) + 1);
+                result.Append(character);
+                backslashes = 0;
+                continue;
+            }
+
+            result.Append('\\', backslashes);
+            result.Append(character);
+            backslashes = 0;
+        }
+
+        result.Append('\\', backslashes * 2);
+        return result.Append('"').ToString();
+    }
+
     private IntPtr? GetSessionUserToken(int sessionId)
     {
         try
@@ -179,27 +251,21 @@ public sealed class AgentLauncher : IDisposable
         return null;
     }
 
-    private bool CreateProcessAsUser(IntPtr userToken, int sessionId)
+    internal bool CreateProcessAsUserCore(IntPtr userToken, int sessionId)
     {
+        var duplicatedToken = IntPtr.Zero;
+        var environmentBlock = IntPtr.Zero;
+        var processInfo = default(PROCESS_INFORMATION);
+
         try
         {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = this.agentExePath,
-                Arguments = $"--pipe={this.pipeName}",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-            };
-
             // Duplicate the token to allow process creation
-            var duplicatedToken = IntPtr.Zero;
-            if (!DuplicateTokenEx(
+            if (!this.processLaunchApi.DuplicateTokenEx(
                 userToken,
                 0,
                 IntPtr.Zero,
-                SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
-                TOKEN_TYPE.TokenPrimary,
+                (int)SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
+                (int)TOKEN_TYPE.TokenPrimary,
                 out duplicatedToken))
             {
                 System.Diagnostics.Debug.WriteLine(
@@ -210,41 +276,40 @@ public sealed class AgentLauncher : IDisposable
             // Create the process with the duplicated token
             // Note: CreateProcessAsUser requires the token to have SE_ASSIGN_PRIMARY_TOKEN
             // and SE_INCREASE_QUOTA_NAME privileges, which LocalSystem typically has.
-            var processInfo = new STARTUPINFO();
-            processInfo.cb = Marshal.SizeOf<STARTUPINFO>();
+            var startupInfo = new STARTUPINFO();
+            startupInfo.cb = Marshal.SizeOf<STARTUPINFO>();
 
-            var environmentBlock = IntPtr.Zero;
-            if (!CreateEnvironmentBlock(out environmentBlock, duplicatedToken, false))
+            if (!this.processLaunchApi.CreateEnvironmentBlock(out environmentBlock, duplicatedToken, false))
             {
                 environmentBlock = IntPtr.Zero;
             }
 
-            var success = CreateProcessAsUser(
+            var success = this.processLaunchApi.CreateProcessAsUser(
                 duplicatedToken,
-                null,
                 this.agentExePath,
+                BuildCommandLine(this.agentExePath, this.pipeName),
                 IntPtr.Zero,
                 IntPtr.Zero,
                 false,
-                CreateProcessFlags.CREATE_NO_WINDOW | CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT,
+                (int)(CreateProcessFlags.CREATE_NO_WINDOW | CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT),
                 environmentBlock,
                 null,
-                ref processInfo,
-                out var procInfo);
-
-            if (environmentBlock != IntPtr.Zero)
-            {
-                DestroyEnvironmentBlock(environmentBlock);
-            }
+                ref startupInfo,
+                out processInfo);
 
             if (success)
             {
-                this.agentProcess = Process.GetProcessById((int)procInfo.dwProcessId);
-                CloseHandle(procInfo.hProcess);
-                CloseHandle(procInfo.hThread);
+                try
+                {
+                    this.agentProcess = this.processLaunchApi.GetProcessById((int)processInfo.dwProcessId);
+                }
+                catch (ArgumentException)
+                {
+                    // The process can exit before Process resolves the newly returned PID.
+                    this.agentProcess = null;
+                }
             }
 
-            CloseHandle(duplicatedToken);
             return success;
         }
         catch (Exception ex)
@@ -252,6 +317,34 @@ public sealed class AgentLauncher : IDisposable
             System.Diagnostics.Debug.WriteLine(
                 $"[AgentLauncher] CreateProcessAsUser failed: {ex.Message}");
             return false;
+        }
+        finally
+        {
+            if (environmentBlock != IntPtr.Zero)
+            {
+                this.processLaunchApi.DestroyEnvironmentBlock(environmentBlock);
+            }
+
+            this.CloseOwnedHandle(processInfo.hProcess);
+            this.CloseOwnedHandle(processInfo.hThread);
+            this.CloseOwnedHandle(duplicatedToken);
+        }
+    }
+
+    private void StopIpcServer()
+    {
+        this.ipcServer?.StopAsync().Wait(TimeSpan.FromSeconds(1));
+        (this.ipcServer as IDisposable)?.Dispose();
+        this.ipcServer = null;
+        this.cts?.Dispose();
+        this.cts = null;
+    }
+
+    private void CloseOwnedHandle(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero)
+        {
+            this.processLaunchApi.CloseHandle(handle);
         }
     }
 
@@ -282,7 +375,7 @@ public sealed class AgentLauncher : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct STARTUPINFO
+    internal struct STARTUPINFO
     {
         public int cb;
         public IntPtr lpReserved;
@@ -305,7 +398,7 @@ public sealed class AgentLauncher : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct PROCESS_INFORMATION
+    internal struct PROCESS_INFORMATION
     {
         public IntPtr hProcess;
         public IntPtr hThread;
@@ -347,4 +440,38 @@ public sealed class AgentLauncher : IDisposable
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
+
+    internal interface IProcessLaunchApi
+    {
+        bool DuplicateTokenEx(IntPtr existingToken, int desiredAccess, IntPtr tokenAttributes, int impersonationLevel, int tokenType, out IntPtr newToken);
+
+        bool CreateEnvironmentBlock(out IntPtr environment, IntPtr token, bool inherit);
+
+        bool CreateProcessAsUser(IntPtr token, string? applicationName, string commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, int flags, IntPtr environment, string? currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+
+        bool DestroyEnvironmentBlock(IntPtr environment);
+
+        Process GetProcessById(int processId);
+
+        bool CloseHandle(IntPtr handle);
+    }
+
+    private sealed class NativeProcessLaunchApi : IProcessLaunchApi
+    {
+        public bool DuplicateTokenEx(IntPtr existingToken, int desiredAccess, IntPtr tokenAttributes, int impersonationLevel, int tokenType, out IntPtr newToken)
+            => AgentLauncher.DuplicateTokenEx(existingToken, desiredAccess, tokenAttributes, (SECURITY_IMPERSONATION_LEVEL)impersonationLevel, (TOKEN_TYPE)tokenType, out newToken);
+
+        public bool CreateEnvironmentBlock(out IntPtr environment, IntPtr token, bool inherit)
+            => AgentLauncher.CreateEnvironmentBlock(out environment, token, inherit);
+
+        public bool CreateProcessAsUser(IntPtr token, string? applicationName, string commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, int flags, IntPtr environment, string? currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation)
+            => AgentLauncher.CreateProcessAsUser(token, applicationName, commandLine, processAttributes, threadAttributes, inheritHandles, (CreateProcessFlags)flags, environment, currentDirectory, ref startupInfo, out processInformation);
+
+        public bool DestroyEnvironmentBlock(IntPtr environment)
+            => AgentLauncher.DestroyEnvironmentBlock(environment);
+
+        public Process GetProcessById(int processId) => Process.GetProcessById(processId);
+
+        public bool CloseHandle(IntPtr handle) => AgentLauncher.CloseHandle(handle);
+    }
 }

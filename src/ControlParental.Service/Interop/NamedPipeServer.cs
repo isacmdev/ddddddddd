@@ -5,6 +5,7 @@
 namespace ControlParental.Service.Interop;
 
 using System.IO.Pipes;
+using System.Security.AccessControl;
 using ControlParental.Domain;
 using System.Security.Principal;
 using System.Text;
@@ -20,6 +21,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
     private const string PipeNamePrefix = "ControlParental";
     private const int BufferSize = 65536;
     private readonly string pipeName;
+    private readonly SecurityIdentifier childSid;
     private readonly Func<string, bool> validateClientSid;
     private readonly CancellationTokenSource internalCts;
     private PipeServerListener? listenerTask;
@@ -29,10 +31,15 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
     /// Initializes a new instance of the <see cref="NamedPipeServer"/> class.
     /// </summary>
     /// <param name="pipeName">The pipe name (without prefix).</param>
+    /// <param name="childSid">SID allowed to connect to the pipe.</param>
     /// <param name="validateClientSid">Function to validate the client SID.</param>
-    public NamedPipeServer(string pipeName, Func<string, bool> validateClientSid)
+    public NamedPipeServer(
+        string pipeName,
+        SecurityIdentifier childSid,
+        Func<string, bool> validateClientSid)
     {
         this.pipeName = $"{PipeNamePrefix}.{pipeName}";
+        this.childSid = childSid ?? throw new ArgumentNullException(nameof(childSid));
         this.validateClientSid = validateClientSid ?? throw new ArgumentNullException(nameof(validateClientSid));
         this.internalCts = new CancellationTokenSource();
     }
@@ -55,12 +62,51 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
 
         this.listenerTask = new PipeServerListener(
             this.pipeName,
+            this.childSid,
             this.validateClientSid,
             this.OnMessage,
             this.OnDisconnected,
             linkedCts.Token);
 
         await this.listenerTask.StartAsync();
+    }
+
+    internal static PipeSecurity CreatePipeSecurity(SecurityIdentifier childSid)
+    {
+        ArgumentNullException.ThrowIfNull(childSid);
+
+        var security = new PipeSecurity();
+        security.SetAccessRuleProtection(true, false);
+        security.AddAccessRule(new PipeAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            PipeAccessRights.FullControl,
+            AccessControlType.Allow));
+        security.AddAccessRule(new PipeAccessRule(
+            childSid,
+            PipeAccessRights.ReadWrite,
+            AccessControlType.Allow));
+        return security;
+    }
+
+    internal static bool ValidateClientSid(
+        SecurityIdentifier? clientSid,
+        Func<string, bool> validator)
+    {
+        ArgumentNullException.ThrowIfNull(validator);
+
+        if (clientSid == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return validator(clientSid.Value);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <inheritdoc />
@@ -108,6 +154,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
     private sealed class PipeServerListener : IDisposable
     {
         private readonly string pipeName;
+        private readonly SecurityIdentifier childSid;
         private readonly Func<string, bool> validateClientSid;
         private readonly Action<IIpcMessage> onMessage;
         private readonly Action onDisconnected;
@@ -118,12 +165,14 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
 
         public PipeServerListener(
             string pipeName,
+            SecurityIdentifier childSid,
             Func<string, bool> validateClientSid,
             Action<IIpcMessage> onMessage,
             Action onDisconnected,
             CancellationToken cancellationToken)
         {
             this.pipeName = pipeName;
+            this.childSid = childSid;
             this.validateClientSid = validateClientSid;
             this.onMessage = onMessage;
             this.onDisconnected = onDisconnected;
@@ -138,6 +187,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             {
                 try
                 {
+                    var pipeSecurity = CreatePipeSecurity(this.childSid);
                     this.pipeServer = NamedPipeServerStreamAcl.Create(
                         this.pipeName,
                         PipeDirection.InOut,
@@ -146,7 +196,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                         PipeOptions.Asynchronous,
                         inBufferSize: BufferSize,
                         outBufferSize: BufferSize,
-                        pipeSecurity: null,
+                        pipeSecurity: pipeSecurity,
                         inheritability: HandleInheritability.None);
 
                     await this.pipeServer.WaitForConnectionAsync(this.cancellationToken);
@@ -250,7 +300,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 }
 
                 var sidString = clientSid.Value;
-                var isValid = this.validateClientSid(sidString);
+                var isValid = ValidateClientSid(clientSid, this.validateClientSid);
 
                 if (!isValid)
                 {

@@ -33,6 +33,11 @@ public enum PairingStatus
     /// An error occurred during pairing.
     /// </summary>
     Error = 4,
+
+    /// <summary>
+    /// Pairing was rate limited and may be retried later.
+    /// </summary>
+    TooManyRequests = 5,
 }
 
 /// <summary>
@@ -108,6 +113,20 @@ public sealed class PairingResult
             ParentId = null,
             PolicyVersion = 0,
             ErrorMessage = "El código expiró. Pedí uno nuevo al administrador."
+        };
+
+    /// <summary>
+    /// Crea un resultado indicando que se alcanzó el límite de intentos.
+    /// </summary>
+    public static PairingResult TooManyRequests()
+        => new()
+        {
+            Success = false,
+            Status = PairingStatus.TooManyRequests,
+            DeviceId = null,
+            ParentId = null,
+            PolicyVersion = 0,
+            ErrorMessage = "Demasiados intentos. Esperá unos minutos e intentá de nuevo.",
         };
 
     /// <summary>

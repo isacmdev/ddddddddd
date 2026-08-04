@@ -111,7 +111,7 @@ public sealed class PairingService : IPairingService
                 PairingResult.ExpiredCode(),
 
             PairingHttpStatus.TooManyRequests =>
-                PairingResult.Error("Demasiados intentos. Esperá unos minutos e intentá de nuevo."),
+                PairingResult.TooManyRequests(),
 
             PairingHttpStatus.ServerError =>
                 PairingResult.Error("Error del servidor. Intentá de nuevo en unos minutos."),
