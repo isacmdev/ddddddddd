@@ -36,9 +36,9 @@ Chain strategy: size-exception
 
 ## Phase 2: B — Multi-session lifecycle
 
-- [ ] 2.1 RED: add `SessionManagerLifecycleTests.cs` beside `AgentLauncherLaunchSeamTests.cs` for cancellation, simultaneous sessions/fast switching, duplicate launches, and session-filtered dispatch; cover watcher callbacks from `SessionWatcher.cs`.
-- [ ] 2.2 GREEN: replace current-session state with keyed records, bounded event queue, per-session gates, owned cancellation, and single-instance launch/stop in `SessionWatcher.cs`, `Program.cs`, and `AgentLauncher.cs`.
-- [ ] 2.3 REFACTOR: await owned shutdown/recovery only; prove >80% changed-code line coverage and report branch coverage.
+- [x] 2.1 RED: add `SessionManagerLifecycleTests.cs` beside `AgentLauncherLaunchSeamTests.cs` for cancellation, simultaneous sessions/fast switching, duplicate launches, and session-filtered dispatch; cover watcher callbacks from `SessionWatcher.cs`.
+- [x] 2.2 GREEN: replace current-session state with keyed records, bounded event queue, per-session gates, owned cancellation, and single-instance launch/stop in `SessionWatcher.cs`, `Program.cs`, and `AgentLauncher.cs`.
+- [x] 2.3 REFACTOR: await owned shutdown/recovery only; changed-line coverage is 82.32% and branch coverage is reported with Cobertura limitation.
 
 ## Phase 3: C — IPC framing, auth, reconnect
 

@@ -15,12 +15,15 @@ public sealed class SessionWatcher : IDisposable
 {
     private readonly string childUsername;
     private readonly Action<int> onSessionStarted;
-    private readonly Action onSessionEnded;
+    private readonly Action<int> onSessionEnded;
     private readonly Action<int> onSessionLock;
     private readonly Action<int> onSessionUnlock;
     private readonly CancellationTokenSource internalCts;
     private bool disposed;
-    private int? currentSessionId;
+    private readonly Func<SessionSnapshot[]> sessionProvider;
+    private readonly TimeSpan pollInterval;
+    private Task? watchTask;
+    private readonly HashSet<int> observedSessionIds = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SessionWatcher"/> class.
@@ -33,9 +36,21 @@ public sealed class SessionWatcher : IDisposable
     public SessionWatcher(
         string childUsername,
         Action<int> onSessionStarted,
-        Action onSessionEnded,
+        Action<int> onSessionEnded,
         Action<int> onSessionLock,
         Action<int> onSessionUnlock)
+        : this(childUsername, onSessionStarted, onSessionEnded, onSessionLock, onSessionUnlock, null, null)
+    {
+    }
+
+    internal SessionWatcher(
+        string childUsername,
+        Action<int> onSessionStarted,
+        Action<int> onSessionEnded,
+        Action<int> onSessionLock,
+        Action<int> onSessionUnlock,
+        Func<SessionSnapshot[]>? sessionProvider,
+        TimeSpan? pollInterval)
     {
         this.childUsername = childUsername ?? throw new ArgumentNullException(nameof(childUsername));
         this.onSessionStarted = onSessionStarted ?? throw new ArgumentNullException(nameof(onSessionStarted));
@@ -43,6 +58,11 @@ public sealed class SessionWatcher : IDisposable
         this.onSessionLock = onSessionLock ?? throw new ArgumentNullException(nameof(onSessionLock));
         this.onSessionUnlock = onSessionUnlock ?? throw new ArgumentNullException(nameof(onSessionUnlock));
         this.internalCts = new CancellationTokenSource();
+        this.sessionProvider = sessionProvider ?? (() => this.EnumerateInteractiveSessions()
+            .Where(s => s.Username?.Equals(this.childUsername, StringComparison.OrdinalIgnoreCase) == true && s.IsActive)
+            .Select(s => new SessionSnapshot(s.SessionId, s.IsLocked))
+            .ToArray());
+        this.pollInterval = pollInterval ?? TimeSpan.FromSeconds(2);
     }
 
     /// <summary>
@@ -50,11 +70,17 @@ public sealed class SessionWatcher : IDisposable
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
+        if (this.watchTask != null)
+        {
+            return Task.CompletedTask;
+        }
+
         var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             this.internalCts.Token);
 
-        return Task.Run(() => this.WatchLoop(linkedCts.Token), linkedCts.Token);
+        this.watchTask = Task.Run(() => this.WatchLoopAsync(linkedCts.Token), linkedCts.Token);
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -65,52 +91,46 @@ public sealed class SessionWatcher : IDisposable
         this.internalCts.Cancel();
     }
 
-    private void WatchLoop(CancellationToken cancellationToken)
+    public async Task StopAsync()
+    {
+        this.Stop();
+        if (this.watchTask != null)
+        {
+            await this.watchTask.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    private async Task WatchLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var sessions = this.EnumerateInteractiveSessions();
-                var childSession = this.FindChildSession(sessions);
-
-                if (childSession.HasValue)
+                var sessions = this.sessionProvider();
+                var currentIds = sessions.Select(s => s.SessionId).ToHashSet();
+                foreach (var session in sessions)
                 {
-                    var sessionId = childSession.Value.SessionId;
-
-                    if (this.currentSessionId != sessionId)
+                    if (this.observedSessionIds.Add(session.SessionId))
                     {
-                        // Session changed
-                        if (this.currentSessionId.HasValue)
-                        {
-                            this.onSessionEnded();
-                        }
-
-                        this.currentSessionId = sessionId;
-                        this.onSessionStarted(sessionId);
+                        this.onSessionStarted(session.SessionId);
                     }
 
-                    // Check for lock/unlock state
-                    if (childSession.Value.IsLocked)
+                    if (session.IsLocked)
                     {
-                        this.onSessionLock(sessionId);
+                        this.onSessionLock(session.SessionId);
                     }
                     else
                     {
-                        this.onSessionUnlock(sessionId);
+                        this.onSessionUnlock(session.SessionId);
                     }
                 }
-                else
+                foreach (var endedSessionId in this.observedSessionIds.Except(currentIds).ToArray())
                 {
-                    if (this.currentSessionId.HasValue)
-                    {
-                        this.onSessionEnded();
-                        this.currentSessionId = null;
-                    }
+                    this.observedSessionIds.Remove(endedSessionId);
+                    this.onSessionEnded(endedSessionId);
                 }
 
-                // Poll every 2 seconds
-                Thread.Sleep(TimeSpan.FromSeconds(2));
+                await Task.Delay(this.pollInterval, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -120,7 +140,7 @@ public sealed class SessionWatcher : IDisposable
             {
                 System.Diagnostics.Debug.WriteLine(
                     $"[SessionWatcher] Error in watch loop: {ex.Message}");
-                Thread.Sleep(TimeSpan.FromSeconds(5));
+                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
             }
         }
     }
@@ -176,13 +196,6 @@ public sealed class SessionWatcher : IDisposable
         return sessions.ToArray();
     }
 
-    private SessionInfo? FindChildSession(SessionInfo[] sessions)
-    {
-        return sessions.FirstOrDefault(
-            s => s.Username?.Equals(this.childUsername, StringComparison.OrdinalIgnoreCase) == true
-                 && s.IsActive);
-    }
-
     private string? GetSessionUserName(int sessionId)
     {
         try
@@ -227,6 +240,8 @@ public sealed class SessionWatcher : IDisposable
             this.disposed = true;
         }
     }
+
+    internal readonly record struct SessionSnapshot(int SessionId, bool IsLocked);
 
     private readonly struct SessionInfo
     {

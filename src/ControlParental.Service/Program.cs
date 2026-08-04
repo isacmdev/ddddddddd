@@ -541,15 +541,28 @@ public sealed class SessionManager : IDisposable
     private readonly Action? onAgentRecoveryNeeded;
     private readonly Action? onAgentDeathDetected;
     private SessionWatcher? sessionWatcher;
-    private AgentLauncher? agentLauncher;
-    private int? currentSessionId;
+    private readonly Dictionary<int, SessionRecord> sessionRecords = new();
+    private readonly object recordsLock = new();
+    private Func<int, AgentLauncher>? launcherFactory;
+    private int? activeSessionId;
     private bool disposed;
 
     /// <summary>
     /// Gets the IPC channel for communicating with the agent.
     /// May be null if the agent is not running.
     /// </summary>
-    public IIpcChannel? AgentChannel => this.agentLauncher?.AgentChannel;
+    public IIpcChannel? AgentChannel
+    {
+        get
+        {
+            lock (this.recordsLock)
+            {
+                return this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var record)
+                    ? record.Launcher.AgentChannel
+                    : null;
+            }
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SessionManager"/> class.
@@ -607,7 +620,8 @@ public sealed class SessionManager : IDisposable
         AgentLauncher agentLauncher)
         : this(childUsername, agentExePath, pipeName, onForegroundChanged, onHeartbeat, onStateSnapshot)
     {
-        this.agentLauncher = agentLauncher ?? throw new ArgumentNullException(nameof(agentLauncher));
+        var injectedLauncher = agentLauncher ?? throw new ArgumentNullException(nameof(agentLauncher));
+        this.launcherFactory = _ => injectedLauncher;
     }
 
     /// <summary>
@@ -619,19 +633,19 @@ public sealed class SessionManager : IDisposable
             .Translate(typeof(SecurityIdentifier));
 
         // Create the agent launcher
-        this.agentLauncher = new AgentLauncher(
+        this.launcherFactory = sessionId => new AgentLauncher(
             this.agentExePath,
-            this.pipeName,
+            $"{this.pipeName}-{sessionId}",
             childSid,
             sid => string.Equals(sid, childSid.Value, StringComparison.Ordinal),
-            message => this.HandleAgentMessage(message),
-            () => this.OnAgentDisconnected());
+            message => this.HandleAgentMessage(sessionId, message),
+            () => this.OnAgentDisconnected(sessionId));
 
         // Create the session watcher
         this.sessionWatcher = new SessionWatcher(
             this.childUsername,
             async sessionId => await this.OnSessionStarted(sessionId),
-            () => this.OnSessionEnded(),
+            sessionId => _ = this.OnSessionEnded(sessionId),
             sessionId => this.OnSessionLocked(sessionId),
             sessionId => this.OnSessionUnlocked(sessionId));
 
@@ -646,16 +660,23 @@ public sealed class SessionManager : IDisposable
     {
         if (this.sessionWatcher != null)
         {
-            this.sessionWatcher.Stop();
+            await this.sessionWatcher.StopAsync();
             this.sessionWatcher.Dispose();
             this.sessionWatcher = null;
         }
 
-        if (this.agentLauncher != null)
+        SessionRecord[] records;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.KillAgentAsync();
-            this.agentLauncher.Dispose();
-            this.agentLauncher = null;
+            records = this.sessionRecords.Values.ToArray();
+            this.sessionRecords.Clear();
+            this.activeSessionId = null;
+        }
+
+        foreach (var record in records)
+        {
+            await record.StopAsync();
+            record.Dispose();
         }
     }
 
@@ -664,9 +685,17 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     public async Task SendToAgentAsync(IIpcMessage message, CancellationToken cancellationToken = default)
     {
-        if (this.agentLauncher != null && this.agentLauncher.IsAgentRunning)
+        SessionRecord? record;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.SendToAgentAsync(message, cancellationToken);
+            record = this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var active)
+                ? active
+                : null;
+        }
+
+        if (record != null)
+        {
+            await record.Launcher.SendToAgentAsync(message, cancellationToken);
         }
     }
 
@@ -675,26 +704,39 @@ public sealed class SessionManager : IDisposable
         System.Diagnostics.Debug.WriteLine(
             $"[SessionManager] Session started for child user: {sessionId}");
 
-        this.currentSessionId = sessionId;
-
-        // Launch the agent in the new session
-        if (this.agentLauncher != null)
+        SessionRecord record;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.LaunchAgentAsync(sessionId);
+            this.activeSessionId = sessionId;
+            if (!this.sessionRecords.TryGetValue(sessionId, out record!))
+            {
+                record = new SessionRecord(sessionId, this.launcherFactory!(sessionId));
+                this.sessionRecords.Add(sessionId, record);
+            }
         }
+
+        await record.StartAsync(sessionId);
     }
 
-    private void OnSessionEnded()
+    internal async Task OnSessionEnded(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             "[SessionManager] Session ended for child user.");
 
-        this.currentSessionId = null;
-
-        // Kill the agent when the session ends
-        if (this.agentLauncher != null)
+        SessionRecord? record;
+        lock (this.recordsLock)
         {
-            _ = this.agentLauncher.KillAgentAsync();
+            this.sessionRecords.Remove(sessionId, out record);
+            if (this.activeSessionId == sessionId)
+            {
+                this.activeSessionId = this.sessionRecords.Keys.FirstOrDefault();
+            }
+        }
+
+        if (record != null)
+        {
+            await record.StopAsync();
+            record.Dispose();
         }
     }
 
@@ -722,7 +764,8 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     private void RestorePersistentOverlay(string reason, string? ctaLabel)
     {
-        if (this.agentLauncher == null || !this.agentLauncher.IsAgentRunning)
+        var launcher = this.GetActiveLauncher();
+        if (launcher == null || !launcher.IsAgentRunning)
         {
             System.Diagnostics.Debug.WriteLine(
                 "[SessionManager] Cannot restore overlay: agent not running.");
@@ -730,7 +773,7 @@ public sealed class SessionManager : IDisposable
         }
 
         var overlayMessage = new ShowOverlay(reason, ctaLabel);
-        this.agentLauncher.SendToAgentAsync(overlayMessage, CancellationToken.None)
+        launcher.SendToAgentAsync(overlayMessage, CancellationToken.None)
             .ContinueWith(_ => System.Diagnostics.Debug.WriteLine(
                 $"[SessionManager] Persistent overlay restored: {reason}"));
     }
@@ -740,13 +783,14 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     private async Task DefaultSendOverlayAsync(string reason, string? ctaLabel, IIpcMessage? message)
     {
-        if (this.agentLauncher != null && this.agentLauncher.IsAgentRunning && message != null)
+        var launcher = this.GetActiveLauncher();
+        if (launcher != null && launcher.IsAgentRunning && message != null)
         {
-            await this.agentLauncher.SendToAgentAsync(message, CancellationToken.None);
+            await launcher.SendToAgentAsync(message, CancellationToken.None);
         }
     }
 
-    private void HandleAgentMessage(IIpcMessage message)
+    private void HandleAgentMessage(int sessionId, IIpcMessage message)
     {
         switch (message)
         {
@@ -769,7 +813,7 @@ public sealed class SessionManager : IDisposable
         }
     }
 
-    private void OnAgentDisconnected()
+    private void OnAgentDisconnected(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             "[SessionManager] Agent disconnected.");
@@ -784,19 +828,123 @@ public sealed class SessionManager : IDisposable
         this.onAgentRecoveryNeeded?.Invoke();
     }
 
-    internal Task<bool> RecoverAgentAsync(CancellationToken cancellationToken = default)
+    internal async Task<bool> RecoverAgentAsync(CancellationToken cancellationToken = default)
     {
-        return this.agentLauncher != null && this.currentSessionId is int sessionId
-            ? this.agentLauncher.LaunchAgentAsync(sessionId, cancellationToken)
-            : Task.FromResult(false);
+        SessionRecord[] records;
+        lock (this.recordsLock)
+        {
+            records = this.sessionRecords.Values.ToArray();
+        }
+
+        var recovered = false;
+        foreach (var record in records)
+        {
+            recovered |= await record.RecoverAsync(cancellationToken);
+        }
+
+        return recovered;
     }
 
     public void Dispose()
     {
         if (!this.disposed)
         {
-            this.StopAsync().Wait(TimeSpan.FromSeconds(5));
+            _ = this.StopAsync();
             this.disposed = true;
+        }
+    }
+
+    private AgentLauncher? GetActiveLauncher()
+    {
+        lock (this.recordsLock)
+        {
+            return this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var record)
+                ? record.Launcher
+                : null;
+        }
+    }
+
+    private sealed class SessionRecord : IDisposable
+    {
+        private readonly SemaphoreSlim lifecycleGate = new(1, 1);
+        private bool started;
+        private Task<bool>? recoveryTask;
+
+        public SessionRecord(int sessionId, AgentLauncher launcher)
+        {
+            this.SessionId = sessionId;
+            this.Launcher = launcher;
+        }
+
+        public int SessionId { get; }
+        public AgentLauncher Launcher { get; }
+
+        public async Task StartAsync(int sessionId)
+        {
+            await this.lifecycleGate.WaitAsync();
+            try
+            {
+                if (!this.started)
+                {
+                    this.started = await this.Launcher.LaunchAgentAsync(sessionId);
+                }
+            }
+            finally
+            {
+                this.lifecycleGate.Release();
+            }
+        }
+
+        public async Task StopAsync()
+        {
+            await this.lifecycleGate.WaitAsync();
+            try
+            {
+                await this.Launcher.KillAgentAsync();
+                this.started = false;
+            }
+            finally
+            {
+                this.lifecycleGate.Release();
+            }
+        }
+
+        public Task<bool> RecoverAsync(CancellationToken cancellationToken)
+        {
+            lock (this)
+            {
+                return this.recoveryTask ??= RecoverCoreAsync(cancellationToken);
+            }
+        }
+
+        private async Task<bool> RecoverCoreAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await this.lifecycleGate.WaitAsync(cancellationToken);
+                try
+                {
+                    this.started = await this.Launcher.LaunchAgentAsync(this.SessionId, cancellationToken);
+                    return this.started;
+                }
+                finally
+                {
+                    this.lifecycleGate.Release();
+                }
+            }
+            finally
+            {
+                lock (this)
+                {
+                    this.recoveryTask = null;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            this.Launcher.Dispose();
+            this.lifecycleGate.Dispose();
         }
     }
 }

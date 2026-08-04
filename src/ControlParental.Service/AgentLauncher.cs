@@ -100,8 +100,8 @@ public sealed class AgentLauncher : IDisposable
             throw new ObjectDisposedException(nameof(AgentLauncher));
         }
 
-        // Kill existing agent if any
-        await this.KillAgentAsync();
+        // A launcher owns exactly one process/channel. Stop it before replacing it.
+        await this.StopAgentCoreAsync(cancellationToken);
 
         // Get the user token for the session
         var userToken = this.sessionUserTokenProvider(sessionId);
@@ -120,12 +120,13 @@ public sealed class AgentLauncher : IDisposable
             this.ipcServer.MessageReceived += this.onAgentMessage;
             this.ipcServer.Disconnected += this.onAgentDisconnected;
             await this.ipcServer.StartAsync(this.cts.Token);
+            cancellationToken.ThrowIfCancellationRequested();
 
             var success = this.CreateProcessAsUserCore(userToken.Value, sessionId);
 
             if (!success)
             {
-                this.StopIpcServer();
+                await this.StopIpcServerAsync();
             }
 
             return success;
@@ -139,14 +140,23 @@ public sealed class AgentLauncher : IDisposable
     /// <summary>
     /// Kills the running agent process.
     /// </summary>
-    public Task KillAgentAsync()
+    public Task KillAgentAsync(CancellationToken cancellationToken = default)
+        => this.StopAgentCoreAsync(cancellationToken);
+
+    private async Task StopAgentCoreAsync(CancellationToken cancellationToken)
     {
         if (this.agentProcess != null && !this.agentProcess.HasExited)
         {
             try
             {
                 this.agentProcess.Kill(entireProcessTree: true);
-                this.agentProcess.WaitForExit(TimeSpan.FromSeconds(5));
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                await this.agentProcess.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -160,14 +170,13 @@ public sealed class AgentLauncher : IDisposable
         // Stop IPC server
         if (this.ipcServer != null)
         {
-            this.StopIpcServer();
+            await this.StopIpcServerAsync();
         }
 
         this.cts?.Cancel();
         this.cts?.Dispose();
         this.cts = null;
 
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -331,9 +340,20 @@ public sealed class AgentLauncher : IDisposable
         }
     }
 
-    private void StopIpcServer()
+    private async Task StopIpcServerAsync()
     {
-        this.ipcServer?.StopAsync().Wait(TimeSpan.FromSeconds(1));
+        if (this.ipcServer != null)
+        {
+            try
+            {
+                await this.ipcServer.StopAsync().WaitAsync(TimeSpan.FromSeconds(1));
+            }
+            catch (TimeoutException)
+            {
+                System.Diagnostics.Debug.WriteLine("[AgentLauncher] IPC stop timed out.");
+            }
+        }
+
         (this.ipcServer as IDisposable)?.Dispose();
         this.ipcServer = null;
         this.cts?.Dispose();
@@ -352,8 +372,8 @@ public sealed class AgentLauncher : IDisposable
     {
         if (!this.disposed)
         {
-            this.KillAgentAsync().Wait(TimeSpan.FromSeconds(2));
             this.disposed = true;
+            this.cts?.Cancel();
         }
     }
 

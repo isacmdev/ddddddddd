@@ -146,6 +146,116 @@ public sealed class AgentLauncherLaunchSeamTests
         Assert.Equal(new[] { 7, 7 }, requestedSessionIds);
     }
 
+    [Fact]
+    public async Task SessionManager_SuppressesDuplicateStartAndStopsOwnedRecord()
+    {
+        var tokenRequests = 0;
+        var api = new FakeProcessLaunchApi
+        {
+            DuplicateTokenResult = true,
+            EnvironmentBlock = new IntPtr(0x2222),
+            CreateProcessResult = true,
+        };
+        var launcher = CreateLauncher(api, _ =>
+        {
+            tokenRequests++;
+            return new IntPtr(0x1111);
+        });
+        var manager = CreateManager(launcher);
+
+        await manager.OnSessionStarted(7);
+        await manager.OnSessionStarted(7);
+
+        Assert.NotNull(manager.AgentChannel);
+        Assert.Equal(1, tokenRequests);
+        await manager.SendToAgentAsync(new ShowOverlay("lifecycle", null));
+        await manager.OnSessionEnded(7);
+        await manager.StopAsync();
+        manager.Dispose();
+    }
+
+    [Fact]
+    public async Task AgentLauncher_FailedProcessLaunchStopsTheOwnedChannel()
+    {
+        var api = new FakeProcessLaunchApi
+        {
+            DuplicateTokenResult = true,
+            EnvironmentBlock = new IntPtr(0x2222),
+            CreateProcessResult = false,
+        };
+        var channel = new FakeIpcChannel();
+        var launcher = CreateLauncher(api, _ => new IntPtr(0x1111), () => channel);
+
+        var success = await launcher.LaunchAgentAsync(7);
+
+        Assert.False(success);
+        Assert.False(channel.IsConnected);
+        Assert.Contains(new IntPtr(0x1111), api.ClosedHandles);
+        launcher.Dispose();
+    }
+
+    [Fact]
+    public async Task AgentLauncher_MissingSessionTokenReturnsWithoutStartingIpc()
+    {
+        var api = new FakeProcessLaunchApi();
+        var starts = 0;
+        var launcher = CreateLauncher(api, _ => null, () =>
+        {
+            starts++;
+            return new FakeIpcChannel();
+        });
+
+        var success = await launcher.LaunchAgentAsync(7);
+
+        Assert.False(success);
+        Assert.Equal(0, starts);
+        launcher.Dispose();
+    }
+
+    [Fact]
+    public async Task SessionManager_RecoveryFailureRemainsBoundedAndObservable()
+    {
+        var api = new FakeProcessLaunchApi
+        {
+            DuplicateTokenResult = true,
+            EnvironmentBlock = new IntPtr(0x2222),
+            CreateProcessResult = false,
+        };
+        var manager = CreateManager(CreateLauncher(api, _ => new IntPtr(0x1111)));
+
+        await manager.OnSessionStarted(7);
+        var recovered = await manager.RecoverAgentAsync();
+
+        Assert.False(recovered);
+        await manager.StopAsync();
+        manager.Dispose();
+    }
+
+    private static SessionManager CreateManager(AgentLauncher launcher)
+        => new(
+            string.Empty,
+            "ControlParental.SessionAgent.exe",
+            "SessionAgent",
+            _ => { },
+            _ => { },
+            _ => { },
+            launcher);
+
+    private static AgentLauncher CreateLauncher(
+        FakeProcessLaunchApi api,
+        Func<int, IntPtr?> tokenProvider,
+        Func<IIpcChannel>? channelFactory = null)
+        => new(
+            "ControlParental.SessionAgent.exe",
+            "SessionAgent",
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+            _ => true,
+            _ => { },
+            () => { },
+            tokenProvider,
+            channelFactory ?? (() => new FakeIpcChannel()),
+            api);
+
     private sealed class FakeIpcChannel : IIpcChannel, IDisposable
     {
         public bool IsConnected { get; private set; }
