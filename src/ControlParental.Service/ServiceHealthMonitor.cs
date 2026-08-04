@@ -23,6 +23,7 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
     private int agentRestartCount;
     private bool isRunning;
     private bool disposed;
+    private RuntimeSecurityVerdict securityVerdict = RuntimeSecurityVerdict.HealthyStandard;
 
     private const int MaxAgentDeathsBeforeAlert = 3;
 
@@ -66,7 +67,20 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
     }
 
     /// <inheritdoc />
-    public bool IsServiceHealthy => this.isRunning && !this.disposed;
+    public bool IsServiceHealthy =>
+        this.isRunning && !this.disposed && RuntimeSecurityVerdictEvaluator.IsHealthy(this.securityVerdict);
+
+    public RuntimeSecurityVerdict SecurityVerdict => this.securityVerdict;
+
+    public bool IsEnforcementActive => true;
+
+    public bool CanProceedWithHealthyOnboarding =>
+        RuntimeSecurityVerdictEvaluator.IsHealthy(this.securityVerdict);
+
+    public void ApplySecurityVerdict(RuntimeSecurityVerdict verdict)
+    {
+        this.securityVerdict = verdict;
+    }
 
     /// <inheritdoc />
     public DateTimeOffset? LastAgentHeartbeat
@@ -174,6 +188,11 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
         if (!this.isRunning)
         {
             issues.Add("Monitor is not running");
+        }
+
+        if (!RuntimeSecurityVerdictEvaluator.IsHealthy(this.securityVerdict))
+        {
+            issues.Add($"Runtime security verdict is {this.securityVerdict}; enforcement remains active");
         }
 
         if (this.lastAgentHeartbeatTicks.HasValue)

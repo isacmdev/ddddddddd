@@ -227,13 +227,10 @@ public static class Program
         builder.Services.AddSingleton<IOverlayPersistenceManager, OverlayPersistenceManager>();
 
         // T10: Register ServiceHealthMonitor and ServiceRecoveryManager
-        builder.Services.AddSingleton<IServiceHealthMonitor>((sp) =>
+        builder.Services.AddSingleton<ServiceHealthMonitor>();
+        builder.Services.AddSingleton<IServiceHealthMonitor>(sp =>
         {
-            var timeProvider = sp.GetRequiredService<ITimeProvider>();
-            return new ServiceHealthMonitor(
-                timeProvider: timeProvider,
-                onAgentDied: () => System.Diagnostics.Debug.WriteLine("[HealthMonitor] Agent died."),
-                onServiceUnhealthy: issue => System.Diagnostics.Debug.WriteLine($"[HealthMonitor] Unhealthy: {issue}"));
+            return sp.GetRequiredService<ServiceHealthMonitor>();
         });
         builder.Services.AddSingleton<IServiceRecoveryManager>((sp) =>
         {
@@ -361,7 +358,8 @@ public static class Program
             new OnboardingStateService(
                 DataFolderPath,
                 sp.GetRequiredService<IChildAccountStore>(),
-                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OnboardingStateService>>()));
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OnboardingStateService>>(),
+                () => sp.GetRequiredService<ServiceHealthMonitor>().CanProceedWithHealthyOnboarding));
         builder.Services.AddSingleton<IOnboardingStateService>(sp =>
             sp.GetRequiredService<OnboardingStateService>());
         builder.Services.AddSingleton<EnforcementLevelQueryHandler>();
@@ -467,6 +465,8 @@ public static class Program
     private static async Task ApplyHardeningAsync(IServiceProvider services)
     {
         var aclHardener = services.GetRequiredService<IAclHardener>();
+        var privilegeLevel = await services.GetRequiredService<IPrivilegeInspector>()
+            .GetPrivilegeLevelAsync(cancellationToken: CancellationToken.None);
 
         if (!Directory.Exists(DataFolderPath))
         {
@@ -481,12 +481,15 @@ public static class Program
             }
         }
 
-        _ = await aclHardener.HardenAllAsync(
+        var aclSucceeded = await aclHardener.HardenAllAsync(
             AgentFolderPath,
             DataFolderPath,
             ServiceRegistryKey,
             ServiceExePath,
             CancellationToken.None);
+
+        var verdict = RuntimeSecurityVerdictEvaluator.Evaluate(privilegeLevel, aclSucceeded);
+        services.GetRequiredService<ServiceHealthMonitor>().ApplySecurityVerdict(verdict);
 
         var scmController = services.GetRequiredService<IScmController>();
         _ = await scmController.ConfigureFailureActionsAsync(ServiceName, CancellationToken.None);

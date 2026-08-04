@@ -5,6 +5,8 @@
 namespace ControlParental.Service.Tests;
 
 using ControlParental.Domain;
+using Microsoft.Win32;
+using System.Security.Principal;
 using Xunit;
 
 /// <summary>
@@ -14,6 +16,46 @@ using Xunit;
 /// </summary>
 public class AclHardenerTests
 {
+    [Fact]
+    public async Task Hardening_HardenAgentFolderAsync_RepeatedApplication_IsSuccessful()
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"cp_acl_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempPath);
+        var hardener = new AclHardener();
+
+        try
+        {
+            var first = await hardener.HardenAgentFolderAsync(tempPath);
+            var second = await hardener.HardenAgentFolderAsync(tempPath);
+            await File.WriteAllTextAsync(Path.Combine(tempPath, "data.txt"), "test");
+            var fileResult = await hardener.HardenDataFolderAsync(Path.Combine(tempPath, "data.txt"));
+            var binaryResult = await hardener.HardenServiceBinaryAsync(Path.Combine(tempPath, "data.txt"));
+
+            Assert.True(first);
+            Assert.True(second);
+            Assert.True(fileResult);
+            Assert.True(binaryResult);
+
+            if (new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))
+            {
+                var keyPath = $"SOFTWARE\\ControlParental-Harness-{Guid.NewGuid():N}";
+                try
+                {
+                    using var key = Registry.LocalMachine.CreateSubKey(keyPath);
+                    Assert.NotNull(key);
+                    Assert.True(await hardener.HardenRegistryKeyAsync(keyPath));
+                }
+                finally
+                {
+                    Registry.LocalMachine.DeleteSubKeyTree(keyPath, throwOnMissingSubKey: false);
+                }
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(tempPath, recursive: true); } catch { }
+        }
+    }
     [Fact]
     public async Task HardenAgentFolderAsync_OnNewDirectory_ShouldSucceed()
     {

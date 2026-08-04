@@ -66,7 +66,7 @@ public sealed class AclHardener : IAclHardener
                         PropagationFlags.None,
                         AccessControlType.Deny);
 
-                    rs.AddAccessRule(rule);
+                    rs.SetAccessRule(rule);
                     key.SetAccessControl(rs);
 
                     return true;
@@ -117,8 +117,8 @@ public sealed class AclHardener : IAclHardener
                         FileSystemRights.ChangePermissions,
                         AccessControlType.Deny);
 
-                    fs.AddAccessRule(deleteRule);
-                    fs.AddAccessRule(changeRule);
+                    fs.SetAccessRule(deleteRule);
+                    fs.SetAccessRule(changeRule);
 
                     fileInfo.SetAccessControl(fs);
                     return true;
@@ -180,8 +180,8 @@ public sealed class AclHardener : IAclHardener
                     FileSystemRights.ChangePermissions,
                     AccessControlType.Deny);
 
-                ds.AddAccessRule(deleteRule);
-                ds.AddAccessRule(changeRule);
+                ds.SetAccessRule(deleteRule);
+                ds.SetAccessRule(changeRule);
 
                 dirInfo.SetAccessControl(ds);
                 return true;
@@ -201,8 +201,8 @@ public sealed class AclHardener : IAclHardener
                     FileSystemRights.Delete,
                     AccessControlType.Deny);
 
-                fs.AddAccessRule(writeRule);
-                fs.AddAccessRule(deleteRule);
+                fs.SetAccessRule(writeRule);
+                fs.SetAccessRule(deleteRule);
 
                 fileInfo.SetAccessControl(fs);
                 return true;

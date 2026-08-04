@@ -141,6 +141,24 @@ public class ServiceHealthMonitorTests : IDisposable
         this.monitor.IsServiceHealthy.Should().BeTrue();
     }
 
+    [Theory]
+    [InlineData(RuntimeSecurityVerdict.HealthyStandard, true, true)]
+    [InlineData(RuntimeSecurityVerdict.Administrator, true, true)]
+    [InlineData(RuntimeSecurityVerdict.Unknown, false, true)]
+    [InlineData(RuntimeSecurityVerdict.AclFailure, false, true)]
+    public async Task Hardening_ApplySecurityVerdict_PublishesHealthWithoutDisablingEnforcement(
+        RuntimeSecurityVerdict verdict,
+        bool healthy,
+        bool enforcementActive)
+    {
+        this.monitor.ApplySecurityVerdict(verdict);
+        await this.monitor.StartAsync();
+
+        this.monitor.IsServiceHealthy.Should().Be(healthy);
+        this.monitor.IsEnforcementActive.Should().Be(enforcementActive);
+        this.monitor.SecurityVerdict.Should().Be(verdict);
+    }
+
     [Fact]
     public async Task StartAsync_WhenDisposed_ThrowsObjectDisposedException()
     {

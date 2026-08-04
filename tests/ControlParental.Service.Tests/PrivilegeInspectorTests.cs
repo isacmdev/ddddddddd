@@ -15,6 +15,18 @@ using Xunit;
 /// </summary>
 public class PrivilegeInspectorTests
 {
+    [Theory]
+    [InlineData(PrivilegeLevel.Standard, true, RuntimeSecurityVerdict.HealthyStandard)]
+    [InlineData(PrivilegeLevel.Administrator, true, RuntimeSecurityVerdict.Administrator)]
+    [InlineData(PrivilegeLevel.Unknown, true, RuntimeSecurityVerdict.Unknown)]
+    [InlineData(PrivilegeLevel.Standard, false, RuntimeSecurityVerdict.AclFailure)]
+    public void Hardening_RuntimeSecurityVerdictEvaluator_UsesPrivilegeAndAclOutcome(
+        PrivilegeLevel privilegeLevel,
+        bool aclSucceeded,
+        RuntimeSecurityVerdict expected)
+    {
+        RuntimeSecurityVerdictEvaluator.Evaluate(privilegeLevel, aclSucceeded).Should().Be(expected);
+    }
     [Fact]
     public async Task GetPrivilegeLevelAsync_WithNoUsername_ReturnsCurrentUserLevel()
     {
