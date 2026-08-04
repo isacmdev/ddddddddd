@@ -11,7 +11,11 @@
 - [x] 2.2 GREEN
 - [x] 2.3 REFACTOR — changed-line coverage gate satisfied; WTS runtime evidence deferred/unavailable
 - [x] Unit B complete — runtime WTS harness deferred/unavailable
-- [ ] Work Units C and D pending
+- [x] 3.1 RED — C1 codec tests isolated in Domain.Tests; historical C2 RED attempt retained below
+- [x] 3.2 GREEN — C1 pure managed codec isolated; historical C2 GREEN attempt rolled back and remains pending
+- [x] 3.3 REFACTOR — exact C1 changed-line coverage gate satisfied; branch coverage reported
+- [ ] Work Unit C complete — C1 complete; C2 deferred/pending; preserve Unit A/B completion
+- [ ] Work Unit D pending
 
 ## Implementation
 
@@ -46,3 +50,17 @@ Unit B adds records keyed by WTS session ID, a cancellable bounded polling loop,
 - Rollback: revert `Program.cs`, `SessionWatcher.cs`, `AgentLauncher.cs`, `SessionManagerLifecycleTests.cs`, and this Unit B evidence; Unit A files and evidence remain intact.
 
 Pending: runtime WTS evidence is deferred/unavailable. Work Units C and D remain pending.
+
+## Historical C2 attempt (preserved, rolled back)
+
+The prior C2 attempt added authenticated native transport, session handshake, PID/SID/AuthentiCode checks, reconnect, serialized pipe writes, and native security/identity tests. Its evidence remained partial/blocked: exact changed-line coverage was 48/210 (22.86%), the ACL-backed loopback timed out, the real client loopback hung under blame-hang, and AuthentiCode was unavailable/invalidated. These facts are preserved historically; no C2 implementation remains in the working tree.
+
+## Isolated C1 final state
+
+C1 retains only `IpcFrameCodec`: pure managed 4-byte little-endian framing, a strict 64 KiB payload limit, incremental decoding, and JSON-object validation. Tests now live in `tests/ControlParental.Domain.Tests/IpcFrameCodecTests.cs` and cover fragmented/coalesced, malformed, and oversized frames. The managed test harness, focused coverage run, and full solution build have passed.
+
+- Native token: `sha256:507d746b56c92c34c4ed75a63c146decc493cb86934f461531af330ced30557c`.
+- C2 paths verified identical to Unit B commit `736d56907d62135e325b22c8f2aa43fc9169408b`.
+- C1 verification: focused codec tests 2/2; full solution build 0 errors; exact changed-line coverage 33/39 (84.62%), branches 8/12 (66.67%).
+- Evidence manifest: `evidence-manifest-unit-c.md`; current verification revision is calculated after this document is settled.
+- Unit A/B implementation and evidence remain preserved; Unit D remains untouched.
