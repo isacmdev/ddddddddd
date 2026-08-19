@@ -43,7 +43,7 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 
 ## Phase 2: Delivery and Admission (PR2)
 
-- [ ] 2.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `BackendClientTests.cs`, `BackendClientSingleRequestTests.cs`, and `AuthenticatedBackendClientTests.cs`; update `BackendClient.cs`/`IBackendClient.cs` for T10-B identity gating, idempotency, redacted outcomes, bounded transport retry, timeout, and cancellation.
+- [x] 2.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `BackendClientTests.cs`, `BackendClientSingleRequestTests.cs`, and `AuthenticatedBackendClientTests.cs`; update `BackendClient.cs`/`IBackendClient.cs` for T10-B identity gating, idempotency, redacted outcomes, bounded transport retry, timeout, and cancellation.
 - [ ] 2.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `ScheduledWorkServiceTests.cs`, `ScheduledWorkServiceBackoffDecrementTests.cs`, `ScheduledWorkServiceAsyncDispatchTests.cs`, and `ScheduledWorkServiceIdentityTests.cs`; update `ScheduledWorkService.cs` for one owner, finite backoff/scans, connectivity, non-overlap, lifecycle, and shutdown bounds; remove bridge.
 
 ## Phase 3: Restart and Backup Composition (PR3)

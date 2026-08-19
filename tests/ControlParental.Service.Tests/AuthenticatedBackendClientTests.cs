@@ -42,6 +42,48 @@ public sealed class AuthenticatedBackendClientTests
         Assert.False(result.Success); Assert.Equal(0, sends);
     }
 
+    [Fact]
+    public async Task FetchPolicyAsync_DefinitiveIdentityTimeout_ReturnsRequestTimeoutWithoutSending()
+    {
+        var sends = 0;
+        var authority = Authority.TimedOut();
+        var sut = Client(new StubHandler((_, _) =>
+        {
+            sends++;
+            return Task.FromResult(Response(HttpStatusCode.OK));
+        }), authority, Options([]) with { RequestTimeout = TimeSpan.FromMilliseconds(20) });
+
+        var operation = sut.FetchPolicyAsync("device-a", 1);
+        var completed = await Task.WhenAny(operation, Task.Delay(TimeSpan.FromSeconds(1)));
+
+        Assert.Same(operation, completed);
+        var result = await operation;
+        Assert.False(result.Success);
+        Assert.Equal("Request timeout", result.ErrorMessage);
+        Assert.Equal(0, sends);
+    }
+
+    [Fact]
+    public async Task FetchPolicyAsync_AuthenticatedSendTimeout_ReturnsRequestTimeoutWithoutCallerCancellation()
+    {
+        var sends = 0;
+        var sut = Client(new StubHandler(async (_, token) =>
+        {
+            sends++;
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return Response(HttpStatusCode.OK);
+        }), Authority.Definitive("access-one", 7), Options([]) with { RequestTimeout = TimeSpan.FromMilliseconds(20) });
+
+        var operation = sut.FetchPolicyAsync("device-a", 1);
+        var completed = await Task.WhenAny(operation, Task.Delay(TimeSpan.FromSeconds(1)));
+
+        Assert.Same(operation, completed);
+        var result = await operation;
+        Assert.False(result.Success);
+        Assert.Equal("Request timeout", result.ErrorMessage);
+        Assert.Equal(1, sends);
+    }
+
     [Theory]
     [InlineData(HttpStatusCode.Unauthorized)]
     [InlineData(HttpStatusCode.Forbidden)]
@@ -182,6 +224,11 @@ public sealed class AuthenticatedBackendClientTests
         }
 
         public static Authority Denied() => new();
+
+        public static Authority TimedOut() => new()
+        {
+            result = BackendDefinitiveSessionResult.Failed(BackendIdentityErrorV1.Timeout),
+        };
 
         public Task<BackendDefinitiveSessionResult> GetDefinitiveSessionAsync(CancellationToken cancellationToken = default) => Task.FromResult(this.result);
 

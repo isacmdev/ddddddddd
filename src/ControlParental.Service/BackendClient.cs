@@ -94,7 +94,8 @@ public sealed class BackendClient : IBackendClient
     private async Task<HttpResponseMessage?> SendAuthenticatedAsync(
         Func<HttpRequestMessage> requestFactory,
         bool retryable,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool classifyTimeout = false)
     {
         if (this.identityCoordinator is null)
         {
@@ -112,9 +113,18 @@ public sealed class BackendClient : IBackendClient
         for (var attempt = 0; attempt < this.reliability.MaximumAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var authorization = await this.identityCoordinator.GetDefinitiveSessionAsync(cancellationToken);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(this.reliability.RequestTimeout);
+            var authorization = await this.identityCoordinator.GetDefinitiveSessionAsync(
+                classifyTimeout ? timeout.Token : cancellationToken);
+
             if (!authorization.IsSuccess)
             {
+                if (classifyTimeout && authorization.Error == BackendIdentityErrorV1.Timeout)
+                {
+                    throw new TaskCanceledException("Backend request timed out", null, timeout.Token);
+                }
+
                 return null;
             }
 
@@ -125,8 +135,6 @@ public sealed class BackendClient : IBackendClient
                 request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
             }
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(this.reliability.RequestTimeout);
             HttpResponseMessage response;
             try
             {
@@ -135,6 +143,10 @@ public sealed class BackendClient : IBackendClient
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 throw;
+            }
+            catch (OperationCanceledException) when (classifyTimeout)
+            {
+                throw new TaskCanceledException("Backend request timed out", null, timeout.Token);
             }
             catch (OperationCanceledException)
             {
@@ -224,7 +236,8 @@ public sealed class BackendClient : IBackendClient
                     Content = JsonContent.Create(new { p_device_id = deviceId }),
                 },
                 retryable: true,
-                cancellationToken);
+                cancellationToken,
+                classifyTimeout: true);
 
             if (response is null || !response.IsSuccessStatusCode)
             {
@@ -242,17 +255,21 @@ public sealed class BackendClient : IBackendClient
 
             return PolicyFetchResult.Succeeded(result.Version, result.PolicyJson ?? string.Empty);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return PolicyFetchResult.Failed($"Network error: {ex.Message}");
+            return PolicyFetchResult.Failed("Network error");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (TaskCanceledException ex) when (ex.CancellationToken != cancellationToken)
         {
             return PolicyFetchResult.Failed("Request timeout");
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return PolicyFetchResult.Failed($"Unexpected error: {ex.Message}");
+            return PolicyFetchResult.Failed("Unexpected error");
         }
     }
 
@@ -298,17 +315,17 @@ public sealed class BackendClient : IBackendClient
 
             return DataPushResult.Succeeded(logsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -347,17 +364,17 @@ public sealed class BackendClient : IBackendClient
 
             return DataPushResult.Succeeded(alertsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -396,17 +413,17 @@ public sealed class BackendClient : IBackendClient
 
             return DataPushResult.Succeeded(eventsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -444,17 +461,17 @@ public sealed class BackendClient : IBackendClient
                 result?.ServerTimeOffsetMs,
                 result?.NewPolicyAvailable ?? false);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return HeartbeatResult.Failed($"Network error: {ex.Message}");
+            return HeartbeatResult.Failed("Network error");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return HeartbeatResult.Failed($"Unexpected error: {ex.Message}");
+            return HeartbeatResult.Failed("Unexpected error");
         }
     }
 
