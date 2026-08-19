@@ -290,6 +290,8 @@ public sealed class NamedPipeUIServerHostedAdapterTests : IDisposable
         var createAttempts = 0;
         var backoffEntered = new TaskCompletionSource<object?>(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBackoff = new TaskCompletionSource<object?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var pipe = new FakeUiPipeServer();
         var listener = this.CreateListener(
             cancellation.Token,
@@ -305,18 +307,28 @@ public sealed class NamedPipeUIServerHostedAdapterTests : IDisposable
             },
             (_, _) =>
             {
-                backoffEntered.SetResult(null);
-                return Task.CompletedTask;
+                backoffEntered.TrySetResult(null);
+                return releaseBackoff.Task;
             });
 
         var startTask = listener.StartAsync();
-        await backoffEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        Assert.False(listener.IsReady);
+        try
+        {
+            await backoffEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.False(listener.IsReady);
 
-        await pipe.ConnectionWaitStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        Assert.True(listener.IsReady);
-        cancellation.Cancel();
-        await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+            releaseBackoff.TrySetResult(null);
+            await pipe.ConnectionWaitStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.True(
+                SpinWait.SpinUntil(() => listener.IsReady, TimeSpan.FromSeconds(1)),
+                "Listener did not report ready within one second after the pipe began waiting for a connection.");
+        }
+        finally
+        {
+            releaseBackoff.TrySetResult(null);
+            cancellation.Cancel();
+            await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+        }
     }
 
     [Fact]
