@@ -16,6 +16,12 @@ Chained PRs recommended: Yes
 Chain strategy: feature-branch-chain
 400-line budget risk: High
 
+## Governance / Closure Criterion
+
+The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure of those four tasks once the fresh current foundation-focused green gate passes. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and MUST NOT be fabricated; they are no longer blockers under this governance decision. This is not a size exception and does not relax strict TDD, feature-branch-chain, real-worktree, or ≤400-line requirements for post-baseline units.
+
+**Current gate status (2026-08-19):** Foundation implementation evidence is green in the preserved apply history. The fresh combined foundation suite passed 28, the scheduler suite passed 89, and the Domain suite passed 97 after minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`. The four foundation checkboxes are now accepted and the formal count is **5/11**.
+
 ### Suggested Work Units
 
 | Unit | Goal | PR | Base / budget |
@@ -29,10 +35,10 @@ Chain strategy: feature-branch-chain
 
 ## Phase 1: Durable Foundation
 
-- [ ] 1.1A **RED → minimal GREEN → TRIANGULATE/REFACTOR** in dedicated `tests/ControlParental.Service.Tests/OutboxClaimAdmissionTests.cs` with shared fixture support owned by A: combine contracts/status/entities with real claim admission, eligibility/order-before-`LIMIT`, bounded pages, and concurrent claims in `src/ControlParental.Domain/IOutboxManager.cs`, `OutboxEntryStatus.cs`, `OutboxEntry.cs`, `src/ControlParental.Service/PolicyDbEntity.cs`, `OutboxManager.cs`, and `ControlParentalDbContext.cs`; later children reuse helpers with no double-count. Preserve unrelated pre-existing `OutboxManagerTests.cs` content. Behavior proves invariants; enum/input-only assertions are forbidden.
-- [ ] 1.1B1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `tests/ControlParental.Service.Tests/OutboxLifecycleCompletionTests.cs` using 1.1A support: implement conditional complete/fail, reclaim generations/stale guards, mixed outcomes, exhaustion/dead-letter, and parameterized SQL in `src/ControlParental.Service/OutboxManager.cs` and `ControlParentalDbContext.cs`; ≤400 lines.
-- [ ] 1.1B2a **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxRecoveryTests.cs`: implement bounded expired recovery, real file-backed restart/no-double-effect, cancellation/busy bound, and transaction rollback in the relevant `OutboxManager.cs`/`ControlParentalDbContext.cs` hunks; ≤400 lines.
-- [ ] 1.1B2b **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxBridgeIntegrationTests.cs`: implement audit/authorized idempotent requeue, redaction, invalid-source guards, and real scheduler success/failure integration in `OutboxManager.cs`, `ScheduledWorkService.cs`, and scheduler tests; keep production-compatible `MarkSentAsync`/`MarkFailedAsync` durable and non-deleting until Unit 2 migrates ownership—never no-op active calls; ≤400 lines.
+- [x] 1.1A **RED → minimal GREEN → TRIANGULATE/REFACTOR** in dedicated `tests/ControlParental.Service.Tests/OutboxClaimAdmissionTests.cs` with shared fixture support owned by A: combine contracts/status/entities with real claim admission, eligibility/order-before-`LIMIT`, bounded pages, and concurrent claims in `src/ControlParental.Domain/IOutboxManager.cs`, `OutboxEntryStatus.cs`, `OutboxEntry.cs`, `src/ControlParental.Service/PolicyDbEntity.cs`, `OutboxManager.cs`, and `ControlParentalDbContext.cs`; later children reuse helpers with no double-count. Preserve unrelated pre-existing `OutboxManagerTests.cs` content. Behavior proves invariants; enum/input-only assertions are forbidden.
+- [x] 1.1B1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `tests/ControlParental.Service.Tests/OutboxLifecycleCompletionTests.cs` using 1.1A support: implement conditional complete/fail, reclaim generations/stale guards, mixed outcomes, exhaustion/dead-letter, and parameterized SQL in `src/ControlParental.Service/OutboxManager.cs` and `ControlParentalDbContext.cs`; ≤400 lines.
+- [x] 1.1B2a **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxRecoveryTests.cs`: implement bounded expired recovery, real file-backed restart/no-double-effect, cancellation/busy bound, and transaction rollback in the relevant `OutboxManager.cs`/`ControlParentalDbContext.cs` hunks; ≤400 lines.
+- [x] 1.1B2b **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxBridgeIntegrationTests.cs`: implement audit/authorized idempotent requeue, redaction, invalid-source guards, and real scheduler success/failure integration in `OutboxManager.cs`, `ScheduledWorkService.cs`, and scheduler tests; keep production-compatible `MarkSentAsync`/`MarkFailedAsync` durable and non-deleting until Unit 2 migrates ownership—never no-op active calls; ≤400 lines.
 - [x] 1.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `tests/ControlParental.Service.Tests/OutboxManagerTests.cs`: test fresh/existing `EnsureCreated`, adoption, schema version/checksum, backfill, defaults/constraints/indexes, restart/rollback; add bootstrap/version wiring and remove invalid migration/snapshot artifacts.
 
 ## Phase 2: Delivery and Admission (PR2)

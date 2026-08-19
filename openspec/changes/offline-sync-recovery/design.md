@@ -4,6 +4,10 @@
 
 Keep Service-owned SQLite durability, with `BackendClient` limited to transport attempts and one `ScheduledWorkService` owner for admission, retry, backoff, cancellation, and single-flight execution. Identity remains fail-closed through `IBackendIdentityCoordinator`.
 
+## Governance Closure Rule
+
+For SDD6 foundation tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b, audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is an accepted governance anchor. Existing green behavior/runtime/coverage evidence may close those tasks after a fresh current foundation-focused green gate. Historical standalone RED and per-unit immutable pre-baseline diffs remain warnings and are not retroactively reconstructed or fabricated. This rule is not a size exception and does not relax strict TDD, feature-branch-chain, real-worktree, or ≤400-line requirements for later units.
+
 ## Architecture Decisions
 
 | Decision | Choice | Tradeoff / rationale |

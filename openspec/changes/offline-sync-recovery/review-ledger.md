@@ -13,6 +13,12 @@
 
 This approval validates the Judgment Day code-risk findings and their fixes. It does not authorize the separate approximately 1,200-line `size:exception`, a commit, push, PR, SDD completion, or archive.
 
+## Audited Foundation Acceptance Governance
+
+On 2026-08-19 the user adopted audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` as the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure after a fresh current foundation-focused green gate. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings; no historical evidence is fabricated. This governance decision is not a `size:exception` and does not relax strict TDD, feature-branch-chain, real-worktree, or ≤400-line requirements for post-baseline units.
+
+The fresh combined foundation suite passed 28/28 and the relevant scheduler suite passed 89/89 on 2026-08-19. The earlier Domain gate was infrastructure-blocked by missing assets, not behavior. After minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`, the fresh Domain suite passed 97/97. The four foundation checkboxes are therefore accepted and closed under this governance rule; formal progress is 5/11. Historical standalone RED and per-unit immutable pre-baseline diffs remain warnings and are not claimed retroactively.
+
 ## Scoped Round 2 Re-Judgment
 
 | item | Judge A | Judge B |

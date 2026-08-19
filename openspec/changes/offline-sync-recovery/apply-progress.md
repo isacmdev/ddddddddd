@@ -8,10 +8,10 @@ Boundary: PR1A base `feature/tracker`; conditional durable lifecycle only.
 
 ## Cumulative State
 
-- [ ] 1.1A — delivery-boundary refactor materialized; behavior green, but immutable patch provenance is blocked by the mixed uncommitted baseline.
-- [ ] 1.1B1 — completion/failure boundary remains behavior green; immutable patch provenance is blocked by the mixed uncommitted baseline.
-- [ ] 1.1B2a — recovery/restart/cancellation/busy/rollback boundary is behavior green; immutable patch provenance is blocked by the mixed uncommitted baseline.
-- [ ] 1.1B2b — audit/requeue/legacy/scheduler boundary is behavior green; immutable patch provenance is blocked by the mixed uncommitted baseline.
+- [x] 1.1A — delivery-boundary refactor accepted against the audited baseline anchor; behavior green, with historical provenance warnings retained.
+- [x] 1.1B1 — completion/failure boundary accepted against the audited baseline anchor; behavior green, with historical provenance warnings retained.
+- [x] 1.1B2a — recovery/restart/cancellation/busy/rollback boundary accepted against the audited baseline anchor; behavior green, with historical provenance warnings retained.
+- [x] 1.1B2b — audit/requeue/legacy/scheduler boundary accepted against the audited baseline anchor; behavior green, with historical provenance warnings retained.
 - [x] 1.2 — base-column-definition remediation complete after final verification; latest reverify FAIL was remediated without changing unrelated scope.
 - [ ] 2.1–2.2 — delivery/admission.
 - [ ] 3.1–3.2 — reconciliation/backup.
@@ -137,3 +137,21 @@ The latest reverify FAIL identified that current-marker acceptance validated bas
 - Coverage: `coverage/**/coverage.cobertura.xml`; remediation-only changed executable scope **40/40 = 100.00%**.
 - Immutable pre-edit evidence: `C:\Users\Usuario\AppData\Local\Temp\sdd6-task12-base-definition-20260819\`; final remediation-only patch SHA-256 `34FC5A79C4BEBC464D017FC53A90CD15953D135341857BC4D6EF905B2AE7873F`; 76 changed current code/test lines; no size exception.
 - No unrelated named-pipe test, foundation/later task, Judgment ledger, commit, branch, push, or PR was changed.
+
+## Audited Foundation Acceptance — 2026-08-19
+
+**Governance decision:** The user adopted audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` as the accepted SDD6 foundation anchor for 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure after a fresh current foundation-focused green gate. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings; no historical evidence is fabricated. This is not a `size:exception` and does not relax strict TDD, feature-branch-chain, real-worktree, or ≤400-line requirements for post-baseline units.
+
+**Fresh current evidence:**
+
+- Combined foundation tests (`OutboxClaimAdmissionTests|OutboxLifecycleCompletionTests|OutboxRecoveryTests|OutboxBridgeIntegrationTests`): **28 passed, 0 failed, 0 skipped**; SHA-256 `6D414F55688F1A4AA3252FDF69A2BC9C7648563C027A3871E5BCA326374205FC`.
+- Relevant scheduler suite (`FullyQualifiedName~ScheduledWorkService`): **89 passed, 0 failed, 0 skipped**; SHA-256 `828547B34C52793BF09B4770AB0F803A65FE060BA33114DBA880129BE3C01592`.
+- Domain suite with `--no-restore --no-build`: blocked because `tests/ControlParental.Domain.Tests/obj/project.assets.json` is absent. A no-restore test-project build confirmed `NETSDK1004`; no restore was run. Evidence SHA-256 `B574A803304761DE0174BD2E149EAD471CFCC3F592FAD86318C11378A1383EF0`; build diagnostic SHA-256 `1ADAA054A5F471F6213BF386BF610725A05F25B1B186C4C1868891873294926E`.
+
+**Historical closure status before asset generation (superseded):** The required fresh Domain gate was unavailable, so 1.1A, 1.1B1, 1.1B2a, and 1.1B2b remained unchecked. This status is superseded by the completed gate recorded below; the historical warning and nonclaim are preserved.
+
+## Audited Foundation Acceptance — Gate Completed
+
+The prior Domain gate was infrastructure-blocked only by missing assets. Minimal normal asset generation was performed only for `tests/ControlParental.Domain.Tests/ControlParental.Domain.Tests.csproj` using locked restore/build; no package versions, lockfiles, source, tests, or dependency configuration changed. The full Domain suite then passed **97/97, 0 failed, 0 skipped**; suite output SHA-256 `499AF28351C84D36207249644431E178FD1449D675EBB68F7AEC68AF760DB018`; test-project build output SHA-256 `EC16337D155F577E132B2517DA47AC0DE1B0E58F8E09C93F48AFB96BE2DD60FE`.
+
+The four audited foundation tasks are now checked under the accepted baseline governance decision. Formal progress before the task 2.1 gate was **5/11**: 1.1A, 1.1B1, 1.1B2a, 1.1B2b, and 1.2 checked; 2.1 and all later tasks unchanged and unchecked. Historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and are not retroactively claimed.
