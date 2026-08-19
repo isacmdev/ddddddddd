@@ -30,6 +30,7 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     private readonly Mock<IServiceHealthMonitor> mockHealthMonitor;
     private readonly Mock<IServiceRecoveryManager> mockRecoveryManager;
     private readonly Mock<IPolicyRepository> mockPolicyRepository;
+    private readonly Mock<IBackendIdentityCoordinator> mockIdentityCoordinator;
     private readonly ScheduledWorkService service;
 
     public ScheduledWorkServiceAsyncDispatchTests()
@@ -42,11 +43,14 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         this.mockHealthMonitor = new Mock<IServiceHealthMonitor>();
         this.mockRecoveryManager = new Mock<IServiceRecoveryManager>();
         this.mockPolicyRepository = new Mock<IPolicyRepository>();
+        this.mockIdentityCoordinator = new Mock<IBackendIdentityCoordinator>();
 
         this.mockUsageReconciler.SetupGet(r => r.IsRunning).Returns(false);
         this.mockEnforcementLevelMonitor.SetupGet(m => m.CurrentLevel).Returns(EnforcementLevel.Standard);
         this.mockHealthMonitor.SetupGet(m => m.IsAgentHealthy).Returns(true);
         this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(DateTimeOffset.UtcNow);
+        this.mockIdentityCoordinator.SetupGet(c => c.CurrentState).Returns(
+            BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
 
         this.service = new ScheduledWorkService(
             backendClient: this.mockBackendClient.Object,
@@ -56,7 +60,8 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
             timeProvider: this.mockTimeProvider.Object,
             healthMonitor: this.mockHealthMonitor.Object,
             recoveryManager: this.mockRecoveryManager.Object,
-            policyRepository: this.mockPolicyRepository.Object);
+            policyRepository: this.mockPolicyRepository.Object,
+            identityCoordinator: this.mockIdentityCoordinator.Object);
     }
 
     public void Dispose()
@@ -411,8 +416,11 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecuteHeartbeatAsync_WhenNewPolicyAvailable_DispatchesSync()
+    public async Task ExecuteHeartbeatAsync_WhenNewPolicyAvailable_AwaitsSyncCompletion()
     {
+        var syncStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSync = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
         this.mockBackendClient
             .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(HeartbeatResult.Succeeded(newPolicyAvailable: true));
@@ -422,15 +430,92 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
             .ReturnsAsync(0);
         this.mockBackendClient
             .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(PolicyFetchResult.Succeeded(1, string.Empty));
+            .Returns(async () =>
+            {
+                syncStarted.SetResult();
+                await releaseSync.Task;
+                return PolicyFetchResult.Succeeded(1, string.Empty);
+            });
 
-        await this.service.StartAsync();
-        await this.service.ExecuteHeartbeatAsync(CancellationToken.None);
+        var heartbeat = this.service.ExecuteHeartbeatAsync(CancellationToken.None);
+        await syncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // The follow-up sync must reach the backend at least once.
+        heartbeat.IsCompleted.Should().BeFalse("heartbeat completion must include the requested policy sync");
+        releaseSync.SetResult();
+        await heartbeat;
+
         this.mockBackendClient.Verify(
             c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
-            Times.AtLeastOnce);
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteHeartbeatAsync_WhenPolicySyncIsCancelled_PropagatesCancellation()
+    {
+        var syncStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+
+        this.mockBackendClient
+            .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), cts.Token))
+            .ReturnsAsync(HeartbeatResult.Succeeded(newPolicyAvailable: true));
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), cts.Token))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), cts.Token))
+            .Returns(async () =>
+            {
+                syncStarted.SetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+                return PolicyFetchResult.Succeeded(1, string.Empty);
+            });
+
+        var heartbeat = this.service.ExecuteHeartbeatAsync(cts.Token);
+        await syncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cts.Cancel();
+
+        var act = async () => await heartbeat;
+        await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenAnotherSyncIsRunning_DoesNotOverlap()
+    {
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var active = 0;
+        var maximumActive = 0;
+
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                var call = Interlocked.Increment(ref calls);
+                var currentActive = Interlocked.Increment(ref active);
+                maximumActive = Math.Max(maximumActive, currentActive);
+                if (call == 1)
+                {
+                    await releaseFirst.Task;
+                }
+
+                Interlocked.Decrement(ref active);
+                return 0;
+            });
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(1, string.Empty));
+
+        var first = this.service.ExecutePolicySyncAsync(CancellationToken.None);
+        calls.Should().Be(1);
+
+        var second = this.service.ExecutePolicySyncAsync(CancellationToken.None);
+        calls.Should().Be(1, "the second sync must await the active sync without entering policy work");
+
+        releaseFirst.SetResult();
+        await Task.WhenAll(first, second);
+
+        calls.Should().Be(2);
+        maximumActive.Should().Be(1);
     }
 
     [Fact]

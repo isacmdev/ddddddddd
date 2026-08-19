@@ -123,7 +123,7 @@ public sealed class UIMessagesJsonContextTests
         // (not reflection) to prove the catalogue is wired correctly.
         var samples = new (string Name, object Value, JsonTypeInfo TypeInfo)[]
         {
-            ("PairDevice", new PairDevice("ABC12345", "13-16"), UIMessagesJsonContext.Default.PairDevice),
+            ("PairDevice", new PairDevice("ABC123", "13-16"), UIMessagesJsonContext.Default.PairDevice),
             ("PairDeviceResponse", new PairDeviceResponse(true, "dev-1", "par-1", 7, PairingStatus.Success, null), UIMessagesJsonContext.Default.PairDeviceResponse),
             ("ListAccounts", new ListAccounts(), UIMessagesJsonContext.Default.ListAccounts),
             ("AccountList", new AccountList(new[] { new AccountInfo("alice", "Standard", true) }), UIMessagesJsonContext.Default.AccountList),

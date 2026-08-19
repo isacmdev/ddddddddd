@@ -69,7 +69,7 @@
                             Foreground="#1A1A1A"
                             Margin="0,0,0,16" />
 
-                        <!-- 8-character code entry -->
+                        <!-- 6-character code entry -->
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,16">
                             <TextBox
                                 x:Name="Digit1"
@@ -117,24 +117,6 @@
                                 TextChanged="OnDigitTextChanged" />
                             <TextBox
                                 x:Name="Digit6"
-                                Width="40"
-                                Height="48"
-                                FontSize="24"
-                                TextAlignment="Center"
-                                MaxLength="1"
-                                Margin="8,0,0,0"
-                                TextChanged="OnDigitTextChanged" />
-                            <TextBox
-                                x:Name="Digit7"
-                                Width="40"
-                                Height="48"
-                                FontSize="24"
-                                TextAlignment="Center"
-                                MaxLength="1"
-                                Margin="8,0,0,0"
-                                TextChanged="OnDigitTextChanged" />
-                            <TextBox
-                                x:Name="Digit8"
                                 Width="40"
                                 Height="48"
                                 FontSize="24"

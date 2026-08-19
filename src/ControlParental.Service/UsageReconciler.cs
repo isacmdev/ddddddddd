@@ -38,7 +38,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
 
     // ── Dependencies ────────────────────────────────────────────────
 
-    private readonly ControlParentalDbContext dbContext;
+    private readonly IDbContextFactory<ControlParentalDbContext> dbContextFactory;
     private readonly ITimeProvider timeProvider;
     private IIpcChannel? ipcChannel;
     private readonly Func<string, string> resolveAppId;
@@ -56,16 +56,16 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
     private bool disposed;
 
     public UsageReconciler(
-        ControlParentalDbContext dbContext,
+        IDbContextFactory<ControlParentalDbContext> dbContextFactory,
         ITimeProvider timeProvider,
         IIpcChannel? ipcChannel,
         Func<string, string> resolveAppId)
     {
-        ArgumentNullException.ThrowIfNull(dbContext);
+        ArgumentNullException.ThrowIfNull(dbContextFactory);
         ArgumentNullException.ThrowIfNull(timeProvider);
         ArgumentNullException.ThrowIfNull(resolveAppId);
 
-        this.dbContext = dbContext;
+        this.dbContextFactory = dbContextFactory;
         this.timeProvider = timeProvider;
         this.ipcChannel = ipcChannel;
         this.resolveAppId = resolveAppId;
@@ -144,7 +144,25 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
     /// <inheritdoc />
     public void SetIpcChannel(IIpcChannel channel)
     {
-        this.ipcChannel = channel;
+        lock (this.lockObj)
+        {
+            if (ReferenceEquals(this.ipcChannel, channel))
+            {
+                return;
+            }
+
+            if (this.isRunning && this.ipcChannel != null)
+            {
+                this.ipcChannel.MessageReceived -= this.OnIpcMessage;
+            }
+
+            this.ipcChannel = channel;
+
+            if (this.isRunning)
+            {
+                this.ipcChannel.MessageReceived += this.OnIpcMessage;
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -153,11 +171,13 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
         var sw = Stopwatch.StartNew();
         try
         {
+            await using var dbContext = this.dbContextFactory.CreateDbContext();
+
             var serverDate = this.timeProvider.ServerDate
                 ?? DateOnly.FromDateTime(DateTime.UtcNow);
 
             // Idempotency: skip if already reconciled today
-            var existing = await this.dbContext.ReconciliationHistory
+            var existing = await dbContext.ReconciliationHistory
                 .AsNoTracking()
                 .FirstOrDefaultAsync(r => r.ServerDate == serverDate, cancellationToken);
 
@@ -168,7 +188,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
             }
 
             // Get all foreground events for today
-            var events = await this.dbContext.ForegroundEvents
+            var events = await dbContext.ForegroundEvents
                 .Where(e => e.ServerDate == serverDate && e.EndedAt != null)
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
@@ -181,43 +201,43 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
                     g => g.Sum(e =>
                     {
                         var end = e.EndedAt ?? this.timeProvider.WallClockNow;
-                        return (int)(end - e.StartedAt).TotalMinutes;
+                        return (long)(end - e.StartedAt).TotalSeconds;
                     }));
 
             // Get recorded usage for today
-            var usageRecords = await this.dbContext.UsageToday
+            var usageRecords = await dbContext.UsageToday
                 .Where(u => u.ServerDate == serverDate)
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
 
-            var recorded = usageRecords.ToDictionary(u => u.AppId, u => u.Minutes);
+            var recorded = usageRecords.ToDictionary(u => u.AppId, u => this.GetElapsedSeconds(u));
 
             var appsReconciled = 0;
             var appsBackfilled = 0;
             var discrepanciesFound = 0;
 
             // For each app with WMI data, check if backfill is needed
-            foreach (var (appId, wmiMinutes) in wmiDurations)
+            foreach (var (appId, wmiSeconds) in wmiDurations)
             {
                 appsReconciled++;
 
-                var recordedMinutes = recorded.GetValueOrDefault(appId, 0);
+                var recordedSeconds = recorded.GetValueOrDefault(appId, 0);
 
-                if (wmiMinutes > recordedMinutes)
+                if (wmiSeconds > recordedSeconds)
                 {
-                    var delta = wmiMinutes - recordedMinutes;
+                    var delta = wmiSeconds - recordedSeconds;
 
                     // Backfill
-                    await this.BackfillAppAsync(appId, delta, serverDate, cancellationToken);
+                    await this.BackfillAppAsync(dbContext, appId, delta, serverDate, cancellationToken);
 
                     appsBackfilled++;
                     discrepanciesFound++;
 
                     var discrepancy = new ReconciliationDiscrepancy(
                         appId,
-                        wmiMinutes,
-                        recordedMinutes,
-                        delta,
+                        (int)(wmiSeconds / 60L),
+                        (int)(recordedSeconds / 60L),
+                        (int)delta,
                         serverDate,
                         DiscrepancyReason.BackfillNeeded);
 
@@ -227,6 +247,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
 
             // Record reconciliation history
             await this.RecordReconciliationAsync(
+                dbContext,
                 serverDate,
                 appsReconciled,
                 appsBackfilled,
@@ -250,6 +271,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
                 var serverDate = this.timeProvider.ServerDate
                     ?? DateOnly.FromDateTime(DateTime.UtcNow);
                 await this.RecordReconciliationAsync(
+                    null,
                     serverDate, 0, 0, 0, ex.Message, cancellationToken);
             }
             catch
@@ -404,11 +426,13 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
 
         try
         {
+            await using var dbContext = this.dbContextFactory.CreateDbContext();
+
             var serverDate = this.timeProvider.ServerDate
                 ?? DateOnly.FromDateTime(DateTime.UtcNow);
 
             // Check if there's an open event for this app (not yet closed)
-            var existingEvent = await this.dbContext.ForegroundEvents
+            var existingEvent = await dbContext.ForegroundEvents
                 .Where(e => e.AppId == appId && e.EndedAt == null && e.ServerDate == serverDate)
                 .OrderByDescending(e => e.StartedAt)
                 .FirstOrDefaultAsync();
@@ -417,11 +441,11 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
             {
                 // Close the previous event
                 existingEvent.EndedAt = startedAt;
-                await this.dbContext.SaveChangesAsync();
+                await dbContext.SaveChangesAsync();
             }
 
             // Open a new event
-            this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+            dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
             {
                 AppId = appId,
                 StartedAt = startedAt,
@@ -430,7 +454,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
                 Source = source,
             });
 
-            await this.dbContext.SaveChangesAsync();
+            await dbContext.SaveChangesAsync();
         }
         catch (Exception ex)
         {
@@ -439,37 +463,43 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
     }
 
     private async Task BackfillAppAsync(
+        ControlParentalDbContext dbContext,
         string appId,
-        int deltaMinutes,
+        long deltaSeconds,
         DateOnly serverDate,
         CancellationToken ct)
     {
-        var existing = await this.dbContext.UsageToday
+        var existing = await dbContext.UsageToday
             .FirstOrDefaultAsync(u => u.AppId == appId && u.ServerDate == serverDate, ct);
 
         if (existing != null)
         {
-            existing.Minutes += deltaMinutes;
+            var currentElapsedSeconds = this.GetElapsedSeconds(existing);
+            var totalElapsedSeconds = currentElapsedSeconds + deltaSeconds;
+            existing.ElapsedSeconds = totalElapsedSeconds;
+            existing.Minutes = (int)(totalElapsedSeconds / 60L);
             existing.LastUpdated = this.timeProvider.WallClockNow;
         }
         else
         {
-            this.dbContext.UsageToday.Add(new UsageTodayDbEntity
+            dbContext.UsageToday.Add(new UsageTodayDbEntity
             {
                 AppId = appId,
                 ServerDate = serverDate,
-                Minutes = deltaMinutes,
+                ElapsedSeconds = deltaSeconds,
+                Minutes = (int)(deltaSeconds / 60L),
                 LastUpdated = this.timeProvider.WallClockNow,
             });
         }
 
-        await this.dbContext.SaveChangesAsync(ct);
+        await dbContext.SaveChangesAsync(ct);
 
         Debug.WriteLine(
-            $"[UsageReconciler] Backfilled {deltaMinutes} min for {appId}");
+            $"[UsageReconciler] Backfilled {deltaSeconds} sec for {appId}");
     }
 
     private async Task RecordReconciliationAsync(
+        ControlParentalDbContext? dbContext,
         DateOnly serverDate,
         int appsReconciled,
         int appsBackfilled,
@@ -477,7 +507,9 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
         string? error,
         CancellationToken ct)
     {
-        var existing = await this.dbContext.ReconciliationHistory
+        await using var scopedDbContext = dbContext ?? this.dbContextFactory.CreateDbContext();
+
+        var existing = await scopedDbContext.ReconciliationHistory
             .FirstOrDefaultAsync(r => r.ServerDate == serverDate, ct);
 
         if (existing != null)
@@ -490,7 +522,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
         }
         else
         {
-            this.dbContext.ReconciliationHistory.Add(new ReconciliationHistoryDbEntity
+            scopedDbContext.ReconciliationHistory.Add(new ReconciliationHistoryDbEntity
             {
                 ServerDate = serverDate,
                 AppsReconciled = appsReconciled,
@@ -502,7 +534,7 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
             });
         }
 
-        await this.dbContext.SaveChangesAsync(ct);
+        await scopedDbContext.SaveChangesAsync(ct);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────
@@ -518,6 +550,9 @@ public sealed class UsageReconciler : IUsageReconciler, IDisposable
         Debug.WriteLine($"[UsageReconciler] Degraded mode: {degraded}");
         this.DegradedModeChanged?.Invoke(degraded);
     }
+
+    private long GetElapsedSeconds(UsageTodayDbEntity record)
+        => record.ElapsedSeconds > 0 ? record.ElapsedSeconds : record.Minutes * 60L;
 
     public void Dispose()
     {

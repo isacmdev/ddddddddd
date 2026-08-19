@@ -5,7 +5,6 @@
 namespace ControlParental.SessionAgent.Interop;
 
 using System.IO.Pipes;
-using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
 
@@ -16,10 +15,17 @@ using ControlParental.Domain;
 public sealed class NamedPipeClient : IIpcChannel, IDisposable
 {
     private const string PipeNamePrefix = "ControlParental";
-    private const int BufferSize = 65536;
+    private const int BufferSize = 8192;
     private readonly string pipeName;
     private readonly CancellationTokenSource internalCts;
-    private NamedPipeClientStream? pipeClient;
+    private readonly Func<CancellationToken, Task<IClientPipeConnection>> connect;
+    private readonly Func<IClientPipeConnection, bool> authenticateServer;
+    private readonly Func<string?> signerProvider;
+    private IClientPipeConnection? pipeClient;
+    private ProcessIdentity? serverIdentity;
+    private readonly IpcPhaseTrace trace = new();
+    private uint serverProcessId;
+    private readonly SemaphoreSlim writeGate = new(1, 1);
     private bool disposed;
 
     /// <summary>
@@ -27,9 +33,23 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
     /// </summary>
     /// <param name="pipeName">The pipe name (without prefix).</param>
     public NamedPipeClient(string pipeName)
+        : this(pipeName, null, null, null, 0)
+    {
+    }
+
+    internal NamedPipeClient(
+        string pipeName,
+        Func<CancellationToken, Task<IClientPipeConnection>>? connect,
+        Func<IClientPipeConnection, bool>? authenticateServer,
+        Func<string?>? signerProvider,
+        uint serverProcessId = 0)
     {
         this.pipeName = $"{PipeNamePrefix}.{pipeName}";
         this.internalCts = new CancellationTokenSource();
+        this.connect = connect ?? this.ConnectAsync;
+        this.authenticateServer = authenticateServer ?? (_ => this.AuthenticateServer());
+        this.signerProvider = signerProvider ?? (() => AuthenticodeSigner.GetSigner(Environment.ProcessPath));
+        this.serverProcessId = serverProcessId;
     }
 
     /// <inheritdoc />
@@ -56,16 +76,13 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
         {
             try
             {
-                this.pipeClient = new NamedPipeClientStream(
-                    ".",
-                    this.pipeName,
-                    PipeDirection.InOut,
-                    PipeOptions.Asynchronous);
+                this.pipeClient = await this.connect(linkedCts.Token);
+                await this.pipeClient.ConnectAsync(linkedCts.Token);
+                this.trace.Record(IpcPhase.Connected);
 
-                await this.pipeClient.ConnectAsync((int)retryDelay.TotalMilliseconds);
-
-                if (this.pipeClient.IsConnected)
+                if (this.pipeClient.IsConnected && this.authenticateServer(this.pipeClient))
                 {
+                    await this.SendHandshakeAsync(linkedCts.Token);
                     // Start reading messages
                     _ = this.ReadMessagesAsync(linkedCts.Token);
                     return;
@@ -73,11 +90,9 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
             }
             catch (IOException)
             {
-                // Retry
             }
             catch (TimeoutException)
             {
-                // Retry
             }
 
             if (i < maxRetries - 1)
@@ -105,14 +120,15 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
             return;
         }
 
-        var json = JsonSerializer.Serialize(message);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await this.pipeClient.WriteAsync(bytes, cancellationToken);
+            var json = JsonSerializer.Serialize(message);
+            await this.WriteFrameAsync(json, cancellationToken);
     }
 
     private async Task ReadMessagesAsync(CancellationToken cancellationToken)
     {
         var buffer = new byte[BufferSize];
+        var decoder = new IpcFrameCodec.Decoder();
+        var serverAuthenticated = false;
 
         try
         {
@@ -125,12 +141,31 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
                     break;
                 }
 
-                var json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                var message = this.DeserializeMessage(json);
-
-                if (message != null)
+                foreach (var json in decoder.Append(buffer.AsSpan(0, bytesRead)))
                 {
-                    this.MessageReceived?.Invoke(message);
+                    if (!serverAuthenticated)
+                    {
+                        if (!IpcHandshake.TryParse(json, out var handshake) ||
+                            handshake.ProcessId != this.serverProcessId)
+                        {
+                            throw new UnauthorizedAccessException("The Service handshake was rejected.");
+                        }
+
+                        var signer = this.serverIdentity is null ? null : AuthenticodeSigner.GetSigner(this.serverIdentity, out _);
+                        if (signer is null || !IpcHandshake.IsAuthorized(
+                            handshake, System.Diagnostics.Process.GetCurrentProcess().SessionId, (int)this.serverProcessId, signer))
+                        {
+                            throw new UnauthorizedAccessException("The Service signer was rejected.");
+                        }
+
+                        serverAuthenticated = true;
+                        this.trace.Record(IpcPhase.ServerHelloRead);
+                        this.trace.Record(IpcPhase.Authenticated);
+                        continue;
+                    }
+
+                    var message = this.DeserializeMessage(json);
+                    if (message != null) this.MessageReceived?.Invoke(message);
                 }
             }
         }
@@ -140,10 +175,63 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Cancellation requested
+            this.trace.CancelledAt(IpcPhase.ServerHelloRead);
         }
 
         this.Disconnected?.Invoke();
+    }
+
+    private bool AuthenticateServer()
+    {
+        if (this.pipeClient is null || !GetNamedPipeServerProcessId(this.pipeClient.SafePipeHandle, out var serverPid))
+        {
+            return false;
+        }
+
+        this.serverProcessId = serverPid;
+        this.trace.Record(IpcPhase.ServerPid);
+        this.serverIdentity?.Dispose();
+        this.serverIdentity = AuthenticodeSigner.Open((int)serverPid);
+        this.trace.Record(IpcPhase.ProcessHandle);
+        this.trace.Record(IpcPhase.Path);
+        var expectedSigner = AuthenticodeSigner.GetSigner(Environment.ProcessPath);
+        var actualSigner = AuthenticodeSigner.GetSigner(this.serverIdentity, out _);
+        this.trace.Record(IpcPhase.AuthResult);
+        return serverPid > 0 && expectedSigner is not null &&
+            string.Equals(expectedSigner, actualSigner, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private Task<IClientPipeConnection> ConnectAsync(CancellationToken cancellationToken)
+    {
+        IClientPipeConnection pipe = new ClientPipeConnection(CreateClientPipe(this.pipeName));
+        return Task.FromResult(pipe);
+    }
+
+    internal static NamedPipeClientStream CreateClientPipeForTest(string pipeName)
+        => CreateClientPipe(pipeName);
+
+    private static NamedPipeClientStream CreateClientPipe(string pipeName)
+        => new(
+            ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous,
+            System.Security.Principal.TokenImpersonationLevel.Impersonation);
+
+    private async Task SendHandshakeAsync(CancellationToken cancellationToken)
+    {
+            var signer = this.signerProvider()
+            ?? throw new UnauthorizedAccessException("The SessionAgent image is not Authenticode trusted.");
+        await this.WriteFrameAsync(
+            IpcHandshake.Create(System.Diagnostics.Process.GetCurrentProcess().SessionId, Environment.ProcessId, signer),
+            cancellationToken);
+        this.trace.Record(IpcPhase.ClientHelloWrite);
+    }
+
+    private async Task WriteFrameAsync(string json, CancellationToken cancellationToken)
+    {
+        if (this.pipeClient is null || !this.pipeClient.IsConnected) return;
+        var frame = IpcFrameCodec.Encode(json);
+        await this.writeGate.WaitAsync(cancellationToken);
+        try { await this.pipeClient.WriteAsync(frame, cancellationToken); }
+        finally { this.writeGate.Release(); }
     }
 
     private IIpcMessage? DeserializeMessage(string json)
@@ -166,6 +254,8 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
                 nameof(HideOverlay) => JsonSerializer.Deserialize<HideOverlay>(json),
                 nameof(ShowWarning) => JsonSerializer.Deserialize<ShowWarning>(json),
                 nameof(LockWorkstation) => JsonSerializer.Deserialize<LockWorkstation>(json),
+                nameof(AgentAuthority) => JsonSerializer.Deserialize<AgentAuthority>(json),
+                nameof(AgentCommandRequest) => JsonSerializer.Deserialize<AgentCommandRequest>(json),
                 nameof(RequestStateSnapshot) => JsonSerializer.Deserialize<RequestStateSnapshot>(json),
                 nameof(Ping) => JsonSerializer.Deserialize<Ping>(json),
                 _ => null,
@@ -183,8 +273,34 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
         {
             this.internalCts.Cancel();
             this.pipeClient?.Dispose();
+            this.serverIdentity?.Dispose();
             this.internalCts.Dispose();
+            this.writeGate.Dispose();
             this.disposed = true;
         }
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetNamedPipeServerProcessId(
+        Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint processId);
+    internal interface IClientPipeConnection : IDisposable
+    {
+        bool IsConnected { get; }
+        Microsoft.Win32.SafeHandles.SafePipeHandle SafePipeHandle { get; }
+        Task ConnectAsync(CancellationToken cancellationToken);
+        Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
+        Task WriteAsync(byte[] buffer, CancellationToken cancellationToken);
+    }
+
+    private sealed class ClientPipeConnection : IClientPipeConnection
+    {
+        private readonly NamedPipeClientStream pipe;
+        public ClientPipeConnection(NamedPipeClientStream pipe) => this.pipe = pipe;
+        public bool IsConnected => this.pipe.IsConnected;
+        public Microsoft.Win32.SafeHandles.SafePipeHandle SafePipeHandle => this.pipe.SafePipeHandle;
+        public Task ConnectAsync(CancellationToken token) => this.pipe.ConnectAsync(token);
+        public Task<int> ReadAsync(byte[] buffer, CancellationToken token) => this.pipe.ReadAsync(buffer, token).AsTask();
+        public Task WriteAsync(byte[] buffer, CancellationToken token) => this.pipe.WriteAsync(buffer, token).AsTask();
+        public void Dispose() => this.pipe.Dispose();
     }
 }

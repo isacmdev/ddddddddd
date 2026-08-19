@@ -11,7 +11,7 @@ using Microsoft.UI.Xaml.Controls;
 
 /// <summary>
 /// T26 — WinUI3 page for device pairing.
-/// The child enters the 8-character code provided by the parent and selects their age band.
+/// The child enters the 6-character code provided by the parent and selects their age band.
 /// </summary>
 public sealed partial class PairingPage : Page
 {
@@ -93,12 +93,6 @@ public sealed partial class PairingPage : Page
                 case "Digit5":
                     this.Digit6.Focus(FocusState.Programmatic);
                     break;
-                case "Digit6":
-                    this.Digit7.Focus(FocusState.Programmatic);
-                    break;
-                case "Digit7":
-                    this.Digit8.Focus(FocusState.Programmatic);
-                    break;
             }
         }
 
@@ -109,8 +103,6 @@ public sealed partial class PairingPage : Page
         this.viewModel.CodeDigit4 = this.Digit4.Text;
         this.viewModel.CodeDigit5 = this.Digit5.Text;
         this.viewModel.CodeDigit6 = this.Digit6.Text;
-        this.viewModel.CodeDigit7 = this.Digit7.Text;
-        this.viewModel.CodeDigit8 = this.Digit8.Text;
     }
 
     private async void OnPairClick(object sender, RoutedEventArgs e)

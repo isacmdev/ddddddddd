@@ -26,6 +26,7 @@ public class EnforcementEngineTests : IDisposable
     private readonly Mock<IIpcChannel> mockIpcChannel;
     private readonly ConcurrentQueue<IIpcMessage> sentMessages;
     private readonly EnforcementEngine engine;
+    private bool throwOnEvaluation;
 
     public EnforcementEngineTests()
     {
@@ -43,7 +44,10 @@ public class EnforcementEngineTests : IDisposable
             .Returns(Task.CompletedTask);
 
         this.mockTimeProvider.SetupGet(t => t.WallClockNow).Returns(DateTimeOffset.UtcNow);
-        this.mockTimeProvider.SetupGet(t => t.CurrentZone).Returns(TimeZoneInfo.Local);
+        this.mockTimeProvider.SetupGet(t => t.CurrentZone).Returns(() =>
+            this.throwOnEvaluation
+                ? throw new InvalidOperationException("evaluation failed")
+                : TimeZoneInfo.Local);
         this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(0);
 
         this.engine = new EnforcementEngine(
@@ -146,7 +150,9 @@ public class EnforcementEngineTests : IDisposable
         result.Success.Should().BeTrue();
         result.Blocked.Should().BeTrue();
         result.ReasonCode.Should().Be(2); // Device locked
-        this.mockWorkstationLockManager.Verify(w => w.LockNowAsync(It.IsAny<CancellationToken>()), Times.Once);
+        this.mockWorkstationLockManager.Verify(
+            manager => manager.LockNowAsync(It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     [Fact]
@@ -176,6 +182,77 @@ public class EnforcementEngineTests : IDisposable
         result.Blocked.Should().BeFalse();
         this.mockProcessTerminator.Verify(
             p => p.TerminateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task EnforceForegroundChangeAsync_WhenEvaluationThrows_PreservesLastSafeDecisionAndMarksDegraded()
+    {
+        // Arrange
+        var policy = CreateTestPolicy(deviceState: DeviceState.Active, dailyScreenTimeMinutes: 0);
+        this.mockPolicyRepository
+            .Setup(r => r.GetPolicyAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(policy);
+
+        var usage = new UsageSnapshot(
+            AppMinutes: new Dictionary<string, int>(),
+            CategoryMinutes: new Dictionary<string, int>(),
+            GlobalMinutes: 0,
+            ExemptAppIds: new HashSet<string>());
+
+        this.mockUsageAccumulator
+            .Setup(u => u.GetSnapshotAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(usage);
+
+        var firstResult = await this.engine.EnforceForegroundChangeAsync("com.example.app", CancellationToken.None);
+
+        firstResult.Success.Should().BeTrue();
+        firstResult.Blocked.Should().BeTrue();
+
+        this.throwOnEvaluation = true;
+
+        // Act
+        var degradedResult = await this.engine.EnforceForegroundChangeAsync("com.example.app", CancellationToken.None);
+
+        // Assert
+        degradedResult.Success.Should().BeFalse();
+        degradedResult.Blocked.Should().BeTrue();
+        degradedResult.IsDegraded.Should().BeTrue();
+        degradedResult.ReasonCode.Should().Be(firstResult.ReasonCode);
+        degradedResult.ReasonText.Should().Be(firstResult.ReasonText);
+
+        var status = this.engine.GetStatus();
+        status.LastDecision.Should().NotBeNull();
+        status.LastDecision!.Value.IsBlocked.Should().BeTrue();
+        status.IsEvaluationDegraded.Should().BeTrue();
+        status.LastEvaluationFailure.Should().Contain("evaluation failed");
+    }
+
+    [Fact]
+    public async Task BlockedEvaluationKeepsAppIdCanonicalAndDoesNotDispatchSideEffects()
+    {
+        var appId = "publisher|family|canonical";
+        this.mockPolicyRepository
+            .Setup(repository => repository.GetPolicyAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CreateTestPolicy(dailyScreenTimeMinutes: 0));
+        this.mockUsageAccumulator
+            .Setup(accumulator => accumulator.GetSnapshotAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UsageSnapshot(
+                new Dictionary<string, int>(),
+                new Dictionary<string, int>(),
+                1,
+                new HashSet<string>()));
+
+        var result = await this.engine.EnforceForegroundChangeAsync(appId);
+
+        result.Blocked.Should().BeTrue();
+        this.engine.GetStatus().LastAppId.Should().Be(appId);
+        this.mockProcessTerminator.Verify(
+            terminator => terminator.TerminateAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockIpcChannel.Verify(
+            channel => channel.SendAsync(It.IsAny<IIpcMessage>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
 
@@ -215,6 +292,18 @@ public class EnforcementEngineTests : IDisposable
         this.mockWorkstationLockManager.Verify(w => w.LockNowAsync(It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    [Fact]
+    public async Task LockDeviceAsync_UnconfirmedTypedOutcomeDoesNotReportDeviceLocked()
+    {
+        this.mockWorkstationLockManager
+            .Setup(w => w.LockNowAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        await this.engine.LockDeviceAsync("Test reason", CancellationToken.None);
+
+        this.engine.GetStatus().IsDeviceLocked.Should().BeFalse();
+    }
+
     // ── UnlockDeviceAsync Tests ──────────────────────────────────────
 
     [Fact]
@@ -252,14 +341,16 @@ public class EnforcementEngineTests : IDisposable
 
     // ── Helper Methods ───────────────────────────────────────────────
 
-    private static Policy CreateTestPolicy(DeviceState deviceState = DeviceState.Active)
+    private static Policy CreateTestPolicy(
+        DeviceState deviceState = DeviceState.Active,
+        int dailyScreenTimeMinutes = 120)
     {
         return new Policy
         {
             DeviceId = "test-device-001",
             Version = 1,
             DeviceState = deviceState,
-            DailyScreenTimeMinutes = 120,
+            DailyScreenTimeMinutes = dailyScreenTimeMinutes,
             Schedules = Array.Empty<Schedule>(),
             CategoryLimits = Array.Empty<CategoryLimit>(),
             CategoryAssignments = new Dictionary<string, string>(),

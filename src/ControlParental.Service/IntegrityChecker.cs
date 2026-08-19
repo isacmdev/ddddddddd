@@ -47,15 +47,12 @@ public interface IIntegrityChecker
 /// </summary>
 public sealed class WinTrustVerifier : IWinTrustVerifier
 {
-    // WINTRUST_ACTION_GENERIC_VERIFY_V2 = {00AAC60B-0000-0000-0090-810000000000}
-    private static readonly Guid WinTrustActionId = new Guid(0x00AAC60B, 0x0000, 0x0000, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-
     /// <inheritdoc />
     public bool IsSigned(string filePath)
     {
         try
         {
-            using var trustInfo = new WinTrustFileInfo(filePath, WinTrustActionId);
+            using var trustInfo = new WinTrustFileInfo(filePath, WinTrust.GenericVerifyV2ActionId);
             return trustInfo.IsSigned;
         }
         catch

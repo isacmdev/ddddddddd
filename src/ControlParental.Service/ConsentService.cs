@@ -12,7 +12,8 @@ using Microsoft.EntityFrameworkCore;
 /// </summary>
 public sealed class ConsentService : IConsentService
 {
-    private readonly ControlParentalDbContext dbContext;
+    private readonly IDbContextFactory<ControlParentalDbContext> dbContextFactory;
+    private readonly ITimeProvider timeProvider;
     private const string DefaultDeviceId = "local";
 
     /// <summary>
@@ -20,19 +21,28 @@ public sealed class ConsentService : IConsentService
     /// </summary>
     /// <param name="dbContext">The database context.</param>
     /// <exception cref="ArgumentNullException">Thrown when dbContext is null.</exception>
-    public ConsentService(ControlParentalDbContext dbContext)
+    public ConsentService(IDbContextFactory<ControlParentalDbContext> dbContextFactory, ITimeProvider timeProvider)
     {
-        this.dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        this.dbContextFactory = dbContextFactory ?? throw new ArgumentNullException(nameof(dbContextFactory));
+        this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
     /// <inheritdoc/>
-    public bool IsConsentGranted =>
-        this.dbContext.Consent.Any(e => e.Status == ConsentStatus.Granted);
+    public bool IsConsentGranted
+    {
+        get
+        {
+            using var dbContext = this.dbContextFactory.CreateDbContext();
+            return dbContext.Consent.Any(e => e.Status == ConsentStatus.Granted);
+        }
+    }
 
     /// <inheritdoc/>
     public async Task<ConsentRecord> GetConsentStatusAsync(CancellationToken ct = default)
     {
-        var consent = await this.dbContext.Consent
+        await using var dbContext = this.dbContextFactory.CreateDbContext();
+
+        var consent = await dbContext.Consent
             .FirstOrDefaultAsync(e => e.DeviceId == DefaultDeviceId, ct);
 
         if (consent == null)
@@ -46,26 +56,28 @@ public sealed class ConsentService : IConsentService
     /// <inheritdoc/>
     public async Task GrantConsentAsync(string? grantedByDeviceId, CancellationToken ct = default)
     {
-        var existing = await this.dbContext.Consent
+        await using var dbContext = this.dbContextFactory.CreateDbContext();
+
+        var existing = await dbContext.Consent
             .FirstOrDefaultAsync(e => e.DeviceId == DefaultDeviceId, ct);
 
         if (existing != null)
         {
             existing.Status = ConsentStatus.Granted;
-            existing.GrantedAt = DateTimeOffset.UtcNow;
+            existing.GrantedAt = this.timeProvider.WallClockNow;
             existing.GrantedByDeviceId = grantedByDeviceId ?? DefaultDeviceId;
         }
         else
         {
-            this.dbContext.Consent.Add(new ConsentDbEntity
+            dbContext.Consent.Add(new ConsentDbEntity
             {
                 DeviceId = DefaultDeviceId,
                 Status = ConsentStatus.Granted,
-                GrantedAt = DateTimeOffset.UtcNow,
+                GrantedAt = this.timeProvider.WallClockNow,
                 GrantedByDeviceId = grantedByDeviceId ?? DefaultDeviceId,
             });
         }
 
-        await this.dbContext.SaveChangesAsync(ct);
+        await dbContext.SaveChangesAsync(ct);
     }
 }

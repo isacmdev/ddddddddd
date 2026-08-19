@@ -18,18 +18,21 @@ public sealed class UIMessageHandler
     private readonly EnforcementLevelQueryHandler enforcementLevelQueryHandler;
     private readonly IServiceScopeFactory scopeFactory;
     private readonly ILogger<UIMessageHandler> logger;
+    private readonly IWnsRegistrationCoordinator? wnsRegistrationCoordinator;
     private Func<IIpcMessage, CancellationToken, Task>? sendToAgentAsync;
 
     public UIMessageHandler(
         OnboardingStateService onboardingStateService,
         EnforcementLevelQueryHandler enforcementLevelQueryHandler,
         IServiceScopeFactory scopeFactory,
-        ILogger<UIMessageHandler> logger)
+        ILogger<UIMessageHandler> logger,
+        IWnsRegistrationCoordinator? wnsRegistrationCoordinator = null)
     {
         this.onboardingStateService = onboardingStateService;
         this.enforcementLevelQueryHandler = enforcementLevelQueryHandler;
         this.scopeFactory = scopeFactory;
         this.logger = logger;
+        this.wnsRegistrationCoordinator = wnsRegistrationCoordinator;
     }
 
     /// <summary>
@@ -46,6 +49,13 @@ public sealed class UIMessageHandler
     /// </summary>
     /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
     public async Task<IIpcMessage> HandleAsync(IIpcMessage message, CancellationToken ct = default)
+        => await this.HandleCoreAsync(message, isAuthenticatedPipeClient: false, ct).ConfigureAwait(false);
+
+    /// <summary>Handles a message only after the named-pipe server authenticated the caller SID.</summary>
+    public async Task<IIpcMessage> HandleAuthenticatedAsync(IIpcMessage message, CancellationToken ct = default)
+        => await this.HandleCoreAsync(message, isAuthenticatedPipeClient: true, ct).ConfigureAwait(false);
+
+    private async Task<IIpcMessage> HandleCoreAsync(IIpcMessage message, bool isAuthenticatedPipeClient, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(message);
 
@@ -105,6 +115,14 @@ public sealed class UIMessageHandler
 
             case ResetOnboardingState reset:
                 return await this.HandleResetOnboardingStateAsync(reset, ct).ConfigureAwait(false);
+
+            case RegisterWnsChannel register:
+                if (!isAuthenticatedPipeClient || this.wnsRegistrationCoordinator is null)
+                {
+                    return new WnsRegistrationResult("invalid", WnsRegistrationStatus.Denied, "IPC-DENIED");
+                }
+
+                return await this.wnsRegistrationCoordinator.RegisterAsync(register, ct).ConfigureAwait(false);
 
             default:
                 System.Diagnostics.Debug.WriteLine(

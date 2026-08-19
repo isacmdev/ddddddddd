@@ -16,7 +16,7 @@ using ControlParental.Domain;
 
 /// <summary>
 /// T26 PR #5 (Fase 3: real pairing) — ViewModel for the pairing step.
-/// The child enters the 8-character code provided by the parent and selects
+/// The child enters the 6-character code provided by the parent and selects
 /// their age band. Pairing is handled exclusively through
 /// <see cref="IUIChannel"/> IPC — there is no local simulation path
 /// (T26 audit finding #5, ADR-002).
@@ -81,7 +81,7 @@ public sealed partial class PairingViewModel : ObservableObject
     /// </summary>
     public const string PairingErrorAgeBandRequired = "Seleccioná tu edad antes de emparejar.";
 
-    private const int CodeLength = 8;
+    private const int CodeLength = 6;
 
     private readonly Action? onPairingCompleted;
     private readonly IUIChannel? uiChannel;
@@ -121,14 +121,6 @@ public sealed partial class PairingViewModel : ObservableObject
     private string codeDigit6 = string.Empty;
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(CanPair))]
-    private string codeDigit7 = string.Empty;
-
-    [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(CanPair))]
-    private string codeDigit8 = string.Empty;
-
-    [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CanPair), nameof(SelectedAgeBandWire))]
     private int selectedAgeBandIndex = -1;
 
@@ -165,7 +157,7 @@ public sealed partial class PairingViewModel : ObservableObject
     };
 
     /// <summary>
-    /// Gets a value indicating whether true only when the user has filled all 8 digits, selected an age band
+    /// Gets a value indicating whether true only when the user has filled all 6 digits, selected an age band
     /// AND no pairing is currently in flight. Bound to the Emparejar button's
     /// <c>IsEnabled</c> so the UI prevents submitting an incomplete payload
     /// (T26 PR #5 spec scenarios "Age band not selected").
@@ -178,12 +170,10 @@ public sealed partial class PairingViewModel : ObservableObject
         && !string.IsNullOrEmpty(this.CodeDigit3)
         && !string.IsNullOrEmpty(this.CodeDigit4)
         && !string.IsNullOrEmpty(this.CodeDigit5)
-        && !string.IsNullOrEmpty(this.CodeDigit6)
-        && !string.IsNullOrEmpty(this.CodeDigit7)
-        && !string.IsNullOrEmpty(this.CodeDigit8);
+        && !string.IsNullOrEmpty(this.CodeDigit6);
 
     /// <summary>
-    /// Attempts to pair using the entered 8-character code. Routes through
+    /// Attempts to pair using the entered 6-character code. Routes through
     /// the IPC channel exclusively — no <c>Task.Delay</c> fallback
     /// (T26 audit finding #5).
     /// </summary>
@@ -212,14 +202,12 @@ public sealed partial class PairingViewModel : ObservableObject
                 + this.CodeDigit3
                 + this.CodeDigit4
                 + this.CodeDigit5
-                + this.CodeDigit6
-                + this.CodeDigit7
-                + this.CodeDigit8;
+                + this.CodeDigit6;
 
             if (fullCode.Length != CodeLength)
             {
                 this.HasError = true;
-                this.ErrorMessage = "Ingresá los 8 caracteres del código.";
+                this.ErrorMessage = "Ingresá los 6 caracteres del código.";
                 return;
             }
 

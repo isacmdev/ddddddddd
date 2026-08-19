@@ -4,6 +4,7 @@
 
 namespace ControlParental.SessionAgent.Tests;
 
+using ControlParental.Domain;
 using ControlParental.SessionAgent;
 using ControlParental.SessionAgent.Interop;
 using FluentAssertions;
@@ -617,5 +618,59 @@ public class OverlayWindowTests
 
         // Assert
         created.Should().BeFalse();
+    }
+
+    [Fact]
+    public void ApplyIntentReturnsTypedShowAndClearOutcomes()
+    {
+        var applied = new List<OverlayIntent>();
+        using var overlay = new OverlayWindow(intent =>
+        {
+            applied.Add(intent);
+            return new NativeActionOutcome(
+                intent.Desired ? ActionStatus.Confirmed : ActionStatus.HarmlessAbsence,
+                null);
+        });
+
+        var shown = overlay.Apply(new OverlayIntent(true, "limit", "Ask", 1));
+        var cleared = overlay.Apply(new OverlayIntent(false, "allowed", null, 2));
+
+        shown.Status.Should().Be(ActionStatus.Confirmed);
+        cleared.Status.Should().Be(ActionStatus.HarmlessAbsence);
+        applied.Select(intent => intent.Version).Should().Equal(1, 2);
+    }
+
+    [Fact]
+    public void ControlledOverlayRejectsInvalidBoundsAndDisposedApply()
+    {
+        var invalid = () => new OverlayWindow(0, 0, 0, 180, hideCursor: false);
+        invalid.Should().Throw<ArgumentOutOfRangeException>();
+
+        var overlay = new OverlayWindow(0, 0, 64, 64, hideCursor: false);
+        overlay.Dispose();
+        overlay.Apply(new OverlayIntent(true, "disposed", null, 1)).Status
+            .Should().Be(ActionStatus.InvalidState);
+    }
+
+    [Fact]
+    public void ClearAbsentControlledOverlayIsHarmless()
+    {
+        using var overlay = new OverlayWindow(0, 0, 64, 64, hideCursor: false);
+
+        var result = overlay.Apply(new OverlayIntent(false, "clear", null, 1));
+
+        result.Status.Should().Be(ActionStatus.HarmlessAbsence);
+        overlay.Handle.Should().Be(IntPtr.Zero);
+    }
+
+    [Theory]
+    [InlineData(true, 0, ActionStatus.Confirmed)]
+    [InlineData(false, 5, ActionStatus.NativeFailure)]
+    public void LockWorkStationNativeResultIsTyped(bool succeeded, int nativeError, ActionStatus expected)
+    {
+        var outcome = SessionAgentHost.MapLockResult(succeeded, nativeError);
+
+        outcome.Status.Should().Be(expected);
+        outcome.NativeError.Should().Be(succeeded ? null : nativeError);
     }
 }

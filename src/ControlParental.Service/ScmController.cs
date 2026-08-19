@@ -16,6 +16,20 @@ using System.Diagnostics;
 public sealed class ScmController : IScmController
 {
     private const string ScExePath = "sc.exe";
+    private readonly Func<string, (bool Success, string Output)> runScCommand;
+    private readonly object stateLock = new();
+    private readonly HashSet<string> configuredFailureActions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> configuredStartupTypes = new(StringComparer.OrdinalIgnoreCase);
+
+    public ScmController()
+        : this(null)
+    {
+    }
+
+    internal ScmController(Func<string, (bool Success, string Output)>? runScCommand)
+    {
+        this.runScCommand = runScCommand ?? this.RunScCommand;
+    }
 
     /// <inheritdoc />
     public Task<bool> IsServiceRunningAsync(
@@ -25,7 +39,7 @@ public sealed class ScmController : IScmController
         return Task.Run(
             () =>
             {
-                var result = this.RunScCommand($"query \"{serviceName}\"");
+                var result = this.runScCommand($"query \"{serviceName}\"");
                 if (!result.Success)
                 {
                     return false;
@@ -43,9 +57,14 @@ public sealed class ScmController : IScmController
         CancellationToken cancellationToken = default)
     {
         return Task.Run(
-            () =>
+            async () =>
             {
-                var result = this.RunScCommand($"start \"{serviceName}\"");
+                if (await this.IsServiceRunningAsync(serviceName, cancellationToken).ConfigureAwait(false))
+                {
+                    return true;
+                }
+
+                var result = this.runScCommand($"start \"{serviceName}\"");
                 return result.Success;
             },
             cancellationToken);
@@ -57,9 +76,14 @@ public sealed class ScmController : IScmController
         CancellationToken cancellationToken = default)
     {
         return Task.Run(
-            () =>
+            async () =>
             {
-                var result = this.RunScCommand($"stop \"{serviceName}\"");
+                if (!await this.IsServiceRunningAsync(serviceName, cancellationToken).ConfigureAwait(false))
+                {
+                    return true;
+                }
+
+                var result = this.runScCommand($"stop \"{serviceName}\"");
                 return result.Success;
             },
             cancellationToken);
@@ -70,13 +94,21 @@ public sealed class ScmController : IScmController
         string serviceName,
         CancellationToken cancellationToken = default)
     {
+        lock (this.stateLock)
+        {
+            if (this.configuredFailureActions.Contains(serviceName))
+            {
+                return Task.FromResult(true);
+            }
+        }
+
         return Task.Run(
             () =>
             {
                 // Configure failure actions: restart on first, second, and subsequent failures
                 // Reset period = 1 day (86400 seconds)
                 // Restart delay = 60 seconds
-                var result = this.RunScCommand(
+                var result = this.runScCommand(
                     $"failure \"{serviceName}\" " +
                     $"actions= restart/60000/restart/60000/restart/60000 " +
                     $"reset= 86400");
@@ -85,9 +117,15 @@ public sealed class ScmController : IScmController
                 {
                     System.Diagnostics.Debug.WriteLine(
                         $"[ScmController] Failed to configure failure actions: {result.Output}");
+                    return false;
                 }
 
-                return result.Success;
+                lock (this.stateLock)
+                {
+                    this.configuredFailureActions.Add(serviceName);
+                }
+
+                return true;
             },
             cancellationToken);
     }
@@ -98,22 +136,41 @@ public sealed class ScmController : IScmController
         string startupType,
         CancellationToken cancellationToken = default)
     {
+        var normalizedType = startupType.ToLowerInvariant() switch
+        {
+            "auto" or "automatic" => "auto",
+            "delayed-auto" or "delayed" => "delayed-auto",
+            "manual" => "demand",
+            "disabled" => "disabled",
+            _ => startupType.ToLowerInvariant(),
+        };
+
+        lock (this.stateLock)
+        {
+            if (this.configuredStartupTypes.TryGetValue(serviceName, out var currentType) &&
+                string.Equals(currentType, normalizedType, StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(true);
+            }
+        }
+
         return Task.Run(
             () =>
             {
-                var normalizedType = startupType.ToLowerInvariant() switch
-                {
-                    "auto" or "automatic" => "auto",
-                    "delayed-auto" or "delayed" => "delayed-auto",
-                    "manual" => "demand",
-                    "disabled" => "disabled",
-                    _ => startupType.ToLowerInvariant(),
-                };
-
-                var result = this.RunScCommand(
+                var result = this.runScCommand(
                     $"config \"{serviceName}\" start= {normalizedType}");
 
-                return result.Success;
+                if (!result.Success)
+                {
+                    return false;
+                }
+
+                lock (this.stateLock)
+                {
+                    this.configuredStartupTypes[serviceName] = normalizedType;
+                }
+
+                return true;
             },
             cancellationToken);
     }

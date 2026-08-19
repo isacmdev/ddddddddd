@@ -20,26 +20,16 @@ public static class WindowsExtensions
     public static SecurityIdentifier? GetImpersonationUserSid(
         this System.IO.Pipes.NamedPipeServerStream pipeServer)
     {
-        // In .NET 9, NamedPipeServerStream has GetImpersonationUserSid() built-in.
-        // Use reflection as a fallback for older versions.
+        ArgumentNullException.ThrowIfNull(pipeServer);
+
         try
         {
-            var method = typeof(System.IO.Pipes.NamedPipeServerStream)
-                .GetMethod(
-                    "GetImpersonationUserSid",
-                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-
-            if (method != null)
-            {
-                var result = method.Invoke(pipeServer, null);
-                return result as SecurityIdentifier;
-            }
+            using var identity = WindowsIdentity.GetCurrent(ifImpersonating: true);
+            return identity?.User;
         }
         catch
         {
-            // Fallback: try to get the SID via Windows API
+            return null;
         }
-
-        return null;
     }
 }

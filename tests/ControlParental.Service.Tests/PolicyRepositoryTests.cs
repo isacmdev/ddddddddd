@@ -4,6 +4,7 @@
 
 namespace ControlParental.Service.Tests;
 
+using Microsoft.Data.Sqlite;
 using System.Text.Json;
 using ControlParental.Domain;
 using Microsoft.EntityFrameworkCore;
@@ -14,8 +15,12 @@ using Xunit;
 /// </summary>
 public class PolicyRepositoryTests : IDisposable
 {
+    private static readonly DateTimeOffset FixedNow = new(2032, 1, 2, 3, 4, 5, TimeSpan.Zero);
+
     private readonly ControlParentalDbContext db;
+    private readonly SqliteConnection connection;
     private readonly FakeTimeProvider timeProvider;
+    private readonly TrackingDbContextFactory dbContextFactory;
     private readonly PolicyRepository repository;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -26,18 +31,24 @@ public class PolicyRepositoryTests : IDisposable
 
     public PolicyRepositoryTests()
     {
+        this.connection = new SqliteConnection("Data Source=:memory:");
+        this.connection.Open();
+
         var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-            .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+            .UseSqlite(this.connection)
             .Options;
 
         this.db = new ControlParentalDbContext(options);
-        this.timeProvider = new FakeTimeProvider(DateTimeOffset.UtcNow);
-        this.repository = new PolicyRepository(this.db, this.timeProvider);
+        this.db.Database.EnsureCreated();
+        this.timeProvider = new FakeTimeProvider(FixedNow);
+        this.dbContextFactory = new TrackingDbContextFactory(options);
+        this.repository = new PolicyRepository(this.dbContextFactory, this.timeProvider);
     }
 
     public void Dispose()
     {
         this.db.Dispose();
+        this.connection.Dispose();
     }
 
     // ── Version guard ──────────────────────────────────────────────────
@@ -57,6 +68,9 @@ public class PolicyRepositoryTests : IDisposable
         Assert.NotNull(stored);
         Assert.Equal("dev-1", stored.DeviceId);
         Assert.Equal(5, stored.Version);
+
+        var storedEntity = await this.db.Policies.SingleAsync();
+        Assert.Equal(FixedNow, storedEntity.LastUpdated);
     }
 
     [Fact]
@@ -106,6 +120,35 @@ public class PolicyRepositoryTests : IDisposable
         Assert.Equal(6, stored!.Version);
     }
 
+    [Fact]
+    public async Task RepeatedPolicyReadsUseVersionedSnapshotWithoutMoreDatabaseContexts()
+    {
+        await this.repository.UpsertPolicyAsync(MakePolicy(deviceId: "dev-1", version: 5));
+        var contextsAfterCommit = this.dbContextFactory.CreateCount;
+
+        var first = await this.repository.GetPolicyAsync();
+        var second = await this.repository.GetPolicyAsync();
+
+        Assert.Same(first, second);
+        Assert.Equal(5, second!.Version);
+        Assert.Equal(contextsAfterCommit, this.dbContextFactory.CreateCount);
+    }
+
+    [Fact]
+    public async Task ExplicitSnapshotInvalidationReloadsAuthoritativePolicyOnce()
+    {
+        await this.repository.UpsertPolicyAsync(MakePolicy(deviceId: "dev-1", version: 5));
+        var contextsAfterCommit = this.dbContextFactory.CreateCount;
+
+        this.repository.InvalidatePolicySnapshot();
+        var reloaded = await this.repository.GetPolicyAsync();
+        var cached = await this.repository.GetPolicyAsync();
+
+        Assert.Equal(5, reloaded!.Version);
+        Assert.Same(reloaded, cached);
+        Assert.Equal(contextsAfterCommit + 1, this.dbContextFactory.CreateCount);
+    }
+
     // ── Usage tracking ─────────────────────────────────────────────────
 
     [Fact]
@@ -115,11 +158,33 @@ public class PolicyRepositoryTests : IDisposable
         this.timeProvider.SetServerDate(new DateOnly(2026, 6, 11));
 
         // Act
-        await this.repository.AccumulateUsageAsync("chrome", 5);
+        await this.repository.AccumulateUsageAsync("chrome", 20);
 
         // Assert
         var usage = await this.repository.GetAppUsageAsync("chrome");
-        Assert.Equal(5, usage);
+        Assert.Equal(20, usage);
+
+        var stored = await this.db.UsageToday.SingleAsync();
+        Assert.Equal(20L, stored.ElapsedSeconds);
+        Assert.Equal(0, stored.Minutes);
+        Assert.Equal(FixedNow, stored.LastUpdated);
+        Assert.Equal(new DateOnly(2026, 6, 11), stored.ServerDate);
+    }
+
+    [Fact]
+    public async Task AccumulateUsage_WhenServerDateMissing_UsesWallClockDate()
+    {
+        // Arrange
+        this.timeProvider.SetServerDate(null);
+
+        // Act
+        await this.repository.AccumulateUsageAsync("chrome", 5);
+
+        // Assert
+        var stored = await this.db.UsageToday.SingleAsync();
+        Assert.Equal(DateOnly.FromDateTime(FixedNow.UtcDateTime), stored.ServerDate);
+        Assert.Equal(FixedNow, stored.LastUpdated);
+        Assert.Equal(5L, stored.ElapsedSeconds);
     }
 
     [Fact]
@@ -127,14 +192,19 @@ public class PolicyRepositoryTests : IDisposable
     {
         // Arrange
         this.timeProvider.SetServerDate(new DateOnly(2026, 6, 11));
-        await this.repository.AccumulateUsageAsync("chrome", 5);
+        await this.repository.AccumulateUsageAsync("chrome", 20);
 
         // Act
-        await this.repository.AccumulateUsageAsync("chrome", 10);
+        await this.repository.AccumulateUsageAsync("chrome", 25);
+        await this.repository.AccumulateUsageAsync("chrome", 20);
 
         // Assert
         var usage = await this.repository.GetAppUsageAsync("chrome");
-        Assert.Equal(15, usage);
+        Assert.Equal(65, usage);
+
+        var stored = await this.db.UsageToday.SingleAsync();
+        Assert.Equal(65L, stored.ElapsedSeconds);
+        Assert.Equal(1, stored.Minutes);
     }
 
     [Fact]
@@ -155,9 +225,9 @@ public class PolicyRepositoryTests : IDisposable
         await this.repository.UpsertPolicyAsync(policy);
 
         // Add usage
-        await this.repository.AccumulateUsageAsync("chrome", 30);
-        await this.repository.AccumulateUsageAsync("whatsapp", 20);
-        await this.repository.AccumulateUsageAsync("notepad", 10);
+        await this.repository.AccumulateUsageAsync("chrome", 30 * 60);
+        await this.repository.AccumulateUsageAsync("whatsapp", 20 * 60);
+        await this.repository.AccumulateUsageAsync("notepad", 10 * 60);
 
         // Act
         var snapshot = await this.repository.GetUsageSnapshotAsync();
@@ -192,6 +262,7 @@ public class PolicyRepositoryTests : IDisposable
         Assert.Single(pending);
         Assert.Equal("usage_log", pending[0].EventType);
         Assert.Equal("dedup-1", pending[0].DedupKey);
+        Assert.Equal(FixedNow, pending[0].CreatedAt);
     }
 
     [Fact]
@@ -241,6 +312,7 @@ public class PolicyRepositoryTests : IDisposable
         Assert.Equal(1, updated.Attempts);
         Assert.Equal("Network error", updated.LastError);
         Assert.NotNull(updated.LastAttemptAt);
+        Assert.Equal(FixedNow, updated.LastAttemptAt);
     }
 
     // ── Grants ──────────────────────────────────────────────────────────
@@ -249,7 +321,7 @@ public class PolicyRepositoryTests : IDisposable
     public async Task GetActiveGrants_Expired_ShouldNotReturn()
     {
         // Arrange
-        var now = DateTimeOffset.UtcNow;
+        var now = FixedNow;
         var policy = MakePolicy(
             deviceId: "dev-1",
             version: 1,
@@ -279,7 +351,7 @@ public class PolicyRepositoryTests : IDisposable
     public async Task GetActiveGrants_Active_ShouldReturn()
     {
         // Arrange
-        var now = DateTimeOffset.UtcNow;
+        var now = FixedNow;
         var policy = MakePolicy(
             deviceId: "dev-1",
             version: 1,
@@ -352,16 +424,12 @@ public class PolicyRepositoryTests : IDisposable
 
         public void SetServerDate(long offsetMs) { }
 
-        public void SetServerDate(DateOnly date, bool uncertain = false)
-        {
-            this.serverDate = date;
-            this.serverDateUncertain = uncertain;
-        }
+        public void SetWallClockNow(DateTimeOffset now) => this.wallClock = now;
 
-        public void SetServerDate(DateOnly serverDate)
+        public void SetServerDate(DateOnly? serverDate, bool uncertain = false)
         {
             this.serverDate = serverDate;
-            this.serverDateUncertain = false;
+            this.serverDateUncertain = serverDate.HasValue && uncertain;
         }
 
         public bool DetectClockJump() => false;

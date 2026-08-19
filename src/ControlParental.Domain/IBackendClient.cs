@@ -138,6 +138,9 @@ public class PushTokenRegistrationResult
     /// </summary>
     public string? ErrorMessage { get; init; }
 
+    /// <summary>Gets the credential-free failure category.</summary>
+    public PushTokenRegistrationFailureKind FailureKind { get; init; }
+
     /// <summary>
     /// Crea un resultado exitoso.
     /// </summary>
@@ -147,8 +150,20 @@ public class PushTokenRegistrationResult
     /// <summary>
     /// Crea un resultado de error.
     /// </summary>
-    public static PushTokenRegistrationResult Failed(string error)
-        => new() { Success = false, ErrorMessage = error };
+    public static PushTokenRegistrationResult Failed(
+        string error,
+        PushTokenRegistrationFailureKind failureKind = PushTokenRegistrationFailureKind.RemoteUnavailable)
+        => new() { Success = false, ErrorMessage = error, FailureKind = failureKind };
+}
+
+/// <summary>Redacted push-token failure categories used by Service orchestration.</summary>
+public enum PushTokenRegistrationFailureKind
+{
+    None,
+    RemoteUnavailable,
+    Revoked,
+    Forbidden,
+    RateLimited,
 }
 
 /// <summary>
@@ -171,6 +186,8 @@ public sealed record PairingRequest(
 /// <summary>
 /// T14 — Interfaz para el cliente del backend de Supabase.
 /// Consume el contrato documentado en T14.
+/// Implementations authorize only definitive identity generations and own their bounded retry policy.
+/// Callers must not inject bearer credentials or add an overlapping retry loop.
 /// </summary>
 public interface IBackendClient
 {
@@ -260,13 +277,6 @@ public interface IBackendClient
         IntegrityReport report,
         CancellationToken cancellationToken = default);
 
-    /// <summary>
-    /// Empareja el dispositivo con un padre.
-    /// </summary>
-    /// <param name="request">Request de emparejamiento.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>Resultado del emparejamiento.</returns>
-    Task<PairingHttpResult> PairAsync(PairingRequest request, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

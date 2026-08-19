@@ -128,8 +128,7 @@ public sealed class WnsNotificationService : IPushNotificationService
 
             if (!response.IsSuccessStatusCode)
             {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return AccessTokenResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return AccessTokenResult.Failed($"HTTP {response.StatusCode}");
             }
 
             var result = await response.Content.ReadFromJsonAsync<AccessTokenResponse>(
@@ -177,8 +176,7 @@ public sealed class WnsNotificationService : IPushNotificationService
 
             if (!response.IsSuccessStatusCode)
             {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return ChannelRequestResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return ChannelRequestResult.Failed($"HTTP {response.StatusCode}");
             }
 
             var channelUri = response.Headers.Location?.ToString();

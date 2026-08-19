@@ -95,29 +95,10 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
         string reason,
         CancellationToken cancellationToken = default)
     {
-        lock (this.lockObject)
+        if (!this.TryBeginRecoveryAttempt(out var beginFailureReason))
         {
-            if (this.isInRecoveryMode)
-            {
-                this.lastRecoveryError = "Already in recovery mode";
-                return false;
-            }
-        }
-
-        // Check cooldown
-        if (this.lastRecoveryAttempt.HasValue)
-        {
-            var elapsed = DateTimeOffset.UtcNow - this.lastRecoveryAttempt.Value;
-            if (elapsed.TotalSeconds < RecoveryCooldownSeconds)
-            {
-                this.lastRecoveryError = $"Recovery cooldown active ({elapsed.TotalSeconds:F1}s elapsed)";
-                return false;
-            }
-        }
-
-        lock (this.lockObject)
-        {
-            this.isInRecoveryMode = true;
+            this.SetLastRecoveryError(beginFailureReason);
+            return false;
         }
 
         try
@@ -129,13 +110,7 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
 
             if (success)
             {
-                this.lastRecoveryAttempt = DateTimeOffset.UtcNow;
-                lock (this.lockObject)
-                {
-                    this.failedRecoveryAttempts = 0;
-                    this.lastRecoveryError = null;
-                    this.isInRecoveryMode = false;
-                }
+                this.CompleteSuccessfulRecovery();
 
                 this.healthMonitor.ResetAgentRestartCount();
                 this.onRecoverySucceeded();
@@ -144,11 +119,7 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
             }
             else
             {
-                lock (this.lockObject)
-                {
-                    this.failedRecoveryAttempts++;
-                    this.lastRecoveryError = "Recovery function returned false";
-                }
+                this.CompleteFailedRecovery("Recovery function returned false");
 
                 this.onRecoveryFailed(this.lastRecoveryError!);
                 return false;
@@ -156,21 +127,14 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
         }
         catch (Exception ex)
         {
-            lock (this.lockObject)
-            {
-                this.failedRecoveryAttempts++;
-                this.lastRecoveryError = ex.Message;
-            }
+            this.CompleteFailedRecovery(ex.Message);
 
             this.onRecoveryFailed(ex.Message);
             return false;
         }
         finally
         {
-            lock (this.lockObject)
-            {
-                this.isInRecoveryMode = false;
-            }
+            this.ExitRecoveryMode();
         }
     }
 
@@ -196,8 +160,11 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
             var agentDeaths = this.healthMonitor.AgentRestartCount;
             var failedRecoveries = this.failedRecoveryAttempts;
 
-            // Healthy = no agent deaths and no failed recoveries
-            var isHealthy = agentDeaths == 0 && failedRecoveries == 0;
+            // Recovery counters are historical evidence; only the authoritative
+            // health projection may establish current healthy protection.
+            var isHealthy = this.healthMonitor.IsServiceHealthy &&
+                            agentDeaths == 0 &&
+                            failedRecoveries == 0;
 
             ServiceHealthLevel healthLevel;
             string statusMessage;
@@ -233,5 +200,67 @@ public sealed class ServiceRecoveryManager : IServiceRecoveryManager
     {
         // Automatically attempt recovery when agent dies
         _ = this.RequestAgentRecoveryAsync($"Agent died (count: {e.DeathCount})");
+    }
+
+    private bool TryBeginRecoveryAttempt(out string? failureReason)
+    {
+        lock (this.lockObject)
+        {
+            if (this.isInRecoveryMode)
+            {
+                failureReason = "Already in recovery mode";
+                return false;
+            }
+
+            if (this.lastRecoveryAttempt.HasValue)
+            {
+                var elapsed = DateTimeOffset.UtcNow - this.lastRecoveryAttempt.Value;
+                if (elapsed.TotalSeconds < RecoveryCooldownSeconds)
+                {
+                    failureReason = $"Recovery cooldown active ({elapsed.TotalSeconds:F1}s elapsed)";
+                    return false;
+                }
+            }
+
+            this.isInRecoveryMode = true;
+        }
+
+        failureReason = null;
+        return true;
+    }
+
+    private void CompleteSuccessfulRecovery()
+    {
+        lock (this.lockObject)
+        {
+            this.lastRecoveryAttempt = DateTimeOffset.UtcNow;
+            this.failedRecoveryAttempts = 0;
+            this.lastRecoveryError = null;
+        }
+    }
+
+    private void CompleteFailedRecovery(string errorMessage)
+    {
+        lock (this.lockObject)
+        {
+            this.failedRecoveryAttempts++;
+            this.lastRecoveryError = errorMessage;
+        }
+    }
+
+    private void SetLastRecoveryError(string? errorMessage)
+    {
+        lock (this.lockObject)
+        {
+            this.lastRecoveryError = errorMessage;
+        }
+    }
+
+    private void ExitRecoveryMode()
+    {
+        lock (this.lockObject)
+        {
+            this.isInRecoveryMode = false;
+        }
     }
 }

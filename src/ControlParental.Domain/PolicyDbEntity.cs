@@ -155,7 +155,14 @@ public sealed class UsageTodayDbEntity
     public DateOnly ServerDate { get; set; }
 
     /// <summary>
+    /// Total elapsed usage seconds used today for this app.
+    /// This is the canonical persisted value; Minutes remains as the legacy floor.
+    /// </summary>
+    public long ElapsedSeconds { get; set; }
+
+    /// <summary>
     /// Minutes used today for this app.
+    /// Legacy compatibility column retained for rollback/backfill.
     /// </summary>
     public int Minutes { get; set; }
 
@@ -209,4 +216,13 @@ public sealed class OutboxDbEntity
     /// Last error message (if any).
     /// </summary>
     public string? LastError { get; set; }
+
+    public OutboxEntryStatus Status { get; set; } = OutboxEntryStatus.Pending;
+    public string OperationId { get; set; } = string.Empty;
+    public long ClaimVersion { get; set; }
+    public DateTimeOffset? ClaimedUntil { get; set; }
+    public DateTimeOffset? NextEligibleAt { get; set; }
+    public DateTimeOffset? DeadLetteredAt { get; set; }
+    public string? SafeFailureCode { get; set; }
+    public string? AuditReference { get; set; }
 }

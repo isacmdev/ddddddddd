@@ -32,6 +32,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ControlParental.SessionAgent\ControlParental.SessionAgent.csproj" />
+    <ProjectReference Include="..\..\src\ControlParental.Service\ControlParental.Service.csproj" />
   </ItemGroup>
 
 </Project>

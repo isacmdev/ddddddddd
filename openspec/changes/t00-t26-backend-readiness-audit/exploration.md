@@ -147,7 +147,7 @@ reviewable and lets the remediation plan map onto roadmap units.
 
 1. **Evidence level for THIS exploration = structural** (read-only source
    inspection + git state + re-reading prior reports as inputs). No code edits,
-   no `gentle-ai review` lifecycle calls.
+   no review lifecycle calls.
 2. **Current-source re-verification rule**: every defect carried forward from a
    prior report MUST be re-checked against the current tree before it earns a
    severity in the report. Known drift to confirm: per-entry outbox (partially
@@ -235,7 +235,7 @@ confused with backend dependencies.
 - Freezing speculative backend routes/DTOs/age-band wire values/pairing-response
   shapes — the audit flags over-speculative `BackendClient` assumptions as (b)
   unready integration, not as a reason to freeze contracts.
-- Calling `gentle-ai review` lifecycle commands.
+- Calling review lifecycle commands.
 
 **Review-workload guard for the remediation plan**: if the plan's authored
 remediation exceeds the 400-line budget, the proposal should recommend chained

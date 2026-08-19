@@ -52,15 +52,14 @@ public class ServiceCompositionTests : IDisposable
         // T38: IPC channel and session management
         services.AddSingleton<SessionManager>();
 
-        // T03: Register PolicyRepository and DbContext (in-memory SQLite for testing)
+        // T03: Register PolicyRepository and DbContext factory (in-memory SQLite for testing)
         var dbPath = Path.Combine(this.tempDataPath, "test.db");
-        services.AddSingleton<ControlParentalDbContext>(sp =>
+        services.AddDbContextFactory<ControlParentalDbContext>(options =>
         {
-            var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
-                .Options;
-            return new ControlParentalDbContext(options);
+            options.UseSqlite($"Data Source={dbPath}");
         });
+        services.AddScoped<ControlParentalDbContext>(sp =>
+            sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>().CreateDbContext());
         services.AddSingleton<IPolicyRepository, PolicyRepository>();
         services.AddSingleton<PolicyRepository>(); // Concrete for UsageAccumulator
 
@@ -70,11 +69,11 @@ public class ServiceCompositionTests : IDisposable
         // T07: Register UsageReconciler
         services.AddSingleton<IUsageReconciler>((sp) =>
         {
-            var dbContext = sp.GetRequiredService<ControlParentalDbContext>();
+            var dbContextFactory = sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>();
             var timeProvider = sp.GetRequiredService<ITimeProvider>();
             var ipcChannel = sp.GetService<IIpcChannel>();
             Func<string, string> resolveAppId = Interop.AppIdentityResolver.Resolve;
-            return new UsageReconciler(dbContext, timeProvider, ipcChannel, resolveAppId);
+            return new UsageReconciler(dbContextFactory, timeProvider, ipcChannel, resolveAppId);
         });
 
         // T06: Register UsageAccumulator
@@ -196,6 +195,9 @@ public class ServiceCompositionTests : IDisposable
                 supabaseKey);
         });
 
+        // T25: Register ConsentService for data collection consent
+        services.AddScoped<IConsentService, ConsentService>();
+
         // T20: Register ScheduledWorkService
         services.AddSingleton<IScheduledWorkService>((sp) =>
         {
@@ -251,6 +253,29 @@ public class ServiceCompositionTests : IDisposable
         // T20: IScheduledWorkService must be resolvable
         var scheduler = this.serviceProvider.GetRequiredService<IScheduledWorkService>();
         Assert.NotNull(scheduler);
+    }
+
+    [Fact]
+    public void ServiceProvider_CanResolveOutboxAndConsentServices()
+    {
+        using var scope = this.serviceProvider.CreateScope();
+
+        var outbox = scope.ServiceProvider.GetRequiredService<IOutboxManager>();
+        var consent = scope.ServiceProvider.GetRequiredService<IConsentService>();
+
+        Assert.NotNull(outbox);
+        Assert.NotNull(consent);
+    }
+
+    [Fact]
+    public void ServiceProvider_CanResolveDbContextFactory_AndScopedContext()
+    {
+        var factory = this.serviceProvider.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>();
+        Assert.NotNull(factory);
+
+        using var scope = this.serviceProvider.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ControlParentalDbContext>();
+        Assert.NotNull(dbContext);
     }
 
     [Fact]

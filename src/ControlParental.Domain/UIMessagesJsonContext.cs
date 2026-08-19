@@ -60,10 +60,16 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(GrantConsent))]
 [JsonSerializable(typeof(AdvanceOnboardingStep))]
 [JsonSerializable(typeof(ResetOnboardingState))]
+[JsonSerializable(typeof(RegisterWnsChannel))]
+[JsonSerializable(typeof(WnsRegistrationResult))]
+[JsonSerializable(typeof(WnsRegistrationStatus))]
 
 // Agent ↔ Service envelopes (same wire contract, different pipe).
 [JsonSerializable(typeof(ForegroundChanged))]
 [JsonSerializable(typeof(AgentHeartbeat))]
+[JsonSerializable(typeof(AgentAuthority))]
+[JsonSerializable(typeof(AgentCommandRequest))]
+[JsonSerializable(typeof(AgentCommandCompleted))]
 [JsonSerializable(typeof(StateSnapshot))]
 [JsonSerializable(typeof(Pong))]
 [JsonSerializable(typeof(ShowOverlay))]

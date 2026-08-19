@@ -72,17 +72,20 @@ public sealed class SessionManagerLifecycleTests
     public async Task WatcherCancellationBoundsProviderFailureShutdown()
     {
         var calls = 0;
+        var providerCalled = new TaskCompletionSource<object?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         using var watcher = new SessionWatcher(
             "child", _ => { }, _ => { }, _ => { }, _ => { },
             () =>
             {
                 calls++;
+                providerCalled.TrySetResult(null);
                 throw new InvalidOperationException("synthetic provider failure");
             },
             TimeSpan.FromMilliseconds(1));
 
         await watcher.StartAsync();
-        await Task.Delay(10);
+        await providerCalled.Task.WaitAsync(TimeSpan.FromSeconds(1));
         var started = DateTime.UtcNow;
         try
         {

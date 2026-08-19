@@ -5,6 +5,7 @@
 namespace ControlParental.SessionAgent;
 
 using System.Diagnostics;
+using ControlParental.Domain;
 using ControlParental.SessionAgent.Interop;
 
 /// <summary>
@@ -57,6 +58,7 @@ public sealed class ForegroundWatcher : IForegroundWatcher, IDisposable
     private Thread? messagePumpThread;
     private CancellationTokenSource? cts;
     private string? currentAppId;
+    private ObservedProcessTarget? currentTarget;
     private bool isRunning;
     private bool isDisposed;
 
@@ -80,6 +82,41 @@ public sealed class ForegroundWatcher : IForegroundWatcher, IDisposable
 
     /// <inheritdoc />
     public event Action<string>? ForegroundChanged;
+
+    public ObservedProcessTarget? CurrentTarget
+    {
+        get
+        {
+            lock (this.lockObj)
+            {
+                return this.currentTarget;
+            }
+        }
+    }
+
+    public ObservedProcessTarget? GetCurrentTarget(string appId)
+    {
+        lock (this.lockObj)
+        {
+            return string.Equals(this.currentAppId, appId, StringComparison.Ordinal)
+                ? this.currentTarget
+                : null;
+        }
+    }
+
+    internal static ForegroundChanged CreateObservation(
+        string appId,
+        int processId,
+        int sessionId,
+        DateTimeOffset startedAt) =>
+        new(appId, new ObservedProcessTarget(processId, sessionId, startedAt));
+
+    internal static bool ShouldPublishObservation(
+        string? currentAppId,
+        ObservedProcessTarget? currentTarget,
+        ForegroundChanged observation) =>
+        !string.Equals(currentAppId, observation.AppId, StringComparison.Ordinal) ||
+        currentTarget != observation.Target;
 
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -264,18 +301,35 @@ public sealed class ForegroundWatcher : IForegroundWatcher, IDisposable
 
         // Resolve to AppId
         var appId = AppIdentityResolver.Resolve(processPath);
+        ObservedProcessTarget? target = null;
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            target = CreateObservation(
+                appId,
+                process.Id,
+                process.SessionId,
+                process.StartTime.ToUniversalTime()).Target;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or UnauthorizedAccessException)
+        {
+            Debug.WriteLine($"[ForegroundWatcher] Exact process identity unavailable: {ex.Message}");
+        }
 
-        // Check if it actually changed
+        var observation = new ForegroundChanged(appId, target);
+
+        // Check if the canonical identity or exact process instance actually changed.
         string? previousAppId;
         lock (this.lockObj)
         {
             previousAppId = this.currentAppId;
-            if (appId == previousAppId)
+            if (!ShouldPublishObservation(this.currentAppId, this.currentTarget, observation))
             {
-                return; // No change
+                return;
             }
 
-            this.currentAppId = appId;
+            this.currentAppId = observation.AppId;
+            this.currentTarget = observation.Target;
         }
 
         Debug.WriteLine($"[ForegroundWatcher] Foreground changed: {previousAppId} → {appId}");
@@ -300,12 +354,14 @@ public sealed class ForegroundWatcher : IForegroundWatcher, IDisposable
             {
                 var appId = AppIdentityResolver.GetCurrentForegroundAppId();
 
-                if (appId != lastAppId && !IsNoiseProcess(Path.GetFileName(appId)))
+                if (!string.Equals(appId, lastAppId, StringComparison.Ordinal) &&
+                    !IsNoiseProcess(Path.GetFileName(appId)))
                 {
                     lock (this.lockObj)
                     {
-                        lastAppId = this.currentAppId;
+                        lastAppId = appId;
                         this.currentAppId = appId;
+                        this.currentTarget = null;
                     }
 
                     this.RaiseForegroundChanged(appId);

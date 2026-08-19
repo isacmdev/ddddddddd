@@ -8,6 +8,7 @@ using ControlParental.Domain;
 
 using System.IO;
 using System.Security.AccessControl;
+using System.Security;
 using System.Security.Principal;
 
 
@@ -18,6 +19,9 @@ using System.Security.Principal;
 /// </summary>
 public sealed class AclHardener : IAclHardener
 {
+    internal static Func<string, bool, Microsoft.Win32.RegistryKey?> RegistryKeyOpener { get; set; } =
+        static (path, writable) => Microsoft.Win32.Registry.LocalMachine.OpenSubKey(path, writable);
+
     private static readonly SecurityIdentifier UsersGroup =
         new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
 
@@ -47,9 +51,7 @@ public sealed class AclHardener : IAclHardener
             {
                 try
                 {
-                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
-                        serviceRegistryKey,
-                        writable: true);
+                    using var key = RegistryKeyOpener(serviceRegistryKey, true);
 
                     if (key == null)
                     {
@@ -76,6 +78,12 @@ public sealed class AclHardener : IAclHardener
                     // Elevation required: the service (LocalSystem) should be able to set ACLs
                     System.Diagnostics.Debug.WriteLine(
                         $"[AclHardener] Cannot set registry ACL (requires elevation): {ex.Message}");
+                    return false;
+                }
+                catch (SecurityException)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        "[AclHardener] Registry ACL access was denied; hardening remains incomplete.");
                     return false;
                 }
                 catch (IOException ex)

@@ -10,7 +10,7 @@ using ControlParental.Domain;
 /// T10 — Implementación de IServiceHealthMonitor.
 /// Monitorea heartbeats del agente y detecta cuando muere.
 /// </summary>
-public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
+public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IAuthoritativeHealthSink, IDisposable
 {
     private readonly TimeSpan agentHeartbeatTimeout;
     private readonly TimeSpan healthCheckInterval;
@@ -24,6 +24,9 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
     private bool isRunning;
     private bool disposed;
     private RuntimeSecurityVerdict securityVerdict = RuntimeSecurityVerdict.HealthyStandard;
+    private bool restoreSucceeded;
+    private bool currentCriticalActionsConfirmed;
+    private bool hasHealthBlockingIssues = true;
 
     private const int MaxAgentDeathsBeforeAlert = 3;
 
@@ -68,7 +71,13 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
 
     /// <inheritdoc />
     public bool IsServiceHealthy =>
-        this.isRunning && !this.disposed && RuntimeSecurityVerdictEvaluator.IsHealthy(this.securityVerdict);
+        this.isRunning &&
+        !this.disposed &&
+        this.restoreSucceeded &&
+        this.currentCriticalActionsConfirmed &&
+        !this.hasHealthBlockingIssues &&
+        this.IsAgentHealthy &&
+        RuntimeSecurityVerdictEvaluator.IsHealthy(this.securityVerdict);
 
     public RuntimeSecurityVerdict SecurityVerdict => this.securityVerdict;
 
@@ -81,6 +90,14 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
     {
         this.securityVerdict = verdict;
     }
+
+    public void SetRestoreStatus(bool succeeded) => this.restoreSucceeded = succeeded;
+
+    public void SetCurrentCriticalActionsConfirmed(bool confirmed) =>
+        this.currentCriticalActionsConfirmed = confirmed;
+
+    public void SetHealthBlockingIssues(bool hasBlockingIssues) =>
+        this.hasHealthBlockingIssues = hasBlockingIssues;
 
     /// <inheritdoc />
     public DateTimeOffset? LastAgentHeartbeat
@@ -151,6 +168,8 @@ public sealed class ServiceHealthMonitor : IServiceHealthMonitor, IDisposable
     /// <inheritdoc />
     public void RecordAgentDeath()
     {
+        this.lastAgentHeartbeatTicks = null;
+        this.currentCriticalActionsConfirmed = false;
         this.agentRestartCount++;
         var timestampTicks = this.timeProvider.MonotonicNow;
 

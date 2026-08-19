@@ -42,9 +42,9 @@ public sealed class ProtectedProcessReporter : IProtectedProcessReporter
                     }
 
                     // Verify Authenticode signature using WinVerifyTrust
-                    // The action GUID for WinVerifyTrust
-                    var verifyAction = new Guid("00AAC60B-0000-0000-0000-000000000000");
-                    var wintrust = new Interop.WinTrustFileInfo(this.serviceExePath, verifyAction);
+                    var wintrust = new Interop.WinTrustFileInfo(
+                        this.serviceExePath,
+                        Interop.WinTrust.GenericVerifyV2ActionId);
 
                     return wintrust.IsSigned;
                 }

@@ -5,6 +5,8 @@
 namespace ControlParental.Service.Tests;
 
 using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
 using ControlParental.Domain;
 using ControlParental.Service.Interop;
 using Microsoft.Extensions.DependencyInjection;
@@ -198,12 +200,231 @@ public sealed class NamedPipeUIServerHostedAdapterTests : IDisposable
         adapter.Dispose();
     }
 
+    [Fact]
+    public async Task Listener_PipeCreationFailuresUseBoundedBackoffInsteadOfSpinning()
+    {
+        // RED seam: expose the private listener with an injectable pipe factory
+        // and delay delegate. The delay delegate is deliberately deterministic;
+        // this test must not sleep in real time.
+        using var cancellation = new CancellationTokenSource();
+        var createAttempts = 0;
+        var delays = new List<TimeSpan>();
+        var listener = this.CreateListener(
+            cancellation.Token,
+            _ =>
+            {
+                createAttempts++;
+                throw new IOException("sensitive pipe path");
+            },
+            (delay, _) =>
+            {
+                delays.Add(delay);
+                if (delays.Count >= 3)
+                {
+                    cancellation.Cancel();
+                }
+
+                return Task.CompletedTask;
+            });
+
+        await listener.StartAsync();
+
+        Assert.Equal(3, createAttempts);
+        Assert.Equal(3, delays.Count);
+        Assert.All(delays, delay => Assert.InRange(delay, TimeSpan.Zero, TimeSpan.FromSeconds(1)));
+        Assert.True(listener.IsReady == false);
+    }
+
+    [Fact]
+    public async Task Listener_PipeCreationFailureLogsSanitizedTypeAndContext()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var listener = this.CreateListener(
+            cancellation.Token,
+            _ => throw new UnauthorizedAccessException("secret path or token"),
+            (_, _) =>
+            {
+                cancellation.Cancel();
+                return Task.CompletedTask;
+            });
+
+        await listener.StartAsync();
+
+        var log = Assert.Single(
+            this.mockLogger.Invocations,
+            invocation => invocation.Method.Name == nameof(ILogger.Log));
+        Assert.Equal(LogLevel.Error, (LogLevel)log.Arguments[0]!);
+        var state = log.Arguments[2]?.ToString() ?? string.Empty;
+        Assert.Contains("pipe", state, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(nameof(UnauthorizedAccessException), state);
+        Assert.DoesNotContain("secret path or token", state);
+    }
+
+    [Fact]
+    public async Task Listener_CancellationDuringBackoffExitsPromptly()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var backoffEntered = new TaskCompletionSource<object?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var listener = this.CreateListener(
+            cancellation.Token,
+            _ => throw new IOException("pipe unavailable"),
+            (_, token) =>
+            {
+                backoffEntered.SetResult(null);
+                return Task.Delay(Timeout.InfiniteTimeSpan, token);
+            });
+
+        var startTask = listener.StartAsync();
+        await backoffEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        cancellation.Cancel();
+
+        await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.False(listener.IsReady);
+    }
+
+    [Fact]
+    public async Task Listener_DoesNotReportReadyUntilPipeCreationSucceeds()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var createAttempts = 0;
+        var backoffEntered = new TaskCompletionSource<object?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipe = new FakeUiPipeServer();
+        var listener = this.CreateListener(
+            cancellation.Token,
+            _ =>
+            {
+                createAttempts++;
+                if (createAttempts == 1)
+                {
+                    throw new IOException("pipe unavailable");
+                }
+
+                return Task.FromResult<NamedPipeUIServer.IUiPipeServer>(pipe);
+            },
+            (_, _) =>
+            {
+                backoffEntered.SetResult(null);
+                return Task.CompletedTask;
+            });
+
+        var startTask = listener.StartAsync();
+        await backoffEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.False(listener.IsReady);
+
+        await pipe.ConnectionWaitStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.True(listener.IsReady);
+        cancellation.Cancel();
+        await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task StartAsync_ExposesUiPipeBeforeClientConnects()
+    {
+        var adapter = new NamedPipeUIServerHostedAdapter(
+            new NamedPipeUIServer(
+                null,
+                null,
+                new Mock<ILogger<NamedPipeUIServer>>().Object),
+            this.messageHandler,
+            this.mockLogger.Object);
+
+        await adapter.StartAsync(CancellationToken.None);
+
+        using var client = new NamedPipeClientStream(
+            ".",
+            "ControlParental.UI",
+            PipeDirection.InOut,
+            PipeOptions.Asynchronous);
+        await client.ConnectAsync(1000);
+
+        Assert.True(client.IsConnected);
+        await adapter.StopAsync(CancellationToken.None);
+        adapter.Dispose();
+    }
+
+    [Fact]
+    public void UiPipe_UsesFrameworkMaximumServerInstanceValue()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            LocateRepoRoot(),
+            "src",
+            "ControlParental.Service",
+            "Interop",
+            "NamedPipeUIServer.cs"));
+
+        Assert.Contains("NamedPipeServerStream.MaxAllowedServerInstances", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("PipeDirection.InOut,\n                255,", source, StringComparison.Ordinal);
+    }
+
+    private NamedPipeUIServer.PipeServerListener CreateListener(
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task<NamedPipeUIServer.IUiPipeServer>> pipeFactory,
+        Func<TimeSpan, CancellationToken, Task> delay)
+    {
+        return new NamedPipeUIServer.PipeServerListener(
+            "ControlParental.UI",
+            null!,
+            null!,
+            null!,
+            () => { },
+            cancellationToken,
+            pipeFactory,
+            delay,
+            this.mockLogger.Object);
+    }
+
+    private sealed class FakeUiPipeServer : NamedPipeUIServer.IUiPipeServer
+    {
+        public TaskCompletionSource<object?> ConnectionWaitStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool IsConnected => false;
+
+        public Task WaitForConnectionAsync(CancellationToken cancellationToken)
+        {
+            this.ConnectionWaitStarted.TrySetResult(null);
+            return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+
+        public Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
+            => cancellationToken.IsCancellationRequested
+                ? Task.FromCanceled<int>(cancellationToken)
+                : Task.FromResult(0);
+
+        public Task WriteAsync(byte[] buffer, CancellationToken cancellationToken)
+            => cancellationToken.IsCancellationRequested
+                ? Task.FromCanceled(cancellationToken)
+                : Task.CompletedTask;
+
+        public System.Security.Principal.SecurityIdentifier GetImpersonationUserSid()
+            => new(
+                System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid,
+                null);
+
+        public void Dispose()
+        {
+        }
+    }
+
     private NamedPipeUIServerHostedAdapter CreateAdapter()
     {
         return new NamedPipeUIServerHostedAdapter(
             new NamedPipeUIServer(),
             this.messageHandler,
             this.mockLogger.Object);
+    }
+
+    private static string LocateRepoRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current != null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
+        {
+            current = current.Parent;
+        }
+
+        return current?.FullName ?? throw new InvalidOperationException("Could not locate repository root.");
     }
 
     public void Dispose()

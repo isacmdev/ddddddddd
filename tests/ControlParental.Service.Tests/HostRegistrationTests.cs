@@ -27,7 +27,7 @@ public class HostRegistrationTests
     {
         string source = ReadProgramSource();
 
-        int occurrences = CountOccurrences(source, "AddSingleton<NamedPipeUIServer>();");
+        int occurrences = CountOccurrences(source, "AddSingleton<NamedPipeUIServer>(");
 
         occurrences.Should().Be(1,
             "NamedPipeUIServer must be registered exactly once so the UI pipe has a single ACL-authoritative instance.");

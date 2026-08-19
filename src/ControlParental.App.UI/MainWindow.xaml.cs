@@ -7,6 +7,7 @@ namespace ControlParental.App.UI;
 using System;
 using System.ComponentModel;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
@@ -138,5 +139,15 @@ public sealed partial class MainWindow : Window
     private void NavigateBackToConsent()
     {
         this.NavigateToCurrentRoute();
+    }
+
+    private static WnsRegistrationPage CreateWnsRegistrationPage(IServiceProvider serviceProvider)
+    {
+        return serviceProvider.GetRequiredService<WnsRegistrationPage>();
+    }
+
+    private void OnWnsRegistrationRequested(object sender, RoutedEventArgs e)
+    {
+        this.PageHost.Content = CreateWnsRegistrationPage(App.Services);
     }
 }

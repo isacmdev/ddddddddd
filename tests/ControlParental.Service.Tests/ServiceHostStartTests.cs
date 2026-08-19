@@ -48,13 +48,12 @@ public class ServiceHostStartTests : IDisposable
 
         // T03
         var dbPath = Path.Combine(this._tempDataPath, "controlparental.db");
-        builder.Services.AddSingleton<ControlParentalDbContext>(sp =>
+        builder.Services.AddDbContextFactory<ControlParentalDbContext>(options =>
         {
-            var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-                .UseSqlite($"Data Source={dbPath}")
-                .Options;
-            return new ControlParentalDbContext(options);
+            options.UseSqlite($"Data Source={dbPath}");
         });
+        builder.Services.AddScoped<ControlParentalDbContext>(sp =>
+            sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>().CreateDbContext());
         builder.Services.AddSingleton<IPolicyRepository, PolicyRepository>();
         builder.Services.AddSingleton<PolicyRepository>();
 
@@ -64,11 +63,11 @@ public class ServiceHostStartTests : IDisposable
         // T07
         builder.Services.AddSingleton<IUsageReconciler>((sp) =>
         {
-            var dbContext = sp.GetRequiredService<ControlParentalDbContext>();
+            var dbContextFactory = sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>();
             var timeProvider = sp.GetRequiredService<ITimeProvider>();
             var ipcChannel = sp.GetService<IIpcChannel>();
             Func<string, string> resolveAppId = Interop.AppIdentityResolver.Resolve;
-            return new UsageReconciler(dbContext, timeProvider, ipcChannel, resolveAppId);
+            return new UsageReconciler(dbContextFactory, timeProvider, ipcChannel, resolveAppId);
         });
 
         // T06
@@ -89,11 +88,15 @@ public class ServiceHostStartTests : IDisposable
         builder.Services.AddSingleton<IOverlayPersistenceManager, OverlayPersistenceManager>();
 
         // T10
-        builder.Services.AddSingleton<IServiceHealthMonitor>((sp) =>
+        builder.Services.AddSingleton<ServiceHealthMonitor>(sp =>
             new ServiceHealthMonitor(
                 sp.GetRequiredService<ITimeProvider>(),
-                onAgentDied: () => { },
-                onServiceUnhealthy: _ => { }));
+                () => { },
+                _ => { }));
+        builder.Services.AddSingleton<IServiceHealthMonitor>((sp) =>
+            sp.GetRequiredService<ServiceHealthMonitor>());
+        builder.Services.AddSingleton<IAuthoritativeHealthSink>((sp) =>
+            sp.GetRequiredService<ServiceHealthMonitor>());
         builder.Services.AddSingleton<IServiceRecoveryManager>((sp) =>
             new ServiceRecoveryManager(
                 sp.GetRequiredService<IServiceHealthMonitor>(),
@@ -198,6 +201,54 @@ public class ServiceHostStartTests : IDisposable
     }
 
     [Fact]
+    public void HostBuilder_ResolvesServiceHealthMonitor_AsSingleton()
+    {
+        var sp = this._host.Services;
+
+        var first = sp.GetRequiredService<IServiceHealthMonitor>();
+        var second = sp.GetRequiredService<IServiceHealthMonitor>();
+
+        Assert.Same(first, second);
+    }
+
+    [Fact]
+    public void HostBuilder_ResolvesServiceHealthMonitor_ThroughConcreteAndInterface_AsSameSingleton()
+    {
+        var sp = this._host.Services;
+
+        var concrete = sp.GetRequiredService<ServiceHealthMonitor>();
+        var contract = sp.GetRequiredService<IServiceHealthMonitor>();
+        var authoritativeSink = sp.GetRequiredService<IAuthoritativeHealthSink>();
+
+        Assert.Same(concrete, contract);
+        Assert.Same(concrete, authoritativeSink);
+    }
+
+    [Fact]
+    public void HostBuilder_ResolvesServiceRecoveryManager_AsSingleton()
+    {
+        var sp = this._host.Services;
+
+        var first = sp.GetRequiredService<IServiceRecoveryManager>();
+        var second = sp.GetRequiredService<IServiceRecoveryManager>();
+
+        Assert.Same(first, second);
+    }
+
+    [Fact]
+    public void HostBuilder_ResolvesDbContextFactory_AndScopedContext()
+    {
+        var sp = this._host.Services;
+
+        var factory = sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>();
+        Assert.NotNull(factory);
+
+        using var scope = sp.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ControlParentalDbContext>();
+        Assert.NotNull(dbContext);
+    }
+
+    [Fact]
     public async Task HostStartAsync_DoesNotThrow()
     {
         // This is the critical test: Host.StartAsync() must not throw.
@@ -258,6 +309,21 @@ public class ServiceHostStartTests : IDisposable
         }
 
         Assert.Null(caught);
+    }
+
+    [Fact]
+    public async Task HostStartAndStopAsync_AreIdempotent()
+    {
+        var lifetime = this._host.Services.GetRequiredService<IHostApplicationLifetime>();
+        Assert.False(lifetime.ApplicationStopped.IsCancellationRequested);
+
+        await this._host.StartAsync(CancellationToken.None);
+        await this._host.StartAsync(CancellationToken.None);
+
+        await this._host.StopAsync(CancellationToken.None);
+        await this._host.StopAsync(CancellationToken.None);
+
+        Assert.True(lifetime.ApplicationStopped.IsCancellationRequested);
     }
 
     public void Dispose()

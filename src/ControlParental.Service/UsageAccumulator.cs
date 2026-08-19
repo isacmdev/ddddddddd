@@ -43,8 +43,10 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
     // ── State ──────────────────────────────────────────────────────────
 
     private readonly object lockObj = new();
-    private readonly Timer tickTimer;
+    private readonly TimeSpan tickInterval;
     private readonly HashSet<int> triggeredThresholds = new();
+    private CancellationTokenSource? tickCancellation;
+    private Task tickTask = Task.CompletedTask;
 
     private string? currentAppId;
     private DateTimeOffset? foregroundStartTime;
@@ -67,31 +69,14 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
         IIpcChannel? ipcChannel,
         PolicyRepository repository,
         ITimeProvider timeProvider,
-        IUsageReconciler? usageReconciler = null)
+        IUsageReconciler? usageReconciler = null,
+        TimeSpan? tickInterval = null)
     {
         this.ipcChannel = ipcChannel;
         this.repository = repository;
         this.timeProvider = timeProvider;
         this.usageReconciler = usageReconciler;
-
-        // Timer with no due time, repeating every TickIntervalSeconds
-        this.tickTimer = new Timer(
-            callback: _ =>
-            {
-                // Guard: only fire if still running (StopTimer doesn't change isRunning)
-                lock (this.lockObj)
-                {
-                    if (!this.isRunning || this.isPaused)
-                    {
-                        return;
-                    }
-                }
-
-                this.SimulateTickAsync().Wait();
-            },
-            state: null,
-            dueTime: Timeout.Infinite, // Start manually
-            period: TickIntervalSeconds * 1000);
+        this.tickInterval = tickInterval ?? TimeSpan.FromSeconds(TickIntervalSeconds);
     }
 
     /// <inheritdoc />
@@ -133,6 +118,7 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
 
             this.isRunning = true;
             this.isPaused = false;
+            this.tickCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
             // Subscribe to foreground changes from the agent
             // IPC channel may be null if SetIpcChannel hasn't been called yet (agent not connected)
@@ -141,9 +127,8 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
                 this.ipcChannel.MessageReceived += this.OnIpcMessage;
             }
 
-            // Start the tick timer
             this.lastTickTime = this.timeProvider.WallClockNow;
-            this.tickTimer.Change(0, TickIntervalSeconds * 1000);
+            this.tickTask = this.RunPeriodicTicksAsync(this.tickCancellation.Token);
         }
 
         return Task.CompletedTask;
@@ -152,6 +137,7 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
     /// <inheritdoc />
     public void Stop()
     {
+        CancellationTokenSource? cancellation;
         lock (this.lockObj)
         {
             if (!this.isRunning)
@@ -160,12 +146,26 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
             }
 
             this.isRunning = false;
-            this.tickTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            cancellation = this.tickCancellation;
             if (this.ipcChannel != null)
             {
                 this.ipcChannel.MessageReceived -= this.OnIpcMessage;
             }
         }
+
+        cancellation?.Cancel();
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        Task task;
+        this.Stop();
+        lock (this.lockObj)
+        {
+            task = this.tickTask;
+        }
+
+        await task;
     }
 
     /// <inheritdoc />
@@ -181,8 +181,6 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
             this.isPaused = true;
             this.foregroundStartTime = null; // Reset foreground start on pause
 
-            // Stop the timer while paused
-            this.tickTimer.Change(Timeout.Infinite, Timeout.Infinite);
             Debug.WriteLine("[UsageAccumulator] Paused.");
         }
     }
@@ -199,7 +197,6 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
 
             this.isPaused = false;
             this.lastTickTime = this.timeProvider.WallClockNow;
-            this.tickTimer.Change(0, TickIntervalSeconds * 1000);
             Debug.WriteLine("[UsageAccumulator] Resumed.");
         }
     }
@@ -304,9 +301,9 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
     /// </summary>
     protected virtual Task AccumulateUsageAsyncCoreAsync(
         string appId,
-        int minutes,
+        long elapsedSeconds,
         CancellationToken ct = default)
-        => this.repository.AccumulateUsageAsync(appId, minutes, ct);
+        => this.repository.AccumulateUsageAsync(appId, elapsedSeconds, ct);
 
     /// <summary>
     /// Override point for testing: gets the current policy.
@@ -362,7 +359,7 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
             // Calculate elapsed seconds
             var now = this.timeProvider.WallClockNow;
             var elapsed = now - startTime.Value;
-            var elapsedSeconds = (int)elapsed.TotalSeconds;
+            var elapsedSeconds = (long)elapsed.TotalSeconds;
 
             if (elapsedSeconds < 1)
             {
@@ -370,7 +367,7 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
             }
 
             // Accumulate usage
-            await this.AccumulateUsageAsyncCoreAsync(appId, elapsedSeconds / 60, ct);
+            await this.AccumulateUsageAsyncCoreAsync(appId, elapsedSeconds, ct);
 
             // Update foreground start time for next tick
             lock (this.lockObj)
@@ -379,10 +376,10 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
             }
 
             Debug.WriteLine(
-                $"[UsageAccumulator] Accumulated {elapsedSeconds / 60} min for {appId}");
+                $"[UsageAccumulator] Accumulated {elapsedSeconds} sec for {appId}");
 
             // Check warning thresholds
-            await this.CheckWarningThresholdsAsync(appId, now, CancellationToken.None);
+            await this.CheckWarningThresholdsAsync(appId, now, ct);
         }
         catch (Exception ex)
         {
@@ -437,7 +434,12 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
 
         this.isDisposed = true;
         this.Stop();
-        this.tickTimer.Dispose();
+        _ = this.tickTask.ContinueWith(
+            (_, state) => ((CancellationTokenSource?)state)?.Dispose(),
+            this.tickCancellation,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
         GC.SuppressFinalize(this);
     }
 
@@ -450,7 +452,22 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
     {
         lock (this.lockObj)
         {
+            if (ReferenceEquals(this.ipcChannel, channel))
+            {
+                return;
+            }
+
+            if (this.isRunning && this.ipcChannel != null)
+            {
+                this.ipcChannel.MessageReceived -= this.OnIpcMessage;
+            }
+
             this.ipcChannel = channel;
+
+            if (this.isRunning)
+            {
+                this.ipcChannel.MessageReceived += this.OnIpcMessage;
+            }
         }
     }
 
@@ -458,5 +475,20 @@ public class UsageAccumulator : IUsageAccumulator, IDisposable
     /// Stops the internal timer (for testing only).
     /// Use this in tests to prevent the timer from firing during test execution.
     /// </summary>
-    internal void StopTimer() => this.tickTimer.Change(Timeout.Infinite, Timeout.Infinite);
+    internal void StopTimer() => this.tickCancellation?.Cancel();
+
+    private async Task RunPeriodicTicksAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(this.tickInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                await this.SimulateTickAsync(cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
 }

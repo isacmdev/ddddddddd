@@ -259,6 +259,23 @@ public class EnforcementLevelMonitorTests : IDisposable
     }
 
     [Fact]
+    public async Task EvaluateAsync_WhenUnexpectedProbeThrows_ReportsEvaluationFailure()
+    {
+        // Arrange
+        this.mockScmController
+            .Setup(s => s.IsServiceRunningAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        this.mockHealthMonitor.SetupGet(h => h.IsAgentHealthy).Throws(new InvalidOperationException("health probe failed"));
+
+        // Act
+        await this.monitor.EvaluateAsync();
+
+        // Assert
+        this.monitor.CurrentLevel.Should().Be(EnforcementLevel.Degraded);
+        this.monitor.CurrentIssues.Should().ContainSingle(i => i.Type == EnforcementIssueType.EvaluationFailure);
+    }
+
+    [Fact]
     public async Task EvaluateAsync_WhenServiceNotRunning_ReturnsDegraded()
     {
         // Arrange
@@ -419,5 +436,24 @@ public class EnforcementLevelMonitorTests : IDisposable
         // Act & Assert
         var act = () => this.monitor.RecordAgentAlive();
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void SemanticIssuesUpdateOneCauseAndKeepDifferentSessionsDistinct()
+    {
+        var first = new IssueKey(4, EnforcementIssueType.ClockTampering, "timezone-change");
+        var otherSession = first with { SessionId = 7 };
+
+        this.monitor.AddIssue(first, EnforcementIssueSeverity.Warning, "first evidence");
+        this.monitor.AddIssue(first, EnforcementIssueSeverity.Severe, "new evidence");
+        this.monitor.AddIssue(otherSession, EnforcementIssueSeverity.Warning, "other session");
+
+        this.monitor.CurrentIssues.Should().HaveCount(2);
+        this.monitor.CurrentIssues.Single(issue => issue.Key == first).OccurrenceCount.Should().Be(2);
+        this.monitor.CurrentIssues.Single(issue => issue.Key == first).Description.Should().Be("new evidence");
+
+        this.monitor.ResolveIssue(first);
+
+        this.monitor.CurrentIssues.Should().ContainSingle(issue => issue.Key == otherSession);
     }
 }

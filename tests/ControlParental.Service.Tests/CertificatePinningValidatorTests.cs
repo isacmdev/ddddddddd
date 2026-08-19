@@ -169,7 +169,7 @@ public class CertificatePinningValidatorTests : IDisposable
     }
 
     [Fact]
-    public void Validate_CertB_AgainstPinA_ThrowsWithCorrectPinInMessage()
+    public void Validate_CertB_AgainstPinA_DoesNotDisclosePins()
     {
         // Arrange
         using var certA = CreateRsaCertificate("supabase.co");
@@ -179,9 +179,10 @@ public class CertificatePinningValidatorTests : IDisposable
         // Act
         var act = () => CertificatePinningValidator.Validate(pinA, certB);
 
-        // Assert: error message contains both expected and computed pins
-        act.Should().Throw<CertificatePinValidationException>()
-            .WithMessage($"*{pinA}*");
+        // Assert: pins are configuration material and must never enter logs via exception text.
+        var exception = act.Should().Throw<CertificatePinValidationException>().Which;
+        exception.Message.Should().NotContain(pinA);
+        exception.Message.Should().NotContain(CertificatePinningValidator.CalculateSpkiPin(certB));
     }
 
     [Fact]

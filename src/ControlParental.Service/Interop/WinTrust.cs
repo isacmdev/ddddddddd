@@ -13,7 +13,7 @@ using System.Text;
 /// </summary>
 public static class WinTrust
 {
-    public const uint WINTRUST_ACTION_GENERIC_VERIFY_V2 = 0x00AAC60B;
+    public static readonly Guid GenericVerifyV2ActionId = new("00AAC56B-CD44-11D0-8CC2-00C04FC295EE");
 
     [DllImport("wintrust.dll", ExactSpelling = true, SetLastError = false, CharSet = CharSet.Unicode)]
     public static extern int WinVerifyTrust(
@@ -46,8 +46,10 @@ public static class WinTrust
         public uint fdwRevocationChecks;
         public uint dwUnionChoice;
         public IntPtr pFile;
-        public uint dwStateData;
-        public IntPtr pszStateData;
+        public uint dwStateAction;
+        public IntPtr hWVTStateData;
+        public IntPtr pwszURLReference;
+        public uint dwProvFlags;
         public uint dwUIContext;
         public IntPtr pSignatureSettings;
     }
@@ -65,6 +67,8 @@ public sealed class WinTrustFileInfo : IDisposable
     private readonly string filePath;
     private bool isSigned;
     private bool disposed;
+
+    public int RawResult { get; private set; } = int.MinValue;
 
     public WinTrustFileInfo(string filePath, Guid actionId)
     {
@@ -92,19 +96,20 @@ public sealed class WinTrustFileInfo : IDisposable
                 fdwRevocationChecks = WinTrust.WTD_REVOKE_NONE,
                 dwUnionChoice = WinTrust.WTD_CHOICE_FILE,
                 pFile = fileInfoPtr,
-                dwStateData = 0,
-                pszStateData = IntPtr.Zero,
+                dwStateAction = 0,
+                hWVTStateData = IntPtr.Zero,
+                pwszURLReference = IntPtr.Zero,
+                dwProvFlags = 0,
                 dwUIContext = 0,
                 pSignatureSettings = IntPtr.Zero,
             };
 
-            var result = WinTrust.WinVerifyTrust(
+            this.RawResult = WinTrust.WinVerifyTrust(
                 IntPtr.Zero,
                 actionId,
                 ref trustData);
 
-            this.isSigned = result == 0;
-
+            this.isSigned = this.RawResult == 0;
             Marshal.FreeHGlobal(fileInfoPtr);
         }
         catch

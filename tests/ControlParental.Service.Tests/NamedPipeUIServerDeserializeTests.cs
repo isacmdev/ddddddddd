@@ -125,7 +125,7 @@ public sealed class NamedPipeUIServerDeserializeTests
             listenerType!,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            args: new object?[] { "test", null, null, null, null, CancellationToken.None },
+            args: new object?[] { "test", null, null, null, null, CancellationToken.None, null, null, null },
             culture: null);
         Assert.NotNull(listener);
 

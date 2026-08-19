@@ -77,4 +77,4 @@ The audit MUST NOT edit application or test code, complete backend work, freeze 
 #### Scenario: Read-only boundary is enforced
 - GIVEN the audit encounters a defect or blocked evidence
 - WHEN the audit records the result
-- THEN it records remediation or dependency status without applying a fix or invoking any `gentle-ai review` lifecycle command
+- THEN it records remediation or dependency status without applying a fix or invoking any review lifecycle command

@@ -67,6 +67,33 @@ public interface IOutboxManager
         string body,
         DateTimeOffset timestamp,
         CancellationToken cancellationToken = default);
+
+    /// <summary>Atomically claims a bounded page of eligible entries.</summary>
+    Task<IReadOnlyList<OutboxEntry>> ClaimAsync(
+        int limit,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Completes a claim only when its lease version still matches.</summary>
+    Task<bool> CompleteAsync(OutboxEntry entry, CancellationToken cancellationToken = default);
+
+    /// <summary>Records an isolated transient or permanent outcome.</summary>
+    Task<bool> FailAsync(
+        OutboxEntry entry,
+        string safeFailureCode,
+        DateTimeOffset? nextEligibleAt = null,
+        bool permanent = false,
+        int maxAttempts = 3,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Moves expired claims back to pending without deleting evidence.</summary>
+    Task<int> RecoverExpiredClaimsAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Explicitly requeues a dead-letter entry for an authorized operator.</summary>
+    Task<bool> RequeueDeadLetterAsync(
+        int id,
+        string authorization,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -113,4 +140,13 @@ public class OutboxEntry
     /// Último error.
     /// </summary>
     public string? LastError { get; init; }
+
+    public OutboxEntryStatus Status { get; init; }
+    public string OperationId { get; init; } = string.Empty;
+    public long ClaimVersion { get; init; }
+    public DateTimeOffset? ClaimedUntil { get; init; }
+    public DateTimeOffset? NextEligibleAt { get; init; }
+    public DateTimeOffset? DeadLetteredAt { get; init; }
+    public string? SafeFailureCode { get; init; }
+    public string? AuditReference { get; init; }
 }

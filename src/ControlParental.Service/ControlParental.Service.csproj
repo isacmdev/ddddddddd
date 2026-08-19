@@ -14,11 +14,13 @@
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <PublishAot>true</PublishAot>
+    <PublishTrimmed>true</PublishTrimmed>
   </PropertyGroup>
 
   <!-- Expose internals to test project for test-only access (StopTimer, etc.) -->
   <ItemGroup>
     <InternalsVisibleTo Include="ControlParental.Service.Tests" />
+    <InternalsVisibleTo Include="ControlParental.SessionAgent.Tests" />
   </ItemGroup>
 
   <ItemGroup>
@@ -26,6 +28,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
     <PackageReference Include="DotNetEnv" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
     <PackageReference Include="System.Reactive" />
     <PackageReference Include="Grpc.Net.Client" />
     <PackageReference Include="supabase-csharp" />

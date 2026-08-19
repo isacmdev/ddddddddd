@@ -1,0 +1,42 @@
+{
+  "schema": "backend-identity-external-acceptance-manifest",
+  "contractVersion": 1,
+  "readiness": "client-ready",
+  "externalVerified": false,
+  "futureExecutionOwner": "backend-integration-acceptance",
+  "localHarness": {
+    "command": "dotnet test tests/ControlParental.Service.Tests/ControlParental.Service.Tests.csproj --filter FullyQualifiedName~BackendIdentityAcceptancePackageTests --no-restore",
+    "mode": "deterministic-local-only",
+    "clock": "2026-08-11T12:00:00Z"
+  },
+  "parameters": {
+    "baseUrl": "required-at-execution",
+    "issuer": "required-at-execution",
+    "audience": "required-at-execution",
+    "tlsHost": "required-at-execution",
+    "currentAndNextPins": "required-at-execution",
+    "routes": ["pre-pair", "pair", "refresh", "own-row", "hostile-row", "revoke", "wns-fanout"]
+  },
+  "probes": [
+    "jwt.exact-device-binding",
+    "rls.two-device-isolation",
+    "identity.revocation",
+    "tls.host-chain-revocation-pins",
+    "wns.registration-and-fanout"
+  ],
+  "artifacts": [
+    {
+      "path": "tests/ControlParental.Service.Tests/BackendIdentityContractV1Harness.cs",
+      "sha256": "2910260E8E704338AB6854C855E94A24010530A69BE44D3AA1B60229DA14AB0F"
+    },
+    {
+      "path": "openspec/changes/backend-identity-contract/evidence/local-receipt.schema.v1.json",
+      "sha256": "25942EF6D419F468F77DB1067C2CAD5333FBB533F3468A81667B098DC5415A43"
+    }
+  ],
+  "promotionGate": {
+    "requiresSignedReceipts": true,
+    "requiresReproducibleArtifactHashes": true,
+    "localReceiptMayPromote": false
+  }
+}

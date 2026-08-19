@@ -22,18 +22,29 @@ public sealed class AgentLauncher : IDisposable
     private readonly Action<IIpcMessage> onAgentMessage;
     private readonly Action onAgentDisconnected;
     private readonly Func<int, IntPtr?> sessionUserTokenProvider;
-    private readonly Func<IIpcChannel> ipcChannelFactory;
+    private readonly Func<int, IIpcChannel> ipcChannelFactory;
     private readonly IProcessLaunchApi processLaunchApi;
     private Process? agentProcess;
-    private IIpcChannel? ipcServer;
-    private CancellationTokenSource? cts;
+    private IpcOwnership? ipcOwnership;
+    private readonly object ipcSync = new();
     private bool disposed;
+
+    private sealed record IpcOwnership(CancellationTokenSource Cts, IIpcChannel Channel, Task StartTask);
 
     /// <summary>
     /// Gets the IPC channel used to communicate with the agent.
     /// Returns null if the agent is not running.
     /// </summary>
-    public IIpcChannel? AgentChannel => this.ipcServer;
+    public IIpcChannel? AgentChannel
+    {
+        get
+        {
+            lock (this.ipcSync)
+            {
+                return this.ipcOwnership?.Channel;
+            }
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="AgentLauncher"/> class.
@@ -72,7 +83,7 @@ public sealed class AgentLauncher : IDisposable
         Action<IIpcMessage> onAgentMessage,
         Action onAgentDisconnected,
         Func<int, IntPtr?>? sessionUserTokenProvider,
-        Func<IIpcChannel>? ipcChannelFactory,
+        Func<int, IIpcChannel>? ipcChannelFactory,
         IProcessLaunchApi? processLaunchApi)
     {
         this.agentExePath = agentExePath ?? throw new ArgumentNullException(nameof(agentExePath));
@@ -83,7 +94,7 @@ public sealed class AgentLauncher : IDisposable
         this.onAgentDisconnected = onAgentDisconnected ?? throw new ArgumentNullException(nameof(onAgentDisconnected));
         this.sessionUserTokenProvider = sessionUserTokenProvider ?? this.GetSessionUserToken;
         this.ipcChannelFactory = ipcChannelFactory ??
-            (() => new Interop.NamedPipeServer(this.pipeName, this.childSid, this.validateClientSid));
+            ((targetSessionId) => new Interop.NamedPipeServer(this.pipeName, this.childSid, this.validateClientSid, targetSessionId));
         this.processLaunchApi = processLaunchApi ?? new NativeProcessLaunchApi();
     }
 
@@ -95,9 +106,12 @@ public sealed class AgentLauncher : IDisposable
     /// <returns>True if the agent was launched successfully.</returns>
     public async Task<bool> LaunchAgentAsync(int sessionId, CancellationToken cancellationToken = default)
     {
-        if (this.disposed)
+        lock (this.ipcSync)
         {
-            throw new ObjectDisposedException(nameof(AgentLauncher));
+            if (this.disposed)
+            {
+                throw new ObjectDisposedException(nameof(AgentLauncher));
+            }
         }
 
         // A launcher owns exactly one process/channel. Stop it before replacing it.
@@ -112,24 +126,86 @@ public sealed class AgentLauncher : IDisposable
             return false;
         }
 
+        IpcOwnership? candidate = null;
+        CancellationTokenSource? candidateCts = null;
+        IIpcChannel? candidateChannel = null;
+        var messageSubscribed = false;
+        var disconnectedSubscribed = false;
+        Task? listenerTask = null;
+        Task? faultCleanupTask = null;
         try
         {
             // Start the IPC server only after obtaining the target user's token.
-            this.cts = new CancellationTokenSource();
-            this.ipcServer = this.ipcChannelFactory();
-            this.ipcServer.MessageReceived += this.onAgentMessage;
-            this.ipcServer.Disconnected += this.onAgentDisconnected;
-            await this.ipcServer.StartAsync(this.cts.Token);
+            candidateCts = new CancellationTokenSource();
+            candidateChannel = this.ipcChannelFactory(sessionId);
+            candidateChannel.MessageReceived += this.onAgentMessage;
+            messageSubscribed = true;
+            candidateChannel.Disconnected += this.onAgentDisconnected;
+            disconnectedSubscribed = true;
+            listenerTask = candidateChannel.StartAsync(candidateCts.Token);
+            candidate = new IpcOwnership(candidateCts, candidateChannel, listenerTask);
+            if (!this.TryPublishOwnership(candidate!))
+            {
+                await this.CleanupDetachedOwnershipAsync(candidate!);
+                return false;
+            }
+
+            faultCleanupTask = ObserveTaskFault(candidate!);
+            if (listenerTask.IsCompleted)
+            {
+                await listenerTask;
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
+
+            if (!this.IsCurrentOwnership(candidate!))
+            {
+                await this.CleanupOwnershipAsync(candidate!);
+                return false;
+            }
 
             var success = this.CreateProcessAsUserCore(userToken.Value, sessionId);
 
+            if (listenerTask.IsFaulted && !this.IsDisposed())
+            {
+                await faultCleanupTask;
+                await listenerTask;
+            }
+
+            if (!this.IsCurrentOwnership(candidate!))
+            {
+                await this.CleanupOwnershipAsync(candidate!);
+                await this.StopAgentProcessAsync();
+                return false;
+            }
+
             if (!success)
             {
-                await this.StopIpcServerAsync();
+                await this.CleanupOwnershipAsync(candidate!);
             }
 
             return success;
+        }
+        catch
+        {
+            if (candidate != null)
+            {
+                await this.CleanupOwnershipAsync(candidate);
+                if (candidate.StartTask.IsFaulted && faultCleanupTask != null)
+                {
+                    await faultCleanupTask;
+                }
+            }
+            else
+            {
+                await CleanupProvisionalOwnershipAsync(
+                    candidateCts,
+                    candidateChannel,
+                    listenerTask,
+                    messageSubscribed,
+                    disconnectedSubscribed);
+            }
+            throw;
         }
         finally
         {
@@ -145,38 +221,45 @@ public sealed class AgentLauncher : IDisposable
 
     private async Task StopAgentCoreAsync(CancellationToken cancellationToken)
     {
-        if (this.agentProcess != null && !this.agentProcess.HasExited)
-        {
-            try
-            {
-                this.agentProcess.Kill(entireProcessTree: true);
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                await this.agentProcess.WaitForExitAsync(timeout.Token);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[AgentLauncher] Failed to kill agent: {ex.Message}");
-            }
+        await this.StopAgentProcessAsync(cancellationToken);
 
-            this.agentProcess = null;
+        IpcOwnership? ownership;
+        lock (this.ipcSync)
+        {
+            ownership = this.DetachOwnershipLocked(null);
         }
 
-        // Stop IPC server
-        if (this.ipcServer != null)
+        if (ownership != null)
         {
-            await this.StopIpcServerAsync();
+            await this.CleanupDetachedOwnershipAsync(ownership);
+        }
+    }
+
+    private async Task StopAgentProcessAsync(CancellationToken cancellationToken = default)
+    {
+        var process = this.agentProcess;
+        if (process == null || process.HasExited)
+        {
+            return;
         }
 
-        this.cts?.Cancel();
-        this.cts?.Dispose();
-        this.cts = null;
+        try
+        {
+            process.Kill(entireProcessTree: true);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] Failed to kill agent: {ex.Message}");
+        }
 
+        this.agentProcess = null;
     }
 
     /// <summary>
@@ -186,9 +269,15 @@ public sealed class AgentLauncher : IDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task SendToAgentAsync(IIpcMessage message, CancellationToken cancellationToken = default)
     {
-        if (this.ipcServer != null && this.ipcServer.IsConnected)
+        IIpcChannel? channel;
+        lock (this.ipcSync)
         {
-            await this.ipcServer.SendAsync(message, cancellationToken);
+            channel = this.ipcOwnership?.Channel;
+        }
+
+        if (channel != null && channel.IsConnected)
+        {
+            await channel.SendAsync(message, cancellationToken);
         }
     }
 
@@ -340,24 +429,189 @@ public sealed class AgentLauncher : IDisposable
         }
     }
 
-    private async Task StopIpcServerAsync()
+    private bool TryPublishOwnership(IpcOwnership ownership)
     {
-        if (this.ipcServer != null)
+        lock (this.ipcSync)
+        {
+            if (this.disposed || this.ipcOwnership != null)
+            {
+                return false;
+            }
+
+            this.ipcOwnership = ownership;
+            return true;
+        }
+    }
+
+    private bool IsCurrentOwnership(IpcOwnership ownership)
+    {
+        lock (this.ipcSync)
+        {
+            return !this.disposed && ReferenceEquals(this.ipcOwnership, ownership);
+        }
+    }
+
+    private bool IsDisposed()
+    {
+        lock (this.ipcSync)
+        {
+            return this.disposed;
+        }
+    }
+
+    private IpcOwnership? DetachOwnershipLocked(IpcOwnership? expected)
+    {
+        if (expected != null && !ReferenceEquals(this.ipcOwnership, expected))
+        {
+            return null;
+        }
+
+        var ownership = this.ipcOwnership;
+        this.ipcOwnership = null;
+        return ownership;
+    }
+
+    private async Task CleanupOwnershipAsync(IpcOwnership ownership, Task? completedTask = null)
+    {
+        IpcOwnership? detached;
+        lock (this.ipcSync)
+        {
+            detached = this.DetachOwnershipLocked(ownership);
+        }
+
+        if (detached != null)
+        {
+            await this.CleanupDetachedOwnershipAsync(detached, completedTask);
+        }
+    }
+
+    private async Task CleanupDetachedOwnershipAsync(IpcOwnership ownership, Task? completedTask = null)
+    {
+        ownership.Channel.MessageReceived -= this.onAgentMessage;
+        ownership.Channel.Disconnected -= this.onAgentDisconnected;
+        ownership.Cts.Cancel();
+        try
+        {
+            await ownership.Channel.StopAsync().WaitAsync(TimeSpan.FromSeconds(1));
+            if (!ReferenceEquals(ownership.StartTask, completedTask))
+            {
+                await ownership.StartTask.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+        }
+        catch (TimeoutException)
+        {
+            System.Diagnostics.Debug.WriteLine("[AgentLauncher] IPC stop timed out.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener stopped with an error: {ex.Message}");
+        }
+
+        try
+        {
+            (ownership.Channel as IDisposable)?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener disposal failed: {ex.Message}");
+        }
+
+        ownership.Cts.Dispose();
+    }
+
+    private async Task CleanupProvisionalOwnershipAsync(
+        CancellationTokenSource? cts,
+        IIpcChannel? channel,
+        Task? startTask,
+        bool messageSubscribed,
+        bool disconnectedSubscribed)
+    {
+        if (channel != null)
         {
             try
             {
-                await this.ipcServer.StopAsync().WaitAsync(TimeSpan.FromSeconds(1));
+                if (messageSubscribed)
+                {
+                    channel.MessageReceived -= this.onAgentMessage;
+                }
+
+                if (disconnectedSubscribed)
+                {
+                    channel.Disconnected -= this.onAgentDisconnected;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener event cleanup failed: {ex.Message}");
+            }
+        }
+
+        try
+        {
+            cts?.Cancel();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC cancellation failed: {ex.Message}");
+        }
+        if (channel != null)
+        {
+            try
+            {
+                await channel.StopAsync().WaitAsync(TimeSpan.FromSeconds(1));
+                if (startTask != null)
+                {
+                    await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+                }
             }
             catch (TimeoutException)
             {
                 System.Diagnostics.Debug.WriteLine("[AgentLauncher] IPC stop timed out.");
             }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener stopped with an error: {ex.Message}");
+            }
+
+            try
+            {
+                (channel as IDisposable)?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener disposal failed: {ex.Message}");
+            }
         }
 
-        (this.ipcServer as IDisposable)?.Dispose();
-        this.ipcServer = null;
-        this.cts?.Dispose();
-        this.cts = null;
+        try
+        {
+            cts?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC cancellation disposal failed: {ex.Message}");
+        }
+    }
+
+    private Task ObserveTaskFault(IpcOwnership ownership)
+    {
+        return ownership.StartTask.ContinueWith(
+            async completed =>
+            {
+                var exception = completed.Exception;
+                System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener failed: {exception?.GetBaseException().Message}");
+                try
+                {
+                    await this.CleanupOwnershipAsync(ownership, ownership.StartTask);
+                }
+                catch (Exception cleanupException)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC listener cleanup failed: {cleanupException.Message}");
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default).Unwrap();
     }
 
     private void CloseOwnedHandle(IntPtr handle)
@@ -370,10 +624,33 @@ public sealed class AgentLauncher : IDisposable
 
     public void Dispose()
     {
-        if (!this.disposed)
+        IpcOwnership? ownership;
+        lock (this.ipcSync)
         {
+            if (this.disposed)
+            {
+                return;
+            }
+
             this.disposed = true;
-            this.cts?.Cancel();
+            ownership = this.DetachOwnershipLocked(null);
+        }
+
+        if (ownership != null)
+        {
+            _ = this.CleanupDetachedOwnershipObservedAsync(ownership);
+        }
+    }
+
+    private async Task CleanupDetachedOwnershipObservedAsync(IpcOwnership ownership)
+    {
+        try
+        {
+            await this.CleanupDetachedOwnershipAsync(ownership);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AgentLauncher] IPC disposal cleanup failed: {ex.Message}");
         }
     }
 

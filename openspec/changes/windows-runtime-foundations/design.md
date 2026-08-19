@@ -2,60 +2,56 @@
 
 ## Technical Approach
 
-Repair the existing `SessionWatcher` → `SessionManager` → `AgentLauncher` → named-pipe seams. Keep the Service host, UI pipe, backend, usage, scheduler, packaging, and warnings unchanged. The 23 modified files are pre-existing; the delta is limited to the seams and tests below.
+Preserve A/B/C1/D and update only the C2 evidence contract. The existing framed, session-bound, fail-closed `NamedPipeServer`/`NamedPipeClient` seams remain the preferred test path. C2 closes only when the executable-managed gate and disposable signed native harness both pass.
 
 ## Architecture Decisions
 
-| Decision | Choice | Rejected | Rationale |
-|---|---|---|---|
-| Session ownership | `SessionManager` owns records keyed by WTS session ID; each owns one `AgentLauncher`, connection, cancellation source, and lifecycle gate. | Replacement supervisor or global current-session state. | Preserves the launch seam while preventing cross-session actions and duplicate agents. |
-| Lifecycle | Queue watcher events and serialize each record's start/stop/recover operation with a per-session gate; lifecycle awaits only owned tasks with bounded cancellation. | Blocking `.Wait`, `Thread.Sleep`, or global locks. | Makes fast switching and shutdown deterministic without redesigning the host. |
-| Recovery | `ServiceRecoveryManager` requests recovery for the affected session; a record-local single-flight task coalesces disconnect and timeout signals. | Independent recovery per callback. | Retains health/recovery integration and guarantees at most one relaunch. |
-| IPC | Use a 4-byte little-endian length prefix, maximum 64 KiB frame, incremental decoder, per-connection write semaphore, and bound session ID. | Raw `ReadAsync` boundaries or a new transport framework. | Compatible with current JSON and fixes partial/coalesced reads. |
-| Identity | Handshake claims session ID and PID. Service validates client PID/token SID; SessionAgent obtains server PID with `GetNamedPipeServerProcessId`, then verifies the server image with `WinVerifyTrust` and the same trusted signer identity as the agent. | Per-session secrets or process replacement. | Meets the approved identity model without introducing secret storage. |
-| Security verdict | Service-owned `RuntimeSecurityVerdict` is the sole source for privilege, ACL, health, and onboarding. | Independent health flags. | Prevents `Unknown` or failed ACL repair from being reported healthy. |
+| Decision | Choice | Rationale |
+|---|---|---|
+| Classification | Classify every changed C2 addition by behavior: managed-deterministic for protocol/state/ownership/serialization/validation/retry/deadline logic; native-boundary for P/Invoke, marshalling, OS PID/SID/session/path lookup, WinTrust, and kernel pipe ACL/identity. | Mixed files must not turn testable security behavior into a native waiver. |
+| Denominator | From compiler/PDB sequence points, derive executable lines within managed ranges; reconcile them with normalized Cobertura repository-relative source path+line records. | Makes the denominator reproducible rather than dependent on report shape. |
+| Evidence | A non-executable addition may be excluded only in a path+line manifest with a specific reason: declaration, signature, brace, continuation, or generated async projection lacking an executable source point. Missing Cobertura mapping alone never proves exclusion; executable managed lines absent or unhit remain uncovered. | Prevents denominator gaming and distinguishes compiler gaps from untested behavior. |
+| Async/branches | Union duplicate async mappings by normalized path+line; report exact branch union only when the evidence is defensible, otherwise report branch evidence as limited without changing line coverage. | Avoids double counting while preserving honest branch uncertainty. |
+| Seams/native proof | Prefer existing factory/authentication seams. Any new production seam requires a named behavior, then candidate, classification, and denominator refresh. Native behavior remains a disposable signed harness gate. | Limits architecture to measurable testability needs. |
 
 ## Data Flow
 
-`SessionWatcher` → bounded event queue → `SessionManager[sessionId]` → gated `AgentLauncher` → authenticated framed connection → session handlers.
+`baseline 90a5a2a… → immutable candidate → changed additions → behavior classification → PDB sequence points + Cobertura path/line union → managed report`; the signed harness independently proves native behavior. Any failed gate keeps C2 closed.
 
-On startup, `PrivilegeInspector` and idempotent ACL hardening publish one verdict to `ServiceHealthMonitor`; `OnboardingStateService` blocks healthy progression for `Unknown` or repair failure while enforcement remains active. `ScmController` applies startup/failure actions idempotently; recovery excludes scheduler/sync.
+Current diagnostic state is implementation evidence: 481 managed additions, 193 proven compiler/source-mapping gaps, 288 executable managed lines, 185 hit, and 103 mapped-but-unhit. The authoritative starting point is **185/288 = 64.236111%**. This is not threshold relaxation. Strict `>80%` requires at least 231/288 (more than 230.4), hence at least 46 additional executable hits, subject to denominator refresh after production changes.
 
 ## File Changes
 
 | File | Action | Description |
 |---|---|---|
-| `src/ControlParental.Service/Program.cs` | Modify | Replace `currentSessionId` ownership with per-session records; bounded async lifecycle and session-filtered dispatch. |
-| `src/ControlParental.Service/SessionWatcher.cs` | Modify | Cancellation-aware event delivery; report session IDs for end/lock/unlock without blocking sleeps. |
-| `src/ControlParental.Service/AgentLauncher.cs` | Modify | Per-session process/channel ownership, single-flight launch/stop, PID binding, and bounded cancellation. |
-| `src/ControlParental.Service/Interop/NamedPipeServer.cs` and `src/ControlParental.SessionAgent/Interop/NamedPipeClient.cs` | Modify | Shared framing/auth contract, bounded decoder, serialized writes, authenticated reconnect. |
-| `src/ControlParental.Service/ServiceHealthMonitor.cs`, `PrivilegeInspector.cs`, `OnboardingStateService.cs` | Modify | Consume the authoritative security verdict and expose `DEGRADED`/onboarding blocking. |
-| `src/ControlParental.Service/ScmController.cs` | Modify | Idempotent SCM configuration and local crash/relaunch verification only. |
-| `tests/...` | Modify/Create | Focused RED/GREEN tests and Windows runtime/SCM harness seams. |
+| `openspec/changes/windows-runtime-foundations/design.md` | Modify | Define executable-managed denominator, C2 evidence, gates, and rollback. |
+| Existing C2 production/test paths | No implementation change | Use current seams; preserve A/B/C1/D and unrelated scope. |
+
+Per-file evidence records classification, additions, executable denominator, hits, unhit lines, reasoned exclusions, percentage, and branches. No historical aggregate (including 50.13%) substitutes for this report.
 
 ## Interfaces / Contracts
 
-Internal seams only: `IProcessIdentityVerifier`, `IAclHardener`, `IScmController`, and clock/process/Pipe API seams for native calls. `RuntimeSecurityVerdict = HealthyStandard | Administrator | Unknown | AclFailure`; the last two keep enforcement enabled but force `DEGRADED`. Handshake rejection closes before dispatch and records session failure.
+Reject malformed/oversized frames, wrong PID/SID/session/signer, unauthorized reconnect, and deadline failure before dispatch; repeat authorization on reconnect; serialize writes; bound cancellation and cleanup. Preserve all fail-closed requirements.
 
 ## Testing Strategy
 
-Use RED/GREEN/REFACTOR work units: (1) session ownership/lifecycle, (2) framing/auth/reconnect, (3) privilege/ACL health/onboarding, (4) SCM setup/recovery. Each changed production scope requires >80% line coverage and reported branch coverage. Unit tests use seams; Windows integration tests use loopback pipes and a local signed Service/Agent harness for two sessions, crash/reconnect, and SCM recovery. No backend is required.
+Managed tests cover protocol, transitions, validation, ownership, ordering, serialization, reconnect, retries, and deadlines through existing seams. The signed harness proves trusted acceptance, fail-closed rejection, ordered handshake, authenticated dispatch, session binding, reconnect reauthorization, separate deadlines, and process/pipe/certificate cleanup. Unit D remains blocked until both C2 gates pass.
 
 ## Threat Matrix
 
-| Threat | Applicability / safe and failure behavior | Planned RED test |
-|---|---|---|
-| Wrong client SID/PID or session | Applicable; accept only token/session match, otherwise close before dispatch. | Unauthorized client cannot deliver a message. |
-| Wrong server PID or Authenticode signer | Applicable; agent rejects and reports disconnected/degraded. | Fake PID, unsigned image, and signer mismatch are rejected. |
-| Frame smuggling/oversize/malformed input | Applicable; bounded decoder rejects without dispatch. | Fragmented, coalesced, malformed, and >64 KiB frames. |
-| Cross-session connection/write | Applicable; connection record and write gate are session-bound. | Concurrent two-session sends never cross streams. |
-| Reconnect race | Applicable; authorization repeats and recovery is single-flight. | Repeated disconnects produce one recovery and preserve session ID. |
-| Documentation/Git/commit/push/PR command boundaries | N/A; this change executes no repository or shell automation. | None. |
+| Boundary | Status and response |
+|---|---|
+| Documentation-like paths | N/A: no executable-document classification or execution boundary. |
+| Git repository selection | N/A: no routing or Git command automation. |
+| Commit state | N/A: no commit automation. |
+| Push state | N/A: no push automation. |
+| PR commands | N/A: no PR command composition. |
+| Process/executable identity and native pipe | Applicable: accept only matching PID/session/SID/signer and ACL; reject and close before dispatch on failure. RED coverage is required in the signed harness. |
 
 ## Migration / Rollout
 
-Protocol rollout accepts only the new framed handshake; an unauthenticated or legacy raw stream is rejected, so no silent downgrade exists. Roll back one work unit with its tests: session ownership, IPC, security verdict, and SCM are independent boundaries. SCM rollback restores prior actions without touching scheduler or sync.
+No protocol migration. No over-engineering: add no seam unless a named managed behavior is unreachable, then refresh candidate/classification/denominator. Roll back only C2 changes and evidence; preserve A/B/C1/D. C2 and Unit D blocking remain unchanged.
 
 ## Open Questions
 
-No blocking questions; signer validation uses the existing signed-binary identity.
+None.

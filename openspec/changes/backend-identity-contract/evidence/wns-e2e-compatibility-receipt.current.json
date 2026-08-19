@@ -1,0 +1,166 @@
+{
+  "schemaVersion": 1,
+  "evidenceScope": "compatible-environment-functional-acceptance",
+  "matrixStatus": "paused-by-user-pending-prerequisites",
+  "externalVerified": false,
+  "pause": {
+    "status": "paused-by-user",
+    "pendingPrerequisites": [
+      "Official Windows 11 24H2 x64 media/channel",
+      "Licensed Windows 10 22H2 x64 test environment"
+    ],
+    "currentScopedEvidence": "Win11 25H2 x64 PASS only",
+    "unit7": "deliberately not started or completed because it follows task 6.4",
+    "runtimeProductCodeImpact": "none; leaving tasks open does not change runtime or product code",
+    "claimsExcluded": [
+      "client-ready",
+      "full matrix support",
+      "verify PASS",
+      "archive",
+      "backend",
+      "JWT",
+      "RLS",
+      "TLS",
+      "WNS fan-out",
+      "ExternalVerified"
+    ],
+    "resumeConditions": [
+      "Official Windows 11 24H2 x64 media/channel and a licensed Windows 10 22H2 x64 environment are available",
+      "Future explicit formal scope amendment"
+    ]
+  },
+  "environment": {
+    "os": "Microsoft Windows 10 Pro",
+    "version": "10.0.26200",
+    "build": "26200.9168",
+    "architecture": "x64",
+    "interactiveSession": "console-active",
+    "developerMode": "enabled"
+  },
+  "tools": {
+    "node": "24.17.0",
+    "npm": "11.13.0",
+    "appium": "3.6.0",
+    "appiumWindowsDriver": "6.1.1",
+    "winAppDriver": "1.2.2009.02003",
+    "runner": "NovaWindows2 1.1.27"
+  },
+  "commands": [
+    {
+      "command": "dotnet test tests/ControlParental.App.UI.E2E.Tests/ControlParental.App.UI.E2E.Tests.csproj --no-build --filter FullyQualifiedName~Registration_surface_exposes_only_safe_typed_state",
+      "exitCode": 1,
+      "timeoutSeconds": 30,
+      "postcondition": "with E2E_REQUIRED=1, CONTROL_PARENTAL_APP_PATH, CONTROL_PARENTAL_APPIUM_URL=http://127.0.0.1:4723, and evidence directory set, blocked before Appium session creation because named pipe ControlParental.UI was not ready"
+    },
+    {
+      "command": "Tracked Service start + named-pipe readiness probe",
+      "exitCode": 0,
+      "timeoutSeconds": 10,
+      "postcondition": "Service PID 9480 reached Application started and emitted WNS invalid_client warning, but 20 probes over 10 seconds could not connect to ControlParental.UI; owned Service process was terminated; no 4723/4724 listeners remained"
+    },
+    {
+      "command": "dotnet test tests/ControlParental.Service.Tests/ControlParental.Service.Tests.csproj --no-restore --filter FullyQualifiedName~StartAsync_ExposesUiPipeBeforeClientConnects",
+      "exitCode": 0,
+      "timeoutSeconds": 60,
+      "postcondition": "focused hosted-adapter test passed 1/1; in-process listener created ControlParental.UI and accepted a client before shutdown"
+    },
+    {
+      "command": "sc.exe query ControlParental; sc.exe qc ControlParental",
+      "exitCode": 1060,
+      "timeoutSeconds": 10,
+      "postcondition": "ControlParental is not installed; no unrelated service was changed"
+    },
+    {
+      "command": "Build-ServiceInstaller.ps1 -Configuration Debug -SkipPublish",
+      "exitCode": 1,
+      "timeoutSeconds": 120,
+      "postcondition": "refused at documented staged-payload validation because artifacts/service-installer/payload/service/ControlParental.Service.exe is absent; no SCM mutation occurred"
+    },
+    {
+      "command": "Build-ServiceInstaller.ps1 (documented defaults: Release, win-x64, real publish)",
+      "exitCode": 1,
+      "timeoutSeconds": 300,
+      "postcondition": "Service compilation completed but NativeAOT publish failed with PublishTrimmed implied-but-disabled; expected Service/Agent staged binaries were absent; no installer, SCM, pipe, Appium, or E2E step ran"
+    },
+    {
+      "command": "node --version",
+      "exitCode": 0
+    },
+    {
+      "command": "npm --version",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes appium@3 --version",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes appium@3 driver install windows",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes appium@3 driver list --installed --json",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes appium@3 driver run windows install-wad",
+      "exitCode": 0,
+      "postcondition": "installation later verified at C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe"
+    },
+    {
+      "command": "WinAppDriver.exe 127.0.0.1 4724/wd/hub; GET http://127.0.0.1:4724/wd/hub/status",
+      "exitCode": 1,
+      "postcondition": "failed: process exited before status endpoint became reachable; no Appium Root/session probe was attempted"
+    },
+    {
+      "command": "WinAppDriver.exe 127.0.0.1 4724/wd/hub (elevated, detached bounded retry); GET http://127.0.0.1:4724/wd/hub/status",
+      "exitCode": 0,
+      "postcondition": "process printed its listening banner, then exited immediately; TCP 127.0.0.1:4724 remained unreachable; no Appium Root/session probe was attempted"
+    },
+    {
+      "command": "netsh http show urlacl url=http://127.0.0.1:4724/wd/hub/",
+      "exitCode": 0,
+      "postcondition": "no URL reservation was reported"
+    },
+    {
+      "command": "Appium 3.6.0 status and W3C Windows Root session probe",
+      "exitCode": 0,
+      "postcondition": "GET /status returned HTTP 200 ready=true; POST /session with platformName Windows, appium:automationName Windows, appium:app Root, and newCommandTimeout 30 succeeded; window handles returned []; DELETE /session succeeded"
+    },
+    {
+      "command": "Bounded Appium cleanup and listener/process verification",
+      "exitCode": 0,
+      "postcondition": "An orphaned npx Appium grandchild (PID 944) was identified by exact command line and terminated specifically; final listeners on 4723/4724 and WinAppDriver processes were 0"
+    }
+  ],
+  "result": {
+    "status": "accepted-compatible-environment-pass",
+    "reason": "Latest live run 19 passed, 0 failed, 0 skipped for the unchanged functional flow: real App.UI→Service IPC, safe typed states/lifecycle, W3C DELETE, and App.UI0. This is compatible-environment evidence only; the declared matrix remains pending.",
+    "productSha256": "603A6FA35FC30F69723778B2C16422043CC2F35E4290948CC658B9BA2510B69D",
+    "e2eBaselineSha256": "DDEB40FCBCE7019DC8C01653B431472DC3E02111337ED67E86634A0CD3585A9F",
+    "runbookExitContracts": { "passed": 3, "failed": 0, "explicitExitCode": 0 },
+    "observerCaveat": "Process.ExitCode=null was non-blocking instrumentation; no independent OS exit was observed.",
+    "evidenceDirectory": "C:\\Users\\Usuario\\AppData\\Local\\Temp\\ControlParental\\e2e-evidence-20260814-110132110",
+    "evidenceFiles": [
+      { "name": "app-startup.log", "sha256": "A8CC86F1BA93359C8461B3C016099E9F1D34A68FB58CB7EC7C323B1F437C4E18", "sizeBytes": 30978, "validated": "safe" },
+      { "name": "page-source.xml", "sha256": "A9A49E91B7AE93BCD325F898DEABF85845AD12A20D98B038FAA15AD1F458B451", "sizeBytes": 9142, "validated": "safe" },
+      { "name": "registration.png", "sha256": "3AA918786BA278ACDCCEE4C0633286B25C183730A6FF1DCBEA2A8F2C101715F9", "sizeBytes": 22645, "validated": "safe" }
+    ],
+    "cleanup": "Invocation-owned Appium, driver, App.UI, and temporary process state were cleaned; redaction validation passed.",
+    "claimsExcluded": ["backend", "JWT", "RLS", "TLS endpoint", "WNS fan-out", "independent OS exit"]
+  },
+  "declaredFutureMatrix": [
+    "Windows 10 22H2 x64",
+    "Windows 11 24H2 x64",
+    "Windows 11 25H2 x64"
+  ],
+  "matrix": {
+    "passed": 1,
+    "total": 3,
+    "cells": [
+      { "cell": "Windows 10 22H2 x64", "status": "blocked", "reason": "No licensed test environment is available." },
+      { "cell": "Windows 11 24H2 x64", "status": "blocked", "reason": "Official media/channel is unavailable." },
+      { "cell": "Windows 11 25H2 x64", "status": "passed", "receipt": "evidence/win11-25h2-x64-cell-receipt.json" }
+    ]
+  }
+}

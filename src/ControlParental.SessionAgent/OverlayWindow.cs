@@ -7,6 +7,7 @@ namespace ControlParental.SessionAgent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using ControlParental.Domain;
 using ControlParental.SessionAgent.Interop;
 
 /// <summary>
@@ -23,7 +24,7 @@ public sealed class OverlayWindow : IDisposable
     /// <summary>
     /// Class name for the overlay window.
     /// </summary>
-    private const string WindowClassName = "ControlParentalOverlayClass";
+    private const string WindowClassNamePrefix = "ControlParentalOverlayClass";
 
     /// <summary>
     /// Window title for the overlay.
@@ -38,9 +39,10 @@ public sealed class OverlayWindow : IDisposable
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     /// <summary>
-    /// Static WndProc that delegates to the instance.
+    /// WndProc delegate rooted for this window instance.
     /// </summary>
-    private static WndProcDelegate? wndProcDelegate;
+    private readonly WndProcDelegate wndProcDelegate;
+    private readonly string windowClassName;
 
     // ── State ────────────────────────────────────────────────────────
 
@@ -51,6 +53,9 @@ public sealed class OverlayWindow : IDisposable
     private Action? onCtaClicked;
     private bool disposed;
     private bool classRegistered;
+    private readonly Func<OverlayIntent, NativeActionOutcome>? applyOverride;
+    private readonly (int X, int Y, int Width, int Height)? controlledBounds;
+    private readonly bool hideCursor = true;
 
     /// <summary>
     /// Lock object for thread safety.
@@ -78,8 +83,84 @@ public sealed class OverlayWindow : IDisposable
     /// </summary>
     public OverlayWindow()
     {
+        this.windowClassName = $"{WindowClassNamePrefix}-{Guid.NewGuid():N}";
+        this.wndProcDelegate = this.WindowProcStatic;
         this.hwnd = IntPtr.Zero;
         this.isVisible = false;
+    }
+
+    internal OverlayWindow(Func<OverlayIntent, NativeActionOutcome> applyOverride)
+        : this()
+    {
+        this.applyOverride = applyOverride ?? throw new ArgumentNullException(nameof(applyOverride));
+    }
+
+    internal OverlayWindow(int x, int y, int width, int height, bool hideCursor)
+        : this()
+    {
+        if (width <= 0 || height <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width));
+        }
+
+        this.controlledBounds = (x, y, width, height);
+        this.hideCursor = hideCursor;
+    }
+
+    internal IntPtr Handle
+    {
+        get
+        {
+            lock (this.lockObj)
+            {
+                return this.hwnd;
+            }
+        }
+    }
+
+    internal NativeActionOutcome Apply(OverlayIntent intent)
+    {
+        lock (this.lockObj)
+        {
+            if (this.disposed)
+            {
+                return new(ActionStatus.InvalidState, null);
+            }
+
+            if (this.applyOverride != null)
+            {
+                return this.applyOverride(intent);
+            }
+
+            try
+            {
+                if (!intent.Desired && !this.isVisible)
+                {
+                    return new(ActionStatus.HarmlessAbsence, null);
+                }
+
+                if (intent.Desired)
+                {
+                    this.Show(intent.Reason, intent.CtaLabel);
+                    return new(
+                        this.hwnd != IntPtr.Zero && this.isVisible
+                            ? ActionStatus.Confirmed
+                            : ActionStatus.NativeFailure,
+                        this.hwnd == IntPtr.Zero ? Marshal.GetLastWin32Error() : null);
+                }
+
+                this.Hide();
+                return new(this.isVisible ? ActionStatus.NativeFailure : ActionStatus.Confirmed, null);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return new(ActionStatus.AccessDenied, Marshal.GetLastWin32Error());
+            }
+            catch
+            {
+                return new(ActionStatus.NativeFailure, Marshal.GetLastWin32Error());
+            }
+        }
     }
 
     /// <summary>
@@ -238,7 +319,7 @@ public sealed class OverlayWindow : IDisposable
         // Create the window
         this.hwnd = Win32Api.CreateWindowEx(
             Win32Api.WS_EX_TOPMOST | Win32Api.WS_EX_TRANSPARENT,
-            WindowClassName,
+            this.windowClassName,
             WindowTitle,
             Win32Api.WS_POPUP | Win32Api.WS_VISIBLE,
             0,
@@ -264,17 +345,11 @@ public sealed class OverlayWindow : IDisposable
             return;
         }
 
-        // Create static delegate for window procedure
-        if (wndProcDelegate == null)
-        {
-            wndProcDelegate = this.WindowProcStatic;
-        }
-
         var wc = new WNDCLASSEX
         {
             cbSize = Marshal.SizeOf<WNDCLASSEX>(),
             style = 0,
-            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(wndProcDelegate),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(this.wndProcDelegate),
             cbClsExtra = 0,
             cbWndExtra = 0,
             hInstance = IntPtr.Zero,
@@ -282,7 +357,7 @@ public sealed class OverlayWindow : IDisposable
             hCursor = IntPtr.Zero,
             hbrBackground = IntPtr.Zero,
             lpszMenuName = null,
-            lpszClassName = WindowClassName,
+            lpszClassName = this.windowClassName,
             hIconSm = IntPtr.Zero,
         };
 
@@ -342,14 +417,14 @@ public sealed class OverlayWindow : IDisposable
             return;
         }
 
-        // Get the virtual screen bounds (all monitors combined)
-        var virtualX = Win32Api.GetSystemMetrics(Win32Api.SM_XVIRTUALSCREEN);
-        var virtualY = Win32Api.GetSystemMetrics(Win32Api.SM_YVIRTUALSCREEN);
-        var virtualWidth = Win32Api.GetSystemMetrics(Win32Api.SM_CXVIRTUALSCREEN);
-        var virtualHeight = Win32Api.GetSystemMetrics(Win32Api.SM_CYVIRTUALSCREEN);
+        // Runtime evidence uses bounded coordinates so it cannot cover the desktop.
+        var virtualX = this.controlledBounds?.X ?? Win32Api.GetSystemMetrics(Win32Api.SM_XVIRTUALSCREEN);
+        var virtualY = this.controlledBounds?.Y ?? Win32Api.GetSystemMetrics(Win32Api.SM_YVIRTUALSCREEN);
+        var virtualWidth = this.controlledBounds?.Width ?? Win32Api.GetSystemMetrics(Win32Api.SM_CXVIRTUALSCREEN);
+        var virtualHeight = this.controlledBounds?.Height ?? Win32Api.GetSystemMetrics(Win32Api.SM_CYVIRTUALSCREEN);
 
         // Fallback to primary monitor if virtual screen metrics not available
-        if (virtualWidth <= 0 || virtualHeight <= 0)
+        if (this.controlledBounds is null && (virtualWidth <= 0 || virtualHeight <= 0))
         {
             virtualX = 0;
             virtualY = 0;
@@ -386,9 +461,13 @@ public sealed class OverlayWindow : IDisposable
             0,
             0,
             0,
-            Win32Api.SWP_NOZORDER | Win32Api.SWP_NOACTIVATE | Win32Api.SWP_SHOWWINDOW);
+            Win32Api.SWP_NOSIZE | Win32Api.SWP_NOMOVE | Win32Api.SWP_NOZORDER |
+            Win32Api.SWP_NOACTIVATE | Win32Api.SWP_SHOWWINDOW);
 
-        Win32Api.ShowCursor(false);
+        if (this.hideCursor)
+        {
+            Win32Api.ShowCursor(false);
+        }
         this.isVisible = true;
     }
 
@@ -408,7 +487,10 @@ public sealed class OverlayWindow : IDisposable
             0,
             Win32Api.SWP_NOZORDER | Win32Api.SWP_NOACTIVATE | Win32Api.SWP_HIDEWINDOW);
 
-        Win32Api.ShowCursor(true);
+        if (this.hideCursor)
+        {
+            Win32Api.ShowCursor(true);
+        }
         this.isVisible = false;
     }
 
@@ -465,6 +547,12 @@ public sealed class OverlayWindow : IDisposable
             {
                 Win32Api.DestroyWindow(this.hwnd);
                 this.hwnd = IntPtr.Zero;
+            }
+
+            if (this.classRegistered)
+            {
+                Win32Api.UnregisterClass(this.windowClassName, IntPtr.Zero);
+                this.classRegistered = false;
             }
 
             this.isVisible = false;

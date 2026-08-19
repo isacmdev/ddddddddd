@@ -76,6 +76,11 @@ public sealed class PairingResult
     public string? ErrorMessage { get; init; }
 
     /// <summary>
+    /// Server-provided delay for a rate-limited operation.
+    /// </summary>
+    public TimeSpan? RetryAfter { get; init; }
+
+    /// <summary>
     /// Crea un resultado indicando que no está emparejado.
     /// </summary>
     public static PairingResult NotPaired()
@@ -118,7 +123,7 @@ public sealed class PairingResult
     /// <summary>
     /// Crea un resultado indicando que se alcanzó el límite de intentos.
     /// </summary>
-    public static PairingResult TooManyRequests()
+    public static PairingResult TooManyRequests(TimeSpan? retryAfter = null)
         => new()
         {
             Success = false,
@@ -127,6 +132,7 @@ public sealed class PairingResult
             ParentId = null,
             PolicyVersion = 0,
             ErrorMessage = "Demasiados intentos. Esperá unos minutos e intentá de nuevo.",
+            RetryAfter = retryAfter,
         };
 
     /// <summary>

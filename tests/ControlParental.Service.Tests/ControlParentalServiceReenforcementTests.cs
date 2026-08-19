@@ -21,13 +21,19 @@ public class ControlParentalServiceReenforcementTests : IDisposable
     private readonly ControlParentalService service;
     private readonly Mock<IUsageAccumulator> mockUsageAccumulator;
     private readonly Mock<IEnforcementEngine> mockEnforcementEngine;
+    private readonly Mock<IProtectedProcessReporter> mockProtectedProcessReporter;
     private readonly string tempDataPath;
 
     public ControlParentalServiceReenforcementTests()
     {
         this.mockUsageAccumulator = new Mock<IUsageAccumulator>();
         this.mockEnforcementEngine = new Mock<IEnforcementEngine>();
+        this.mockProtectedProcessReporter = new Mock<IProtectedProcessReporter>();
         this.tempDataPath = Path.Combine(Path.GetTempPath(), $"cp_reenforce_{Guid.NewGuid():N}");
+
+        this.mockProtectedProcessReporter
+            .Setup(r => r.GetStatusDescriptionAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync("Service binary is signed and PPL-capable.");
 
         this.service = new ControlParentalService(
             scmController: new Mock<IScmController>().Object,
@@ -42,6 +48,7 @@ public class ControlParentalServiceReenforcementTests : IDisposable
             timeProvider: new Mock<ITimeProvider>().Object,
             policyRepository: new Mock<IPolicyRepository>().Object,
             processTerminator: new Mock<IProcessTerminator>().Object,
+            protectedProcessReporter: this.mockProtectedProcessReporter.Object,
             enforcementLevelMonitor: new Mock<IEnforcementLevelMonitor>().Object,
             antiTamperMonitor: new Mock<IAntiTamperMonitor>().Object);
 
@@ -68,12 +75,11 @@ public class ControlParentalServiceReenforcementTests : IDisposable
     }
 
     [Fact]
-    public async Task OnForegroundChanged_WhenEngineIsSet_ForwardsAppIdToEngine()
+    public void OnForegroundChanged_WithoutSessionAuthority_DoesNotBypassSafetyLoop()
     {
         // Arrange
         const string AppId = "com.example.app";
 
-        var tcs = new TaskCompletionSource<string>();
         this.mockEnforcementEngine
             .Setup(e => e.EnforceForegroundChangeAsync(AppId, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new EnforcementResult
@@ -82,19 +88,16 @@ public class ControlParentalServiceReenforcementTests : IDisposable
                 Blocked = true,
                 Timestamp = DateTimeOffset.UtcNow,
                 ReasonText = "Límite alcanzado",
-            })
-            .Callback<string, CancellationToken>((appId, _) => tcs.TrySetResult(appId));
+            });
 
         // Act
         this.InvokeOnForegroundChanged(AppId);
 
         // Assert
-        var enforcedAppId = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        enforcedAppId.Should().Be(AppId);
         this.mockUsageAccumulator.Verify(u => u.OnForegroundChanged(AppId), Times.Once);
         this.mockEnforcementEngine.Verify(
             e => e.EnforceForegroundChangeAsync(AppId, It.IsAny<CancellationToken>()),
-            Times.Once);
+            Times.Never);
     }
 
     [Fact]
@@ -111,6 +114,25 @@ public class ControlParentalServiceReenforcementTests : IDisposable
         this.mockEnforcementEngine.Verify(
             e => e.EnforceForegroundChangeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never);
+    }
+
+    [Fact]
+    public async Task ReportProtectedProcessStatusAsync_WhenReporterExists_QueriesStatusOnce()
+    {
+        var method = typeof(ControlParentalService).GetMethod(
+            "ReportProtectedProcessStatusAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        method.Should().NotBeNull("the startup PPL status helper must exist for testability");
+
+        var invocation = method!.Invoke(this.service, new object[] { CancellationToken.None });
+        invocation.Should().BeAssignableTo<Task>();
+
+        await ((Task)invocation!).WaitAsync(TimeSpan.FromSeconds(2));
+
+        this.mockProtectedProcessReporter.Verify(
+            r => r.GetStatusDescriptionAsync(It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     private void SetEnforcementEngine(IEnforcementEngine engine)

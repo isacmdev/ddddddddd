@@ -10,6 +10,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
+using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// T26 — Named pipe server for IPC with App.UI.
@@ -26,6 +27,7 @@ public sealed class NamedPipeUIServer : IDisposable
     private readonly SecurityIdentifier? parentSid;
     private readonly SecurityIdentifier? childSid;
     private readonly CancellationTokenSource internalCts;
+    private readonly ILogger<NamedPipeUIServer> logger;
     private PipeServerListener? listenerTask;
     private bool disposed;
 
@@ -35,7 +37,7 @@ public sealed class NamedPipeUIServer : IDisposable
     /// the LocalSystem and the Administrators group.
     /// </summary>
     public NamedPipeUIServer()
-        : this(null, null)
+        : this(null, null, Microsoft.Extensions.Logging.Abstractions.NullLogger<NamedPipeUIServer>.Instance)
     {
     }
 
@@ -45,10 +47,22 @@ public sealed class NamedPipeUIServer : IDisposable
     /// <param name="parentSid">SID of the parent/adult account that owns App.UI.</param>
     /// <param name="childSid">Optional SID of the child account; the UI pipe is explicitly denied to this SID.</param>
     public NamedPipeUIServer(SecurityIdentifier? parentSid, SecurityIdentifier? childSid)
+        : this(parentSid, childSid, Microsoft.Extensions.Logging.Abstractions.NullLogger<NamedPipeUIServer>.Instance)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance with an injected logger.
+    /// </summary>
+    public NamedPipeUIServer(
+        SecurityIdentifier? parentSid,
+        SecurityIdentifier? childSid,
+        ILogger<NamedPipeUIServer> logger)
     {
         this.pipeName = $"{PipeNamePrefix}.{UIPPipeName}";
         this.parentSid = parentSid;
         this.childSid = childSid;
+        this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.internalCts = new CancellationTokenSource();
     }
 
@@ -134,7 +148,10 @@ public sealed class NamedPipeUIServer : IDisposable
             this.childSid,
             messageHandler,
             () => this.OnDisconnected(),
-            linkedCts.Token);
+            linkedCts.Token,
+            null,
+            null,
+            this.logger);
 
         await this.listenerTask.StartAsync().ConfigureAwait(false);
     }
@@ -188,7 +205,7 @@ public sealed class NamedPipeUIServer : IDisposable
     /// <summary>
     /// Internal listener that accepts connections and handles message dispatch.
     /// </summary>
-    private sealed class PipeServerListener : IDisposable
+    internal sealed class PipeServerListener : IDisposable
     {
         private readonly string pipeName;
         private readonly SecurityIdentifier? parentSid;
@@ -196,7 +213,7 @@ public sealed class NamedPipeUIServer : IDisposable
         private readonly UIMessageHandler messageHandler;
         private readonly Action onDisconnected;
         private readonly CancellationToken cancellationToken;
-        private NamedPipeServerStream? pipeServer;
+        private IUiPipeServer? pipeServer;
         private Task? listenerTask;
         private bool disposed;
 
@@ -206,7 +223,10 @@ public sealed class NamedPipeUIServer : IDisposable
             SecurityIdentifier? childSid,
             UIMessageHandler messageHandler,
             Action onDisconnected,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Func<CancellationToken, Task<IUiPipeServer>>? pipeFactory = null,
+            Func<TimeSpan, CancellationToken, Task>? delay = null,
+            ILogger? logger = null)
         {
             this.pipeName = pipeName;
             this.parentSid = parentSid;
@@ -214,36 +234,32 @@ public sealed class NamedPipeUIServer : IDisposable
             this.messageHandler = messageHandler;
             this.onDisconnected = onDisconnected;
             this.cancellationToken = cancellationToken;
+            this.pipeFactory = pipeFactory ?? this.CreatePipeAsync;
+            this.delay = delay ?? ((interval, token) => Task.Delay(interval, token));
+            this.logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         }
 
         public bool IsConnected => this.pipeServer?.IsConnected ?? false;
+
+        internal bool IsReady { get; private set; }
 
         public async Task StartAsync()
         {
             while (!this.cancellationToken.IsCancellationRequested)
             {
+                this.IsReady = false;
                 try
                 {
-                    var pipeSecurity = CreatePipeSecurity(this.parentSid, this.childSid);
-
-                    this.pipeServer = NamedPipeServerStreamAcl.Create(
-                        this.pipeName,
-                        PipeDirection.InOut,
-                        255,
-                        PipeTransmissionMode.Message,
-                        PipeOptions.Asynchronous,
-                        inBufferSize: BufferSize,
-                        outBufferSize: BufferSize,
-                        pipeSecurity: pipeSecurity,
-                        inheritability: HandleInheritability.None);
-
-                    await this.pipeServer.WaitForConnectionAsync(this.cancellationToken).ConfigureAwait(false);
+                    this.pipeServer = await this.pipeFactory(this.cancellationToken).ConfigureAwait(false);
+                    var connectionTask = this.pipeServer.WaitForConnectionAsync(this.cancellationToken);
+                    this.IsReady = true;
+                    await connectionTask.ConfigureAwait(false);
+                    this.IsReady = false;
 
                     // Reject unauthorized clients before handing them off to message dispatch.
                     if (!this.ValidateClient())
                     {
-                        this.pipeServer.Dispose();
-                        this.pipeServer = null;
+                        this.ClosePipe();
                         continue;
                     }
 
@@ -252,21 +268,29 @@ public sealed class NamedPipeUIServer : IDisposable
                 }
                 catch (OperationCanceledException)
                 {
+                    this.IsReady = false;
                     break;
-                }
-                catch (IOException ex)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[NamedPipeUIServer] IO error: {ex.Message}");
-                    this.pipeServer?.Dispose();
-                    this.pipeServer = null;
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[NamedPipeUIServer] Unexpected error: {ex.Message}");
-                    this.pipeServer?.Dispose();
-                    this.pipeServer = null;
+                    this.IsReady = false;
+                    this.logger.LogError(
+                        ex,
+                        "[NamedPipeUIServer] Pipe server creation/listening failed ({ExceptionType}).",
+                        ex.GetType().Name);
+                    this.ClosePipe();
+                    if (!this.cancellationToken.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            await this.delay(TimeSpan.FromMilliseconds(250), this.cancellationToken).ConfigureAwait(false);
+                            await Task.Yield();
+                        }
+                        catch (OperationCanceledException) when (this.cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -309,7 +333,7 @@ public sealed class NamedPipeUIServer : IDisposable
                     if (message != null)
                     {
                         // Handle message and send response
-                        var response = await this.messageHandler.HandleAsync(message, this.cancellationToken).ConfigureAwait(false);
+                        var response = await this.messageHandler.HandleAuthenticatedAsync(message, this.cancellationToken).ConfigureAwait(false);
                         if (response != null)
                         {
                             await this.SendAsync(response, this.cancellationToken).ConfigureAwait(false);
@@ -326,6 +350,7 @@ public sealed class NamedPipeUIServer : IDisposable
                 // Cancellation requested
             }
 
+            this.IsReady = false;
             this.onDisconnected?.Invoke();
         }
 
@@ -399,33 +424,35 @@ public sealed class NamedPipeUIServer : IDisposable
                 // eliminating the reflection-based serializer at the IPC boundary.
                 return messageType switch
                 {
-                    nameof(GetEnforcementLevel) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GetEnforcementLevel),
-                    nameof(EnforcementLevelResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.EnforcementLevelResponse),
-                    nameof(GetOnboardingState) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GetOnboardingState),
-                    nameof(OnboardingStateResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.OnboardingStateResponse),
-                    nameof(RecordOnboardingStepCompleted) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.RecordOnboardingStepCompleted),
-                    nameof(StepCompletedResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.StepCompletedResponse),
-                    nameof(RecordFunnelEvent) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.RecordFunnelEvent),
-                    nameof(ShowOverlayCommand) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ShowOverlayCommand),
-                    nameof(HideOverlayCommand) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.HideOverlayCommand),
-                    nameof(GetUsageState) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GetUsageState),
-                    nameof(UsageStateResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.UsageStateResponse),
-                    nameof(TriggerSync) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.TriggerSync),
-                    nameof(PairDevice) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.PairDevice),
-                    nameof(PairDeviceResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.PairDeviceResponse),
-                    nameof(ListAccounts) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ListAccounts),
-                    nameof(AccountList) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.AccountList),
-                    nameof(CreateAccount) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.CreateAccount),
-                    nameof(CreateAccountResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.CreateAccountResponse),
-                    nameof(ConvertAccount) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ConvertAccount),
-                    nameof(ConvertAccountResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ConvertAccountResponse),
-                    nameof(GetServiceStatus) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GetServiceStatus),
-                    nameof(ServiceStatusResponse) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ServiceStatusResponse),
-                    nameof(GetConsentStatus) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GetConsentStatus),
-                    nameof(ConsentStatusSnapshot) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ConsentStatusSnapshot),
-                    nameof(GrantConsent) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.GrantConsent),
-                    nameof(AdvanceOnboardingStep) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.AdvanceOnboardingStep),
-                    nameof(ResetOnboardingState) => JsonSerializer.Deserialize(json, UIMessagesJsonContext.Default.ResetOnboardingState),
+                    nameof(GetEnforcementLevel) => root.Deserialize(UIMessagesJsonContext.Default.GetEnforcementLevel),
+                    nameof(EnforcementLevelResponse) => root.Deserialize(UIMessagesJsonContext.Default.EnforcementLevelResponse),
+                    nameof(GetOnboardingState) => root.Deserialize(UIMessagesJsonContext.Default.GetOnboardingState),
+                    nameof(OnboardingStateResponse) => root.Deserialize(UIMessagesJsonContext.Default.OnboardingStateResponse),
+                    nameof(RecordOnboardingStepCompleted) => root.Deserialize(UIMessagesJsonContext.Default.RecordOnboardingStepCompleted),
+                    nameof(StepCompletedResponse) => root.Deserialize(UIMessagesJsonContext.Default.StepCompletedResponse),
+                    nameof(RecordFunnelEvent) => root.Deserialize(UIMessagesJsonContext.Default.RecordFunnelEvent),
+                    nameof(ShowOverlayCommand) => root.Deserialize(UIMessagesJsonContext.Default.ShowOverlayCommand),
+                    nameof(HideOverlayCommand) => root.Deserialize(UIMessagesJsonContext.Default.HideOverlayCommand),
+                    nameof(GetUsageState) => root.Deserialize(UIMessagesJsonContext.Default.GetUsageState),
+                    nameof(UsageStateResponse) => root.Deserialize(UIMessagesJsonContext.Default.UsageStateResponse),
+                    nameof(TriggerSync) => root.Deserialize(UIMessagesJsonContext.Default.TriggerSync),
+                    nameof(PairDevice) => root.Deserialize(UIMessagesJsonContext.Default.PairDevice),
+                    nameof(PairDeviceResponse) => root.Deserialize(UIMessagesJsonContext.Default.PairDeviceResponse),
+                    nameof(ListAccounts) => root.Deserialize(UIMessagesJsonContext.Default.ListAccounts),
+                    nameof(AccountList) => root.Deserialize(UIMessagesJsonContext.Default.AccountList),
+                    nameof(CreateAccount) => root.Deserialize(UIMessagesJsonContext.Default.CreateAccount),
+                    nameof(CreateAccountResponse) => root.Deserialize(UIMessagesJsonContext.Default.CreateAccountResponse),
+                    nameof(ConvertAccount) => root.Deserialize(UIMessagesJsonContext.Default.ConvertAccount),
+                    nameof(ConvertAccountResponse) => root.Deserialize(UIMessagesJsonContext.Default.ConvertAccountResponse),
+                    nameof(GetServiceStatus) => root.Deserialize(UIMessagesJsonContext.Default.GetServiceStatus),
+                    nameof(ServiceStatusResponse) => root.Deserialize(UIMessagesJsonContext.Default.ServiceStatusResponse),
+                    nameof(GetConsentStatus) => root.Deserialize(UIMessagesJsonContext.Default.GetConsentStatus),
+                    nameof(ConsentStatusSnapshot) => root.Deserialize(UIMessagesJsonContext.Default.ConsentStatusSnapshot),
+                    nameof(GrantConsent) => root.Deserialize(UIMessagesJsonContext.Default.GrantConsent),
+                    nameof(AdvanceOnboardingStep) => root.Deserialize(UIMessagesJsonContext.Default.AdvanceOnboardingStep),
+                    nameof(ResetOnboardingState) => root.Deserialize(UIMessagesJsonContext.Default.ResetOnboardingState),
+                    nameof(RegisterWnsChannel) => root.Deserialize(UIMessagesJsonContext.Default.RegisterWnsChannel),
+                    nameof(WnsRegistrationResult) => root.Deserialize(UIMessagesJsonContext.Default.WnsRegistrationResult),
                     _ => null,
                 };
             }
@@ -441,9 +468,59 @@ public sealed class NamedPipeUIServer : IDisposable
         {
             if (!this.disposed)
             {
-                this.pipeServer?.Dispose();
+                this.IsReady = false;
+                this.ClosePipe();
                 this.disposed = true;
             }
         }
+
+        private readonly Func<CancellationToken, Task<IUiPipeServer>> pipeFactory;
+        private readonly Func<TimeSpan, CancellationToken, Task> delay;
+        private readonly ILogger logger;
+
+        private Task<IUiPipeServer> CreatePipeAsync(CancellationToken cancellationToken)
+        {
+            var pipeSecurity = CreatePipeSecurity(this.parentSid, this.childSid);
+            var pipe = NamedPipeServerStreamAcl.Create(
+                this.pipeName,
+                PipeDirection.InOut,
+                NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Message,
+                PipeOptions.Asynchronous,
+                inBufferSize: BufferSize,
+                outBufferSize: BufferSize,
+                pipeSecurity: pipeSecurity,
+                inheritability: HandleInheritability.None);
+            return Task.FromResult<IUiPipeServer>(new UiPipeServer(pipe));
+        }
+
+        private void ClosePipe()
+        {
+            this.pipeServer?.Dispose();
+            this.pipeServer = null;
+            this.IsReady = false;
+        }
+    }
+
+    internal interface IUiPipeServer : IDisposable
+    {
+        bool IsConnected { get; }
+        Task WaitForConnectionAsync(CancellationToken cancellationToken);
+        Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
+        Task WriteAsync(byte[] buffer, CancellationToken cancellationToken);
+        SecurityIdentifier GetImpersonationUserSid();
+    }
+
+    private sealed class UiPipeServer : IUiPipeServer
+    {
+        private readonly NamedPipeServerStream pipe;
+
+        public UiPipeServer(NamedPipeServerStream pipe) => this.pipe = pipe;
+        public bool IsConnected => this.pipe.IsConnected;
+        public Task WaitForConnectionAsync(CancellationToken token) => this.pipe.WaitForConnectionAsync(token);
+        public Task<int> ReadAsync(byte[] buffer, CancellationToken token) => this.pipe.ReadAsync(buffer, token).AsTask();
+        public Task WriteAsync(byte[] buffer, CancellationToken token) => this.pipe.WriteAsync(buffer, token).AsTask();
+        public SecurityIdentifier GetImpersonationUserSid() => this.pipe.GetImpersonationUserSid();
+        public void Dispose() => this.pipe.Dispose();
     }
 }

@@ -70,6 +70,11 @@ public sealed class EnforcementResult
     public string? ErrorMessage { get; init; }
 
     /// <summary>
+    /// Indica si la respuesta proviene de una evaluación degradada.
+    /// </summary>
+    public bool IsDegraded { get; init; }
+
+    /// <summary>
     /// Timestamp de la evaluación.
     /// </summary>
     public required DateTimeOffset Timestamp { get; init; }
@@ -99,6 +104,16 @@ public sealed class EnforcementStatus
     /// Última evaluación realizada.
     /// </summary>
     public Decision? LastDecision { get; init; }
+
+    /// <summary>
+    /// Indica si la última evaluación falló y el estado quedó degradado.
+    /// </summary>
+    public bool IsEvaluationDegraded { get; init; }
+
+    /// <summary>
+    /// Mensaje de la última falla de evaluación, si existió.
+    /// </summary>
+    public string? LastEvaluationFailure { get; init; }
 
     /// <summary>
     /// AppId de la última app evaluada.

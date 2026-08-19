@@ -8,6 +8,7 @@ using System.Collections.Concurrent;
 using ControlParental.Domain;
 using ControlParental.Service;
 using FluentAssertions;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using Xunit;
@@ -22,22 +23,27 @@ public class UsageReconcilerTests : IDisposable
     // ── Test Database ─────────────────────────────────────────────────
 
     private readonly ControlParentalDbContext dbContext;
+    private readonly SqliteConnection connection;
+    private readonly TrackingDbContextFactory dbContextFactory;
 
     public UsageReconcilerTests()
     {
+        this.connection = new SqliteConnection("Data Source=:memory:");
+        this.connection.Open();
+
         var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-            .UseSqlite("DataSource=:memory:")
+            .UseSqlite(this.connection)
             .Options;
 
         this.dbContext = new ControlParentalDbContext(options);
-        this.dbContext.Database.OpenConnection();
         this.dbContext.Database.EnsureCreated();
+        this.dbContextFactory = new TrackingDbContextFactory(options);
     }
 
     public void Dispose()
     {
-        this.dbContext.Database.CloseConnection();
         this.dbContext.Dispose();
+        this.connection.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -58,6 +64,47 @@ public class UsageReconcilerTests : IDisposable
         return mock.Object;
     }
 
+    private sealed class FakeIpcChannel : IIpcChannel
+    {
+        public bool IsConnected { get; set; } = true;
+        private event Action? disconnected;
+        private event Action<IIpcMessage>? messageReceived;
+
+        public int MessageReceivedSubscriptions { get; private set; }
+
+        public int MessageReceivedUnsubscriptions { get; private set; }
+
+        public event Action? Disconnected
+        {
+            add => this.disconnected += value;
+            remove => this.disconnected -= value;
+        }
+
+        public event Action<IIpcMessage>? MessageReceived
+        {
+            add
+            {
+                this.messageReceived += value;
+                this.MessageReceivedSubscriptions++;
+            }
+
+            remove
+            {
+                this.messageReceived -= value;
+                this.MessageReceivedUnsubscriptions++;
+            }
+        }
+
+        public Task StartAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task StopAsync() => Task.CompletedTask;
+
+        public Task SendAsync(IIpcMessage message, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public void SimulateMessage(IIpcMessage message) => this.messageReceived?.Invoke(message);
+    }
+
     private UsageReconciler CreateReconciler(
         ITimeProvider? timeProvider = null,
         IIpcChannel? ipcChannel = null,
@@ -68,7 +115,7 @@ public class UsageReconcilerTests : IDisposable
         var resolve = resolveAppId ?? (name => name.Replace(".exe", string.Empty));
 
         return new UsageReconciler(
-            this.dbContext,
+            this.dbContextFactory,
             tp,
             ipc,
             resolve);
@@ -85,13 +132,13 @@ public class UsageReconcilerTests : IDisposable
 
         // Act & Assert
         var act = () => new UsageReconciler(
-            dbContext: null!,
+            dbContextFactory: null!,
             timeProvider,
             ipcChannel,
             name => name);
 
         act.Should().ThrowExactly<ArgumentNullException>()
-            .WithParameterName("dbContext");
+            .WithParameterName("dbContextFactory");
     }
 
     [Fact]
@@ -99,7 +146,7 @@ public class UsageReconcilerTests : IDisposable
     {
         // Act & Assert
         var act = () => new UsageReconciler(
-            this.dbContext,
+            this.dbContextFactory,
             timeProvider: null!,
             CreateMockIpcChannel(),
             name => name);
@@ -113,7 +160,7 @@ public class UsageReconcilerTests : IDisposable
     {
         // IPC channel is now nullable - SetIpcChannel must be called before StartAsync
         var act = () => new UsageReconciler(
-            this.dbContext,
+            this.dbContextFactory,
             CreateMockTimeProvider(DateTimeOffset.UtcNow),
             ipcChannel: null,
             name => name);
@@ -126,7 +173,7 @@ public class UsageReconcilerTests : IDisposable
     {
         // Act & Assert
         var act = () => new UsageReconciler(
-            this.dbContext,
+            this.dbContextFactory,
             CreateMockTimeProvider(DateTimeOffset.UtcNow),
             CreateMockIpcChannel(),
             resolveAppId: null!);
@@ -323,11 +370,13 @@ public class UsageReconcilerTests : IDisposable
         result.DiscrepanciesFound.Should().Be(1);
 
         // Verify backfill was applied
-        var usage = await this.dbContext.UsageToday
+        await using var verifyDb = this.dbContextFactory.CreateDbContext();
+        var usage = await verifyDb.UsageToday
             .FirstOrDefaultAsync(u => u.AppId == "whatsapp" && u.ServerDate == today);
 
         usage.Should().NotBeNull();
         usage!.Minutes.Should().BeGreaterThanOrEqualTo(30);
+        usage.ElapsedSeconds.Should().Be(3600L);
     }
 
     [Fact]
@@ -423,6 +472,7 @@ public class UsageReconcilerTests : IDisposable
 
         usage.Should().NotBeNull();
         usage!.Minutes.Should().BeGreaterThan(0);
+        usage.ElapsedSeconds.Should().BeGreaterThan(0L);
     }
 
     // ── Event Tests ──────────────────────────────────────────────────
@@ -714,5 +764,24 @@ public class UsageReconcilerTests : IDisposable
         // Assert
         discrepancies.Should().HaveCount(2);
         discrepancies.Select(d => d.Reason).Should().AllBeEquivalentTo(DiscrepancyReason.BackfillNeeded);
+    }
+
+    [Fact]
+    public async Task SetIpcChannel_WhenRunning_RewiresForegroundSubscription()
+    {
+        var channel1 = new FakeIpcChannel();
+        var channel2 = new FakeIpcChannel();
+        var reconciler = this.CreateReconciler(ipcChannel: channel1);
+
+        await reconciler.StartAsync();
+
+        reconciler.SetIpcChannel(channel2);
+
+        channel1.MessageReceivedSubscriptions.Should().Be(1);
+        channel1.MessageReceivedUnsubscriptions.Should().Be(1);
+        channel2.MessageReceivedSubscriptions.Should().Be(1);
+        channel2.MessageReceivedUnsubscriptions.Should().Be(0);
+
+        reconciler.Stop();
     }
 }

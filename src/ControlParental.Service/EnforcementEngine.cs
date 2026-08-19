@@ -25,6 +25,8 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
     private bool isDeviceLocked;
     private Decision? lastDecision;
     private string? lastAppId;
+    private bool isEvaluationDegraded;
+    private string? lastEvaluationFailure;
     private bool disposed;
 
     /// <summary>
@@ -73,38 +75,25 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
             {
                 System.Diagnostics.Debug.WriteLine(
                     $"[EnforcementEngine] No policy available. Allowing {appId}.");
+                this.isEvaluationDegraded = false;
+                this.lastEvaluationFailure = null;
                 return new EnforcementResult
                 {
                     Success = true,
                     Blocked = false,
                     ReasonText = "Sin política activa",
+                    IsDegraded = false,
                     Timestamp = timestamp,
                 };
             }
 
             // Check if device is in locked state - if so, always block
-            if (policy.DeviceState == DeviceState.Locked && !this.isDeviceLocked)
+            if (policy.DeviceState == DeviceState.Locked || this.isDeviceLocked)
             {
-                await this.LockDeviceAsync("dispositivo bloqueado", cancellationToken);
-            }
-
-            // If device is locked, enforce full lock
-            if (this.isDeviceLocked)
-            {
-                // Show persistent overlay
-                this.ShowOverlayInternal("dispositivo bloqueado", null);
-
-                // Terminate the app if it's not a system process
-                if (this.processTerminator.CanTerminate(appId))
-                {
-                    await this.processTerminator.TerminateAsync(
-                        appId,
-                        "Device locked",
-                        cancellationToken);
-                }
-
                 var decision = Decision.Block(2, "dispositivo bloqueado");
                 this.lastDecision = decision;
+                this.isEvaluationDegraded = false;
+                this.lastEvaluationFailure = null;
 
                 return new EnforcementResult
                 {
@@ -112,6 +101,7 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
                     Blocked = true,
                     ReasonCode = 2,
                     ReasonText = "dispositivo bloqueado",
+                    IsDegraded = false,
                     Timestamp = timestamp,
                 };
             }
@@ -129,6 +119,8 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
                 zonaHoraria);
 
             this.lastDecision = policyDecision;
+            this.isEvaluationDegraded = false;
+            this.lastEvaluationFailure = null;
 
             if (policyDecision.IsBlocked)
             {
@@ -136,26 +128,13 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
                 System.Diagnostics.Debug.WriteLine(
                     $"[EnforcementEngine] Blocking {appId}. Reason: {policyDecision.ReasonText}");
 
-                this.ShowOverlayInternal(policyDecision.ReasonText, null);
-
-                // Terminate the process (if not a system process)
-                if (this.processTerminator.CanTerminate(appId))
-                {
-                    await this.processTerminator.TerminateAsync(
-                        appId,
-                        policyDecision.ReasonText ?? "Bloqueado",
-                        cancellationToken);
-                }
-
-                // Return focus to desktop (via agent)
-                // This would be done via IPC to the agent
-
                 return new EnforcementResult
                 {
                     Success = true,
                     Blocked = true,
                     ReasonCode = policyDecision.ReasonCode,
                     ReasonText = policyDecision.ReasonText,
+                    IsDegraded = false,
                     Timestamp = timestamp,
                 };
             }
@@ -165,16 +144,12 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
                 System.Diagnostics.Debug.WriteLine(
                     $"[EnforcementEngine] Allowing {appId}.");
 
-                if (this.isOverlayActive)
-                {
-                    this.HideOverlayInternal();
-                }
-
                 return new EnforcementResult
                 {
                     Success = true,
                     Blocked = false,
                     ReasonText = "Permitido",
+                    IsDegraded = false,
                     Timestamp = timestamp,
                 };
             }
@@ -184,11 +159,19 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
             System.Diagnostics.Debug.WriteLine(
                 $"[EnforcementEngine] Error enforcing foreground change: {ex.Message}");
 
+            this.isEvaluationDegraded = true;
+            this.lastEvaluationFailure = ex.Message;
+
+            var safeDecision = this.lastDecision;
+
             return new EnforcementResult
             {
                 Success = false,
-                Blocked = false,
+                Blocked = safeDecision?.IsBlocked ?? false,
+                ReasonCode = safeDecision?.ReasonCode,
+                ReasonText = safeDecision?.ReasonText ?? "Evaluación degradada",
                 ErrorMessage = ex.Message,
+                IsDegraded = true,
                 Timestamp = timestamp,
             };
         }
@@ -207,11 +190,10 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
         System.Diagnostics.Debug.WriteLine(
             $"[EnforcementEngine] Locking device. Reason: {reason}");
 
-        this.isDeviceLocked = true;
         this.ShowOverlayInternal(reason, "Consultar padre");
 
-        // Request workstation lock via IPC
-        await this.workstationLockManager.LockNowAsync();
+        // Only a current typed confirmation can establish locked state.
+        this.isDeviceLocked = await this.workstationLockManager.LockNowAsync(cancellationToken);
 
         // Enforce persistent overlay
         // (This will be restored on session unlock via OverlayPersistenceManager)
@@ -244,6 +226,8 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
             IsDeviceLocked = this.isDeviceLocked,
             LastDecision = this.lastDecision,
             LastAppId = this.lastAppId,
+            IsEvaluationDegraded = this.isEvaluationDegraded,
+            LastEvaluationFailure = this.lastEvaluationFailure,
         };
     }
 

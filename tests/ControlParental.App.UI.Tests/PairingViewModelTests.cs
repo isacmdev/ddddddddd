@@ -51,8 +51,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "1",
             CodeDigit5 = "2",
             CodeDigit6 = "3",
-            CodeDigit7 = "D",
-            CodeDigit8 = "E",
         };
 
         // Act
@@ -63,6 +61,7 @@ public sealed class PairingViewModelTests
         Assert.False(viewModel.HasError);
         Assert.Equal(string.Empty, viewModel.ErrorMessage);
         Assert.NotNull(channel.LastPairDeviceRequest);
+        Assert.Equal(6, channel.LastPairDeviceRequest!.Code.Length);
     }
 
     /// <summary>
@@ -91,8 +90,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "1",
             CodeDigit5 = "2",
             CodeDigit6 = "3",
-            CodeDigit7 = "D",
-            CodeDigit8 = "E",
         };
 
         await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
@@ -127,8 +124,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "1",
             CodeDigit5 = "2",
             CodeDigit6 = "3",
-            CodeDigit7 = "D",
-            CodeDigit8 = "E",
         };
 
         await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
@@ -164,8 +159,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "9",
             CodeDigit5 = "8",
             CodeDigit6 = "7",
-            CodeDigit7 = "6",
-            CodeDigit8 = "5",
         };
 
         await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
@@ -202,8 +195,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "D",
             CodeDigit5 = "E",
             CodeDigit6 = "F",
-            CodeDigit7 = "G",
-            CodeDigit8 = "H",
         };
 
         await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
@@ -217,7 +208,7 @@ public sealed class PairingViewModelTests
     /// (<c>SelectedAgeBandIndex == -1</c>) so the user is forced to pick one
     /// before the Emparejar button can enable — and the derived
     /// <see cref="PairingViewModel.CanPair"/> MUST be false even after the
-    /// user has typed a complete 8-character code.
+    /// user has typed a complete 6-character code.
     /// </summary>
     [Fact]
     public void SelectedAgeBandNullAtStartEmparejarButtonDisabled()
@@ -233,8 +224,6 @@ public sealed class PairingViewModelTests
             CodeDigit4 = "1",
             CodeDigit5 = "2",
             CodeDigit6 = "3",
-            CodeDigit7 = "D",
-            CodeDigit8 = "E",
         };
 
         // Assert — the CanPair gate refuses until the user picks a band.
@@ -284,16 +273,40 @@ public sealed class PairingViewModelTests
                 CodeDigit4 = "1",
                 CodeDigit5 = "2",
                 CodeDigit6 = "3",
-                CodeDigit7 = "D",
-                CodeDigit8 = "E",
             };
 
             await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
 
             Assert.NotNull(channel.LastPairDeviceRequest);
+            Assert.Equal(6, channel.LastPairDeviceRequest!.Code.Length);
             Assert.Equal(expected, channel.LastPairDeviceRequest!.AgeBand);
             Assert.DoesNotContain("a", channel.LastPairDeviceRequest.AgeBand);
             Assert.DoesNotContain("años", channel.LastPairDeviceRequest.AgeBand);
         }
+    }
+
+    /// <summary>
+    /// Pairing must reject codes that are not exactly 6 characters long and
+    /// must not send a wire request when the contract is violated.
+    /// </summary>
+    [Fact]
+    public async Task PairWithCodeAsync_CodeNot6Chars_ReturnsError_AndDoesNotSend()
+    {
+        var channel = new MockNamedPipeUIChannel();
+        var viewModel = new PairingViewModel(null, channel)
+        {
+            SelectedAgeBandIndex = 0,
+            CodeDigit1 = "A",
+            CodeDigit2 = "B",
+            CodeDigit3 = "C",
+            CodeDigit4 = "1",
+            CodeDigit5 = "2",
+        };
+
+        await viewModel.PairWithCodeCommand.ExecuteAsync(null).ConfigureAwait(false);
+
+        Assert.True(viewModel.HasError);
+        Assert.Equal("Ingresá los 6 caracteres del código.", viewModel.ErrorMessage);
+        Assert.Null(channel.LastPairDeviceRequest);
     }
 }

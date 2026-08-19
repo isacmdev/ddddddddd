@@ -7,6 +7,7 @@ namespace ControlParental.App.UI.Tests;
 using System.Text;
 using System.Text.Json;
 using ControlParental.App.UI;
+using ControlParental.App.UI.Interop;
 using ControlParental.Domain;
 using Xunit;
 
@@ -136,6 +137,122 @@ public class WnsLifecycleTests
     }
 
     [Fact]
+    public async Task RegisterChannelAsync_SendsRegisterWnsChannelOverTypedServiceIpc()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+        var expiresAt = new DateTimeOffset(2026, 8, 22, 0, 0, 0, TimeSpan.Zero);
+        var expected = new WnsRegistrationResult("operation", WnsRegistrationStatus.Accepted, "correlation");
+        channel.QueryResult = expected;
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            expiresAt,
+            CancellationToken.None);
+
+        Assert.Same(expected, result);
+        var message = Assert.IsType<RegisterWnsChannel>(channel.Messages.Single());
+        Assert.Equal("https://db3p.notify.windows.com/?token=abc", message.ChannelUri);
+        Assert.Equal("wns", message.Channel);
+        Assert.Equal(expiresAt, message.ExpiresAt);
+        Assert.False(string.IsNullOrWhiteSpace(message.OperationId));
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_ServiceUnavailable_FailsClosedWithoutBackendFallback()
+    {
+        var channel = new RecordingUIChannel
+        {
+            SendException = new InvalidOperationException("Service unavailable."),
+        };
+        var sut = new WnsPushNotificationHandler(channel);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None));
+
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Theory]
+    [InlineData(WnsRegistrationStatus.Denied)]
+    [InlineData(WnsRegistrationStatus.Retryable)]
+    public async Task RegisterChannelAsync_PreservesTypedNonAcceptedResultWithoutRetry(WnsRegistrationStatus status)
+    {
+        var channel = new RecordingUIChannel
+        {
+            QueryResult = new WnsRegistrationResult("operation", status, "correlation"),
+        };
+        var sut = new WnsPushNotificationHandler(channel);
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        Assert.Equal(channel.QueryResult, result);
+        Assert.Equal(status, result!.Status);
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_NullResultFailsClosedWithoutFallback()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_SeparateInvocationsUseDistinctOperationIds()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+        await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        var requests = channel.Messages.Cast<RegisterWnsChannel>().ToArray();
+        Assert.Equal(2, requests.Length);
+        Assert.All(requests, request => Assert.False(string.IsNullOrWhiteSpace(request.OperationId)));
+        Assert.NotEqual(requests[0].OperationId, requests[1].OperationId);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_PropagatesCancellationToTypedServiceIpc()
+    {
+        using var cts = new CancellationTokenSource();
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            cts.Token));
+
+            Assert.Equal(cts.Token, channel.CancellationToken);
+    }
+
+    [Fact]
     public async Task HandleRawNotificationAsyncWithMalformedPayloadEmitsTypedTriggerSync()
     {
         var malformedPayload = Encoding.UTF8.GetBytes("{not-json");
@@ -206,5 +323,48 @@ public class WnsLifecycleTests
 
         Assert.NotNull(message);
         Assert.Equal(nameof(TriggerSync), message!.MessageType);
+    }
+
+    private sealed class RecordingUIChannel : IUIChannel
+    {
+        public List<object> Messages { get; } = new();
+
+        public List<object> SentMessages { get; } = new();
+
+        public Exception? SendException { get; init; }
+
+        public WnsRegistrationResult? QueryResult { get; set; }
+
+        public CancellationToken CancellationToken { get; private set; }
+
+        public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
+            where TQuery : ControlParental.Domain.IUIMessage
+            where TResponse : class, ControlParental.Domain.IUIMessage
+        {
+            this.CancellationToken = ct;
+            this.Messages.Add(query);
+            if (ct.IsCancellationRequested)
+            {
+                return Task.FromCanceled<TResponse?>(ct);
+            }
+
+            return this.SendException is null
+                ? Task.FromResult(this.QueryResult as TResponse)
+                : Task.FromException<TResponse?>(this.SendException);
+        }
+
+        public Task SendAsync<T>(T message, CancellationToken ct = default)
+            where T : ControlParental.Domain.IUIMessage
+        {
+            this.CancellationToken = ct;
+            this.Messages.Add(message);
+            this.SentMessages.Add(message);
+            if (ct.IsCancellationRequested)
+            {
+                return Task.FromCanceled(ct);
+            }
+
+            return this.SendException is null ? Task.CompletedTask : Task.FromException(this.SendException);
+        }
     }
 }

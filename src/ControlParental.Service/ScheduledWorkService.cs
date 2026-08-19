@@ -63,6 +63,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     private readonly IServiceHealthMonitor healthMonitor;
     private readonly IServiceRecoveryManager recoveryManager;
     private readonly IPolicyRepository policyRepository;
+    private readonly IBackendIdentityCoordinator? identityCoordinator;
     private readonly ITaskSchedulerBackup? taskSchedulerBackup;
     private readonly JsonSerializerOptions jsonOptions;
 
@@ -78,7 +79,9 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
     private readonly object lockObj = new();
     private readonly Dictionary<WorkType, int> backoffByWorkType = new();
+    private readonly Dictionary<WorkType, DateTimeOffset> nextEligibleAtByWorkType = new();
     private readonly Dictionary<WorkType, Task> inFlightWork = new();
+    private readonly SemaphoreSlim policySyncGate = new(1, 1);
 
     // ── Types ──────────────────────────────────────────────────────
 
@@ -113,7 +116,8 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         IServiceHealthMonitor healthMonitor,
         IServiceRecoveryManager recoveryManager,
         IPolicyRepository policyRepository,
-        ITaskSchedulerBackup? taskSchedulerBackup = null)
+        ITaskSchedulerBackup? taskSchedulerBackup = null,
+        IBackendIdentityCoordinator? identityCoordinator = null)
     {
         this.backendClient = backendClient ?? throw new ArgumentNullException(nameof(backendClient));
         this.outboxManager = outboxManager ?? throw new ArgumentNullException(nameof(outboxManager));
@@ -124,6 +128,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         this.recoveryManager = recoveryManager ?? throw new ArgumentNullException(nameof(recoveryManager));
         this.policyRepository = policyRepository ?? throw new ArgumentNullException(nameof(policyRepository));
         this.taskSchedulerBackup = taskSchedulerBackup;
+        this.identityCoordinator = identityCoordinator;
 
         this.jsonOptions = new JsonSerializerOptions
         {
@@ -135,6 +140,11 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         this.backoffByWorkType[WorkType.Heartbeat] = InitialBackoffSeconds;
         this.backoffByWorkType[WorkType.OutboxPush] = InitialBackoffSeconds;
         this.backoffByWorkType[WorkType.Reconciliation] = InitialBackoffSeconds;
+
+        // Startup eligibility is truthful: every work type starts immediately eligible.
+        this.nextEligibleAtByWorkType[WorkType.Heartbeat] = DateTimeOffset.MinValue;
+        this.nextEligibleAtByWorkType[WorkType.OutboxPush] = DateTimeOffset.MinValue;
+        this.nextEligibleAtByWorkType[WorkType.Reconciliation] = DateTimeOffset.MinValue;
     }
 
     // ── IScheduledWorkService ──────────────────────────────────────
@@ -384,17 +394,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             if (result.NewPolicyAvailable)
             {
                 System.Diagnostics.Debug.WriteLine("[ScheduledWorkService] New policy available, triggering sync.");
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await this.ExecutePolicySyncAsync(cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy sync failed: {ex.Message}");
-                    }
-                }, cancellationToken);
+                await this.ExecutePolicySyncAsync(cancellationToken);
             }
         }
         else
@@ -644,23 +644,37 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     internal async Task ExecutePolicySyncAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        await this.policySyncGate.WaitAsync(cancellationToken);
 
-        if (!IsNetworkAvailable())
+        try
         {
-            return;
-        }
-
-        var currentVersion = await this.policyRepository.GetLocalVersionAsync("default", cancellationToken);
-        var fetchResult = await this.backendClient.FetchPolicyAsync("default", currentVersion, cancellationToken);
-
-        if (fetchResult.Success && !string.IsNullOrEmpty(fetchResult.PolicyJson))
-        {
-            var policy = JsonSerializer.Deserialize<Policy>(fetchResult.PolicyJson, PolicyJsonContext.Default.Policy);
-            if (policy != null)
+            if (!IsNetworkAvailable())
             {
-                await this.policyRepository.UpsertPolicyAsync(policy, cancellationToken);
-                System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy synced: version {policy.Version}");
+                return;
             }
+
+            var identity = this.identityCoordinator?.CurrentState;
+            if (identity?.CanAuthorizeRemoteAccess != true || string.IsNullOrWhiteSpace(identity.DeviceId))
+            {
+                return;
+            }
+
+            var currentVersion = await this.policyRepository.GetLocalVersionAsync(identity.DeviceId, cancellationToken);
+            var fetchResult = await this.backendClient.FetchPolicyAsync(identity.DeviceId, currentVersion, cancellationToken);
+
+            if (fetchResult.Success && !string.IsNullOrEmpty(fetchResult.PolicyJson))
+            {
+                var policy = JsonSerializer.Deserialize<Policy>(fetchResult.PolicyJson, PolicyJsonContext.Default.Policy);
+                if (policy != null)
+                {
+                    await this.policyRepository.UpsertPolicyAsync(policy, cancellationToken);
+                    System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy synced: version {policy.Version}");
+                }
+            }
+        }
+        finally
+        {
+            this.policySyncGate.Release();
         }
     }
 
@@ -689,8 +703,11 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 return false;
             }
 
-            var backoff = this.backoffByWorkType.GetValueOrDefault(workType, InitialBackoffSeconds);
-            return backoff == 0;
+            var nextEligibleAt = this.nextEligibleAtByWorkType.GetValueOrDefault(
+                workType,
+                DateTimeOffset.MinValue);
+
+            return this.timeProvider.WallClockNow >= nextEligibleAt;
         }
     }
 
@@ -700,10 +717,13 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         {
             var current = this.backoffByWorkType.GetValueOrDefault(workType, InitialBackoffSeconds);
             var next = Math.Min(current * 2, MaxBackoffSeconds);
+            var now = this.timeProvider.WallClockNow;
+
             this.backoffByWorkType[workType] = next;
+            this.nextEligibleAtByWorkType[workType] = now.AddSeconds(current);
 
             System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Backoff for {workType}: {current}s -> {next}s");
+                $"[ScheduledWorkService] Backoff for {workType}: {current}s -> {next}s; next eligible at {this.nextEligibleAtByWorkType[workType]:O}");
         }
     }
 
@@ -712,6 +732,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         lock (this.lockObj)
         {
             this.backoffByWorkType[workType] = InitialBackoffSeconds;
+            this.nextEligibleAtByWorkType[workType] = DateTimeOffset.MinValue;
         }
     }
 
@@ -723,6 +744,17 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         lock (this.lockObj)
         {
             return this.backoffByWorkType.GetValueOrDefault(workType, InitialBackoffSeconds);
+        }
+    }
+
+    /// <summary>
+    /// Gets the next eligible time for a work type (for testing).
+    /// </summary>
+    internal DateTimeOffset GetNextEligibleAtForTesting(WorkType workType)
+    {
+        lock (this.lockObj)
+        {
+            return this.nextEligibleAtByWorkType.GetValueOrDefault(workType, DateTimeOffset.MinValue);
         }
     }
 

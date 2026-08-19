@@ -215,14 +215,12 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
 
             // Headers de Supabase
             request.Headers.Add("apikey", this.supabaseKey);
-            request.Headers.Add("Authorization", $"Bearer {this.supabaseKey}");
 
             var response = await this.httpClient.SendAsync(request, cancellationToken);
 
             if (!response.IsSuccessStatusCode)
             {
-                var errorContent = await response.Content.ReadAsStringAsync(cancellationToken);
-                return DeviceAuthResult.Failed($"Error creando sesión anónima: {response.StatusCode} - {errorContent}");
+                return DeviceAuthResult.Failed($"Error creando sesión anónima: {response.StatusCode}");
             }
 
             var session = await response.Content.ReadFromJsonAsync<SupabaseSession>(cancellationToken: cancellationToken);
@@ -239,7 +237,7 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
             this.tokenExpiresAt = session.ExpiresAt;
 
             // Extraer device_id del JWT si está presente
-            if (TryExtractDeviceIdFromToken(session.AccessToken, out var tokenDeviceId))
+            if (TryReadExactDeviceClaim(session.AccessToken, out var tokenDeviceId))
             {
                 this.currentDeviceId = tokenDeviceId;
             }
@@ -301,7 +299,6 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
             };
 
             request.Headers.Add("apikey", this.supabaseKey);
-            request.Headers.Add("Authorization", $"Bearer {this.supabaseKey}");
 
             var response = await this.httpClient.SendAsync(request, cancellationToken);
 
@@ -320,8 +317,7 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
                     this.stateLock.Release();
                 }
 
-                var errorContent = await response.Content.ReadAsStringAsync(cancellationToken);
-                return DeviceAuthResult.Failed($"Error refrescando token: {response.StatusCode} - {errorContent}");
+                return DeviceAuthResult.Failed($"Error refrescando token: {response.StatusCode}");
             }
 
             var session = await response.Content.ReadFromJsonAsync<SupabaseSession>(cancellationToken: cancellationToken);
@@ -350,7 +346,7 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
                 this.currentState = DeviceAuthState.Authenticated;
 
                 // Extraer device_id del JWT si está presente
-                if (TryExtractDeviceIdFromToken(session.AccessToken, out var tokenDeviceId))
+                if (TryReadExactDeviceClaim(session.AccessToken, out var tokenDeviceId))
                 {
                     this.currentDeviceId = tokenDeviceId;
                 }
@@ -533,7 +529,7 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
     /// <summary>
     /// Intenta extraer el device_id del JWT.
     /// </summary>
-    private static bool TryExtractDeviceIdFromToken(string token, out string? deviceId)
+    public static bool TryReadExactDeviceClaim(string token, out string? deviceId)
     {
         deviceId = null;
 
@@ -546,7 +542,7 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
                 return false;
             }
 
-            var payload = parts[1];
+            var payload = parts[1].Replace('-', '+').Replace('_', '/');
             // Add padding if needed
             var remainder = payload.Length % 4;
             var padded = remainder switch
@@ -562,16 +558,14 @@ public sealed class DeviceAuthenticator : IDeviceAuthenticator, IDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            // Intentar diferentes claim names para device_id
             if (root.TryGetProperty("device_id", out var deviceIdElement))
             {
-                deviceId = deviceIdElement.GetString();
-                return !string.IsNullOrEmpty(deviceId);
-            }
+                if (deviceIdElement.ValueKind != JsonValueKind.String)
+                {
+                    return false;
+                }
 
-            if (root.TryGetProperty("sub", out var subElement))
-            {
-                deviceId = subElement.GetString();
+                deviceId = deviceIdElement.GetString();
                 return !string.IsNullOrEmpty(deviceId);
             }
         }

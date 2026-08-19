@@ -11,11 +11,10 @@
 namespace ControlParental.App.UI;
 
 using System.Diagnostics;
-using System.Globalization;
 using System.IO.Pipes;
-using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using ControlParental.App.UI.Interop;
 using ControlParental.Domain;
 using Microsoft.Windows.PushNotifications;
 using Windows.Foundation.Metadata;
@@ -39,14 +38,14 @@ using Windows.Foundation.Metadata;
 ///
 /// When App.UI is not running, the Service falls back to polling (T18/T20).
 /// </summary>
-public sealed class WnsPushNotificationHandler : IDisposable
+public sealed class WnsPushNotificationHandler : IDisposable, IWnsRegistrationPort, IWnsChannelProvider
 {
     // Named pipe to the Service UI endpoint. WNS is an accelerator; the Service owns sync.
     private const string PipeName = "ControlParental.UI";
     private const int ConnectTimeoutMs = 5000;
 
-    private readonly string supabaseUrl;
-    private readonly string supabaseKey;
+    private readonly IUIChannel uiChannel;
+    private readonly IDisposable? ownedChannel;
     private readonly Func<string, CancellationToken, Task>? sendTriggerSyncOverride;
     private readonly CancellationTokenSource cts;
     private bool disposed;
@@ -58,13 +57,26 @@ public sealed class WnsPushNotificationHandler : IDisposable
     /// <summary>
     /// Initializes a new instance of the <see cref="WnsPushNotificationHandler"/> class.
     /// </summary>
-    /// <param name="supabaseUrl">Supabase project URL.</param>
-    /// <param name="supabaseKey">Supabase anon key.</param>
+    /// <param name="uiChannel">Typed channel to the Service.</param>
+    public WnsPushNotificationHandler(IUIChannel uiChannel)
+    {
+        this.uiChannel = uiChannel ?? throw new ArgumentNullException(nameof(uiChannel));
+        this.cts = new CancellationTokenSource();
+    }
+
+    /// <summary>
+    /// Compatibility constructor for callers that have not yet resolved the UI channel.
+    /// Registration authority remains exclusively in the Service.
+    /// </summary>
+    /// <param name="supabaseUrl">Obsolete and ignored.</param>
+    /// <param name="supabaseKey">Obsolete and ignored.</param>
     /// <param name="sendTriggerSyncOverride">Optional test seam for the IPC send.</param>
     public WnsPushNotificationHandler(string supabaseUrl, string supabaseKey, Func<string, CancellationToken, Task>? sendTriggerSyncOverride = null)
     {
-        this.supabaseUrl = supabaseUrl ?? throw new ArgumentNullException(nameof(supabaseUrl));
-        this.supabaseKey = supabaseKey ?? throw new ArgumentNullException(nameof(supabaseKey));
+        _ = supabaseUrl ?? throw new ArgumentNullException(nameof(supabaseUrl));
+        _ = supabaseKey ?? throw new ArgumentNullException(nameof(supabaseKey));
+        this.uiChannel = new NamedPipeUIChannel();
+        this.ownedChannel = this.uiChannel as IDisposable;
         this.sendTriggerSyncOverride = sendTriggerSyncOverride;
         this.cts = new CancellationTokenSource();
     }
@@ -133,7 +145,7 @@ public sealed class WnsPushNotificationHandler : IDisposable
                 }
 
                 channel = result.Channel;
-                Debug.WriteLine($"[WNS] Channel created: {channel.Uri}, expires {channel.ExpirationTime}");
+                Debug.WriteLine($"[WNS] Channel created, expires {channel.ExpirationTime}");
             }
             catch (Exception ex)
             {
@@ -211,6 +223,7 @@ public sealed class WnsPushNotificationHandler : IDisposable
         {
             this.cts.Cancel();
             this.cts.Dispose();
+            this.ownedChannel?.Dispose();
             this.disposed = true;
         }
     }
@@ -243,56 +256,81 @@ public sealed class WnsPushNotificationHandler : IDisposable
     }
 
     /// <summary>
-    /// Registers the WNS channel URI with the backend so it can send push notifications.
+    /// Registers the WNS channel URI through the Service's typed IPC contract.
     /// </summary>
-    private async Task RegisterChannelAsync(PushNotificationChannel channel, CancellationToken ct)
+    public Task<WnsRegistrationResult?> RegisterChannelAsync(
+        string channelUri,
+        DateTimeOffset expiresAt,
+        CancellationToken ct = default)
     {
+        var request = new RegisterWnsChannel(
+            Guid.NewGuid().ToString("N"),
+            channelUri,
+            "wns",
+            expiresAt);
+
+        return this.QueryRegistrationAsync(request, ct);
+    }
+
+    /// <summary>Creates one real WNS channel without registering or exposing its value.</summary>
+    public async Task<WnsChannelIntent?> CreateChannelAsync(CancellationToken cancellationToken = default)
+    {
+        if (!ApiInformation.IsApiContractPresent(
+            "Microsoft.Windows.PushNotifications.PushNotificationsContract", 1, 0))
+        {
+            return null;
+        }
+
+        var appIdText = Environment.GetEnvironmentVariable("WNS_AAD_APP_ID");
+        if (string.IsNullOrWhiteSpace(appIdText) || !Guid.TryParse(appIdText, out var appId))
+        {
+            return null;
+        }
+
         try
         {
+            PushNotificationManager.Default.Register();
+            var result = await PushNotificationManager.Default.CreateChannelAsync(appId)
+                .AsTask(cancellationToken)
+                .ConfigureAwait(false);
+            if (result.Status != PushNotificationChannelStatus.CompletedSuccess)
+            {
+                return null;
+            }
+
+            var channel = result.Channel;
             var expiresAt = WnsChannelPlanner.ResolveExpiration(
-                DateTimeOffset.UtcNow, channel.ExpirationTime != DateTime.MinValue ? DateTimeOffset.FromFileTime(channel.ExpirationTime.ToFileTime()) : (DateTimeOffset?)null);
-
-            var url = $"{this.supabaseUrl}/rest/v1/device_push_tokens";
-            var payload = new WnsChannelRegistration
-            {
-                Channel = "wns",
-                PushHandle = channel.Uri.ToString(),
-                ExpiresAt = expiresAt.ToString("O", CultureInfo.InvariantCulture),
-            };
-
-            using var httpClient = new HttpClient();
-            HttpRequestMessage? request = null;
-            try
-            {
-                request = new HttpRequestMessage(HttpMethod.Post, url);
-
-                // T19/E5: serialize via the source-generated WnsJsonContext
-                // instead of reflection-based JsonContent.Create(payload).
-                request.Content = JsonContent.Create(payload, WnsJsonContext.Default.WnsChannelRegistration);
-                request.Headers.Add("apikey", this.supabaseKey);
-                request.Headers.Add("Authorization", $"Bearer {this.supabaseKey}");
-                request.Headers.Add("Prefer", "resolution=merge-duplicates");
-
-                var response = await httpClient.SendAsync(request, ct).ConfigureAwait(false);
-                if (response.IsSuccessStatusCode)
-                {
-                    Debug.WriteLine($"[WNS] Channel registered with backend (expires {expiresAt:O})");
-                }
-                else
-                {
-                    var error = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    Debug.WriteLine($"[WNS] Channel registration failed: {response.StatusCode} {error}");
-                }
-            }
-            finally
-            {
-                request?.Dispose();
-            }
+                DateTimeOffset.UtcNow,
+                channel.ExpirationTime != DateTime.MinValue
+                    ? DateTimeOffset.FromFileTime(channel.ExpirationTime.ToFileTime())
+                    : null);
+            return new WnsChannelIntent(channel.Uri.ToString(), expiresAt);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException)
         {
-            Debug.WriteLine($"[WNS] Could not register channel with backend: {ex.Message}");
+            throw;
         }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private Task<WnsRegistrationResult?> RegisterChannelAsync(PushNotificationChannel channel, CancellationToken ct)
+    {
+        var expiresAt = WnsChannelPlanner.ResolveExpiration(
+            DateTimeOffset.UtcNow,
+            channel.ExpirationTime != DateTime.MinValue ? DateTimeOffset.FromFileTime(channel.ExpirationTime.ToFileTime()) : null);
+
+        return this.RegisterChannelAsync(channel.Uri.ToString(), expiresAt, ct);
+    }
+
+    private async Task<WnsRegistrationResult?> QueryRegistrationAsync(
+        RegisterWnsChannel request,
+        CancellationToken ct)
+    {
+        return await this.uiChannel.QueryAsync<RegisterWnsChannel, WnsRegistrationResult>(request, ct)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -355,7 +393,7 @@ public sealed class WnsPushNotificationHandler : IDisposable
 
             this.activeChannel = result.Channel;
             await this.RegisterChannelAsync(result.Channel, this.cts.Token).ConfigureAwait(false);
-            Debug.WriteLine($"[WNS] Channel renewed: {result.Channel.Uri}");
+            Debug.WriteLine("[WNS] Channel renewed");
         }
         catch (Exception ex)
         {
@@ -378,7 +416,9 @@ public sealed class WnsPushNotificationHandler : IDisposable
             var message = new TriggerSync();
 
             // T26/E5: use the source-generated JSON catalogue instead of reflection.
-            var json = JsonSerializer.Serialize(message, UIMessagesJsonContext.Default.TriggerSync);
+            var json = JsonSerializer.Serialize(
+                message,
+                ControlParental.Domain.UIMessagesJsonContext.Default.TriggerSync);
 
             if (this.sendTriggerSyncOverride != null)
             {

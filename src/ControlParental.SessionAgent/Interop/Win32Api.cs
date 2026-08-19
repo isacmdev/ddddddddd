@@ -193,6 +193,9 @@ internal static class Win32Api
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern ushort RegisterClassEx(ref WNDCLASSEX lpWndClass);
 
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool UnregisterClass(string lpClassName, IntPtr hInstance);
+
     // ── Message box ──────────────────────────────────────────────────
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -233,6 +236,8 @@ internal static class Win32Api
     public const uint WM_SYSKEYDOWN = 0x0104;
 
     // SetWindowPos flags
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;

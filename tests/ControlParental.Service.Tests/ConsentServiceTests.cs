@@ -4,6 +4,7 @@
 
 namespace ControlParental.Service.Tests;
 
+using Microsoft.Data.Sqlite;
 using ControlParental.Domain;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
@@ -13,17 +14,28 @@ using Xunit;
 /// </summary>
 public class ConsentServiceTests : IDisposable
 {
+    private static readonly DateTimeOffset FixedNow = new(2032, 1, 2, 3, 4, 5, TimeSpan.Zero);
+
     private readonly ControlParentalDbContext dbContext;
+    private readonly SqliteConnection connection;
+    private readonly FakeTimeProvider timeProvider;
     private readonly ConsentService consentService;
+    private readonly TrackingDbContextFactory dbContextFactory;
 
     public ConsentServiceTests()
     {
+        this.connection = new SqliteConnection("Data Source=:memory:");
+        this.connection.Open();
+
         var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-            .UseInMemoryDatabase(databaseName: $"ConsentTest_{Guid.NewGuid():N}")
+            .UseSqlite(this.connection)
             .Options;
 
         this.dbContext = new ControlParentalDbContext(options);
-        this.consentService = new ConsentService(this.dbContext);
+        this.dbContext.Database.EnsureCreated();
+        this.timeProvider = new FakeTimeProvider(FixedNow);
+        this.dbContextFactory = new TrackingDbContextFactory(options);
+        this.consentService = new ConsentService(this.dbContextFactory, this.timeProvider);
     }
 
     [Fact]
@@ -47,7 +59,7 @@ public class ConsentServiceTests : IDisposable
         // Assert
         var result = await this.consentService.GetConsentStatusAsync();
         Assert.Equal(ConsentStatus.Granted, result.Status);
-        Assert.NotEqual(default, result.GrantedAt);
+        Assert.Equal(FixedNow, result.GrantedAt);
         Assert.Equal("local", result.GrantedByDeviceId);
     }
 
@@ -56,8 +68,7 @@ public class ConsentServiceTests : IDisposable
     {
         // Arrange - grant consent first time
         await this.consentService.GrantConsentAsync(null);
-        var firstGrant = await this.consentService.GetConsentStatusAsync();
-        await Task.Delay(10); // Ensure time difference
+        this.timeProvider.SetWallClockNow(FixedNow.AddMinutes(5));
 
         // Act - grant consent again
         await this.consentService.GrantConsentAsync("another-device");
@@ -65,7 +76,7 @@ public class ConsentServiceTests : IDisposable
         // Assert
         var result = await this.consentService.GetConsentStatusAsync();
         Assert.Equal(ConsentStatus.Granted, result.Status);
-        Assert.True(result.GrantedAt > firstGrant.GrantedAt);
+        Assert.Equal(FixedNow.AddMinutes(5), result.GrantedAt);
         Assert.Equal("another-device", result.GrantedByDeviceId);
     }
 
@@ -77,7 +88,7 @@ public class ConsentServiceTests : IDisposable
         {
             DeviceId = "local",
             Status = ConsentStatus.Granted,
-            GrantedAt = DateTimeOffset.UtcNow,
+            GrantedAt = FixedNow,
         });
         this.dbContext.SaveChanges();
 
@@ -97,5 +108,25 @@ public class ConsentServiceTests : IDisposable
     public void Dispose()
     {
         this.dbContext.Dispose();
+        this.connection.Dispose();
+    }
+
+    private sealed class FakeTimeProvider : ITimeProvider
+    {
+        public FakeTimeProvider(DateTimeOffset wallClock)
+        {
+            this.WallClockNow = wallClock;
+        }
+
+        public long MonotonicNow => 0;
+        public DateTimeOffset WallClockNow { get; private set; }
+        public TimeZoneInfo CurrentZone => TimeZoneInfo.Utc;
+        public DateOnly? ServerDate => DateOnly.FromDateTime(this.WallClockNow.UtcDateTime);
+        public bool IsServerDateUncertain => false;
+        public event EventHandler<TimeChangedEventArgs>? TimeChanged;
+        public void SetServerDate(long offsetMs) { }
+        public bool DetectClockJump() => false;
+
+        public void SetWallClockNow(DateTimeOffset now) => this.WallClockNow = now;
     }
 }

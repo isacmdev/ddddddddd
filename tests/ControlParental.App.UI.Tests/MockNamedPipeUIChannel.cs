@@ -167,8 +167,8 @@ public sealed class MockNamedPipeUIChannel : IUIChannel
 
     /// <inheritdoc />
     public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
-        where TQuery : ControlParental.App.UI.IUIMessage
-        where TResponse : class, ControlParental.App.UI.IUIMessage
+        where TQuery : ControlParental.Domain.IUIMessage
+        where TResponse : class, ControlParental.Domain.IUIMessage
     {
         if (query is ControlParental.App.UI.GetOnboardingState)
         {
@@ -250,20 +250,20 @@ public sealed class MockNamedPipeUIChannel : IUIChannel
 
     /// <inheritdoc />
     public Task SendAsync<T>(T message, CancellationToken ct = default)
-        where T : ControlParental.App.UI.IUIMessage
+        where T : ControlParental.Domain.IUIMessage
     {
         this.sentMessages.Enqueue(message!);
         return Task.CompletedTask;
     }
 
-    private static ControlParental.App.UI.IUIMessage AsUIMessage<T>(T message)
-        where T : ControlParental.App.UI.IUIMessage
+    private static ControlParental.Domain.IUIMessage AsUIMessage<T>(T message)
+        where T : ControlParental.Domain.IUIMessage
     {
         return message!;
     }
 
     private static object AsAppUIMessage<T>(T message)
-        where T : ControlParental.App.UI.IUIMessage
+        where T : ControlParental.Domain.IUIMessage
     {
         return message!;
     }

@@ -4,6 +4,8 @@
 
 namespace ControlParental.SessionAgent;
 
+using ControlParental.Domain;
+
 /// <summary>
 /// T05 — Watches for foreground app changes in the child's session.
 /// Emits ForegroundChanged(appId) when the foreground app changes.
@@ -14,6 +16,13 @@ public interface IForegroundWatcher
     /// Gets the AppId of the current foreground app.
     /// </summary>
     string? CurrentAppId { get; }
+
+    ObservedProcessTarget? CurrentTarget => null;
+
+    ObservedProcessTarget? GetCurrentTarget(string appId) =>
+        string.Equals(this.CurrentAppId, appId, StringComparison.Ordinal)
+            ? this.CurrentTarget
+            : null;
 
     /// <summary>
     /// Event raised when the foreground app changes.

@@ -170,6 +170,33 @@ public sealed class OnboardingViewModelIpcOwnershipTests
     }
 
     [Fact]
+    public async Task RetryAsyncRefreshesCanonicalSnapshotAfterFailedMutation()
+    {
+        // Arrange — the first mutate round-trip fails on the advance boundary,
+        // leaving the visible surface on the last acknowledged snapshot.
+        var client = new FakeIpcOnboardingStateService();
+        var vm = new OnboardingViewModel(client);
+        await vm.InitializeAsync().ConfigureAwait(false);
+
+        client.FailNextWithUnavailable(count: 1);
+
+        await vm.GoNextCommand.ExecuteAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("pairing", vm.CurrentStep?.Id);
+        Assert.NotNull(vm.ErrorMessage);
+
+        // The Service later acknowledges the canonical state; retry must read it.
+        await client.AdvanceOnboardingStepAsync().ConfigureAwait(false);
+
+        // Act
+        await vm.RetryCommand.ExecuteAsync(CancellationToken.None).ConfigureAwait(false);
+
+        // Assert — surface refreshed only after the acknowledged read succeeds.
+        Assert.Null(vm.ErrorMessage);
+        Assert.NotNull(vm.CurrentStep);
+        Assert.Equal("consent", vm.CurrentStep!.Id);
+    }
+
+    [Fact]
     public async Task InitializeAsyncWhenStateIsAbandonedLoadsLastStep()
     {
         // Arrange — Service reports an abandoned state with all steps still

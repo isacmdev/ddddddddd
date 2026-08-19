@@ -8,7 +8,6 @@ using System.IO.Pipes;
 using System.Security.AccessControl;
 using ControlParental.Domain;
 using System.Security.Principal;
-using System.Text;
 using System.Text.Json;
 
 /// <summary>
@@ -19,11 +18,17 @@ using System.Text.Json;
 public sealed class NamedPipeServer : IIpcChannel, IDisposable
 {
     private const string PipeNamePrefix = "ControlParental";
-    private const int BufferSize = 65536;
+    internal const int BufferSize = 8192;
+    internal const int MaxNativePipeBufferSize = 65535;
+    internal const int PipeInstances = NamedPipeServerStream.MaxAllowedServerInstances;
     private readonly string pipeName;
     private readonly SecurityIdentifier childSid;
     private readonly Func<string, bool> validateClientSid;
+    private readonly int sessionId;
     private readonly CancellationTokenSource internalCts;
+    private readonly Func<CancellationToken, Task<IServicePipeConnection>> pipeFactory;
+    private readonly Func<IServicePipeConnection, Task<IReadOnlyList<string>?>>? authenticateClient;
+    private readonly Func<string?> signerProvider;
     private PipeServerListener? listenerTask;
     private bool disposed;
 
@@ -36,12 +41,29 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
     public NamedPipeServer(
         string pipeName,
         SecurityIdentifier childSid,
-        Func<string, bool> validateClientSid)
+        Func<string, bool> validateClientSid,
+        int sessionId = -1)
+        : this(pipeName, childSid, validateClientSid, sessionId, null, null, null)
+    {
+    }
+
+    internal NamedPipeServer(
+        string pipeName,
+        SecurityIdentifier childSid,
+        Func<string, bool> validateClientSid,
+        int sessionId,
+        Func<CancellationToken, Task<IServicePipeConnection>>? pipeFactory,
+        Func<IServicePipeConnection, Task<IReadOnlyList<string>?>>? authenticateClient,
+        Func<string?>? signerProvider)
     {
         this.pipeName = $"{PipeNamePrefix}.{pipeName}";
         this.childSid = childSid ?? throw new ArgumentNullException(nameof(childSid));
         this.validateClientSid = validateClientSid ?? throw new ArgumentNullException(nameof(validateClientSid));
+        this.sessionId = sessionId;
         this.internalCts = new CancellationTokenSource();
+        this.pipeFactory = pipeFactory ?? this.CreatePipeAsync;
+        this.authenticateClient = authenticateClient;
+        this.signerProvider = signerProvider ?? (() => AuthenticodeSigner.GetSigner(Environment.ProcessPath));
     }
 
     /// <inheritdoc />
@@ -64,11 +86,24 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             this.pipeName,
             this.childSid,
             this.validateClientSid,
+            this.sessionId,
             this.OnMessage,
             this.OnDisconnected,
-            linkedCts.Token);
+            linkedCts.Token,
+            this.pipeFactory,
+            this.authenticateClient,
+            this.signerProvider);
 
         await this.listenerTask.StartAsync();
+    }
+
+    private Task<IServicePipeConnection> CreatePipeAsync(CancellationToken cancellationToken)
+    {
+        var pipeSecurity = CreatePipeSecurity(this.childSid);
+        IServicePipeConnection pipe = new ServicePipeConnection(NamedPipeServerStreamAcl.Create(
+            this.pipeName, PipeDirection.InOut, PipeInstances, PipeTransmissionMode.Message,
+            PipeOptions.Asynchronous, BufferSize, BufferSize, pipeSecurity, HandleInheritability.None));
+        return Task.FromResult(pipe);
     }
 
     internal static PipeSecurity CreatePipeSecurity(SecurityIdentifier childSid)
@@ -151,15 +186,21 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
     /// <summary>
     /// Internal listener that accepts connections and handles message dispatch.
     /// </summary>
-    private sealed class PipeServerListener : IDisposable
+    internal sealed class PipeServerListener : IDisposable
     {
         private readonly string pipeName;
         private readonly SecurityIdentifier childSid;
         private readonly Func<string, bool> validateClientSid;
+        private readonly int sessionId;
         private readonly Action<IIpcMessage> onMessage;
         private readonly Action onDisconnected;
         private readonly CancellationToken cancellationToken;
-        private NamedPipeServerStream? pipeServer;
+        private readonly Func<CancellationToken, Task<IServicePipeConnection>> pipeFactory;
+        private readonly Func<IServicePipeConnection, Task<IReadOnlyList<string>?>>? authenticateClient;
+        private readonly Func<string?> signerProvider;
+        private IServicePipeConnection? pipeServer;
+        private ProcessIdentity? clientIdentity;
+        private readonly IpcPhaseTrace trace = new();
         private Task? listenerTask;
         private bool disposed;
 
@@ -167,16 +208,24 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             string pipeName,
             SecurityIdentifier childSid,
             Func<string, bool> validateClientSid,
+            int sessionId,
             Action<IIpcMessage> onMessage,
             Action onDisconnected,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Func<CancellationToken, Task<IServicePipeConnection>> pipeFactory,
+            Func<IServicePipeConnection, Task<IReadOnlyList<string>?>>? authenticateClient,
+            Func<string?> signerProvider)
         {
             this.pipeName = pipeName;
             this.childSid = childSid;
             this.validateClientSid = validateClientSid;
+            this.sessionId = sessionId;
             this.onMessage = onMessage;
             this.onDisconnected = onDisconnected;
             this.cancellationToken = cancellationToken;
+            this.pipeFactory = pipeFactory;
+            this.authenticateClient = authenticateClient;
+            this.signerProvider = signerProvider;
         }
 
         public bool IsConnected => this.pipeServer?.IsConnected ?? false;
@@ -187,31 +236,23 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             {
                 try
                 {
-                    var pipeSecurity = CreatePipeSecurity(this.childSid);
-                    this.pipeServer = NamedPipeServerStreamAcl.Create(
-                        this.pipeName,
-                        PipeDirection.InOut,
-                        255,
-                        PipeTransmissionMode.Message,
-                        PipeOptions.Asynchronous,
-                        inBufferSize: BufferSize,
-                        outBufferSize: BufferSize,
-                        pipeSecurity: pipeSecurity,
-                        inheritability: HandleInheritability.None);
-
+                    this.pipeServer = await this.pipeFactory(this.cancellationToken);
                     await this.pipeServer.WaitForConnectionAsync(this.cancellationToken);
+                    this.trace.Record(IpcPhase.Connected);
 
-                    // Validate the client SID
-                    if (!this.ValidateClient())
+                    var initialFrames = await (this.authenticateClient?.Invoke(this.pipeServer)
+                        ?? this.AuthenticateClientAsync());
+                    if (initialFrames is null)
                     {
-                        this.pipeServer.Close();
-                        this.pipeServer.Dispose();
+                        this.ClosePipe();
                         this.pipeServer = null;
                         continue;
                     }
 
-                    // Start reading messages in a background task
-                    _ = this.ReadMessagesAsync();
+                    await this.SendHandshakeAsync();
+                    await this.ReadMessagesAsync(initialFrames);
+                    this.ClosePipe();
+                    this.pipeServer = null;
                 }
                 catch (OperationCanceledException)
                 {
@@ -241,17 +282,20 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 return;
             }
 
-            var json = JsonSerializer.Serialize(message);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await this.pipeServer.WriteAsync(bytes, cancellationToken);
+            var frame = IpcFrameCodec.Encode(JsonSerializer.Serialize(message));
+            await this.writeGate.WaitAsync(cancellationToken);
+            try { await this.pipeServer.WriteAsync(frame, cancellationToken); }
+            finally { this.writeGate.Release(); }
         }
 
-        private async Task ReadMessagesAsync()
+        private async Task ReadMessagesAsync(IReadOnlyList<string> initialFrames)
         {
             var buffer = new byte[BufferSize];
+            var decoder = new IpcFrameCodec.Decoder();
 
             try
             {
+                this.Dispatch(initialFrames);
                 while (this.pipeServer?.IsConnected ?? false)
                 {
                     var bytesRead = await this.pipeServer.ReadAsync(buffer, this.cancellationToken);
@@ -261,12 +305,10 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                         break;
                     }
 
-                    var json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    var message = this.DeserializeMessage(json);
-
-                    if (message != null)
+                    foreach (var json in decoder.Append(buffer.AsSpan(0, bytesRead)))
                     {
-                        this.onMessage(message);
+                        var message = this.DeserializeMessage(json);
+                        if (message != null) this.onMessage(message);
                     }
                 }
             }
@@ -282,41 +324,81 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             this.onDisconnected();
         }
 
-        private bool ValidateClient()
+        private async Task<IReadOnlyList<string>?> AuthenticateClientAsync()
         {
             if (this.pipeServer == null)
             {
-                return false;
+                return null;
             }
 
             try
             {
-                var clientSid = this.pipeServer.GetImpersonationUserSid();
-                if (clientSid == null)
+                if (!GetNamedPipeClientProcessId(this.pipeServer.SafePipeHandle, out var clientPid) || clientPid == 0)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        "[NamedPipeServer] Could not get client SID.");
-                    return false;
+                    return null;
+                }
+                this.trace.Record(IpcPhase.ServerPid);
+                this.clientIdentity?.Dispose();
+                this.clientIdentity = AuthenticodeSigner.Open((int)clientPid);
+                this.trace.Record(IpcPhase.ProcessHandle);
+                this.trace.Record(IpcPhase.Path);
+                SecurityIdentifier? clientSid = null;
+                this.pipeServer.RunAsClient(() => clientSid = this.pipeServer!.GetImpersonationUserSid());
+                if (!ValidateClientSid(clientSid, this.validateClientSid))
+                {
+                    return null;
                 }
 
-                var sidString = clientSid.Value;
-                var isValid = ValidateClientSid(clientSid, this.validateClientSid);
-
-                if (!isValid)
+                if (this.sessionId >= 0 && this.clientIdentity.SessionId != this.sessionId)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[NamedPipeServer] Client SID '{sidString}' is not the target child user.");
+                    return null;
                 }
 
-                return isValid;
+                var expectedSigner = AuthenticodeSigner.GetSigner(Environment.ProcessPath);
+                var clientSigner = AuthenticodeSigner.GetSigner(this.clientIdentity, out _);
+                this.trace.Record(IpcPhase.AuthResult);
+                if (expectedSigner is null || !string.Equals(expectedSigner, clientSigner, StringComparison.OrdinalIgnoreCase)) return null;
+
+                var decoder = new IpcFrameCodec.Decoder();
+                while (true)
+                {
+                    var bytesRead = await this.pipeServer.ReadAsync(this.readBuffer, this.cancellationToken);
+                    if (bytesRead == 0) return null;
+                    var frames = decoder.Append(this.readBuffer.AsSpan(0, bytesRead));
+                    if (frames.Count == 0) continue;
+                    this.trace.Record(IpcPhase.ClientHelloRead);
+                    if (!IpcHandshake.TryParse(frames[0], out var handshake) ||
+                        !IpcHandshake.IsAuthorized(handshake, this.sessionId >= 0 ? this.sessionId : this.clientIdentity.SessionId, (int)clientPid, clientSigner)) return null;
+                    return frames.Skip(1).ToArray();
+                }
             }
-            catch (Exception ex)
+            catch
             {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[NamedPipeServer] Failed to validate client: {ex.Message}");
-                return false;
+                return null;
             }
         }
+
+        private void Dispatch(IEnumerable<string> frames)
+        {
+            foreach (var json in frames)
+            {
+                var message = this.DeserializeMessage(json);
+                if (message != null) this.onMessage(message);
+            }
+        }
+
+        private async Task SendHandshakeAsync()
+        {
+            var signer = this.signerProvider()
+                ?? throw new UnauthorizedAccessException("The Service image is not Authenticode trusted.");
+            var frame = IpcFrameCodec.Encode(IpcHandshake.Create(this.sessionId, Environment.ProcessId, signer));
+            await this.writeGate.WaitAsync(this.cancellationToken);
+            try { await this.pipeServer!.WriteAsync(frame, this.cancellationToken); }
+            finally { this.writeGate.Release(); }
+            this.trace.Record(IpcPhase.ServerHelloWrite);
+        }
+
+        private void ClosePipe() => this.pipeServer?.Dispose();
 
         private IIpcMessage? DeserializeMessage(string json)
         {
@@ -337,6 +419,7 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 {
                     nameof(ForegroundChanged) => JsonSerializer.Deserialize<ForegroundChanged>(json),
                     nameof(AgentHeartbeat) => JsonSerializer.Deserialize<AgentHeartbeat>(json),
+                    nameof(AgentCommandCompleted) => JsonSerializer.Deserialize<AgentCommandCompleted>(json),
                     nameof(StateSnapshot) => JsonSerializer.Deserialize<StateSnapshot>(json),
                     nameof(Pong) => JsonSerializer.Deserialize<Pong>(json),
                     nameof(GetUsageState) => JsonSerializer.Deserialize<GetUsageState>(json),
@@ -357,8 +440,42 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
             if (!this.disposed)
             {
                 this.pipeServer?.Dispose();
+                this.clientIdentity?.Dispose();
+                this.writeGate.Dispose();
                 this.disposed = true;
             }
         }
+
+        private readonly byte[] readBuffer = new byte[BufferSize];
+        private readonly SemaphoreSlim writeGate = new(1, 1);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeClientProcessId(
+            Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint processId);
+    }
+
+    internal interface IServicePipeConnection : IDisposable
+    {
+        bool IsConnected { get; }
+        Microsoft.Win32.SafeHandles.SafePipeHandle SafePipeHandle { get; }
+        Task WaitForConnectionAsync(CancellationToken cancellationToken);
+        Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
+        Task WriteAsync(byte[] buffer, CancellationToken cancellationToken);
+        void RunAsClient(Action action);
+        SecurityIdentifier GetImpersonationUserSid();
+    }
+
+    private sealed class ServicePipeConnection : IServicePipeConnection
+    {
+        private readonly NamedPipeServerStream pipe;
+        public ServicePipeConnection(NamedPipeServerStream pipe) => this.pipe = pipe;
+        public bool IsConnected => this.pipe.IsConnected;
+        public Microsoft.Win32.SafeHandles.SafePipeHandle SafePipeHandle => this.pipe.SafePipeHandle;
+        public Task WaitForConnectionAsync(CancellationToken token) => this.pipe.WaitForConnectionAsync(token);
+        public Task<int> ReadAsync(byte[] buffer, CancellationToken token) => this.pipe.ReadAsync(buffer, token).AsTask();
+        public Task WriteAsync(byte[] buffer, CancellationToken token) => this.pipe.WriteAsync(buffer, token).AsTask();
+        public void RunAsClient(Action action) => this.pipe.RunAsClient(() => action());
+        public SecurityIdentifier GetImpersonationUserSid() => this.pipe.GetImpersonationUserSid();
+        public void Dispose() => this.pipe.Dispose();
     }
 }

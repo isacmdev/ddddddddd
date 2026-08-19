@@ -7,6 +7,7 @@ namespace ControlParental.Service.Tests;
 using ControlParental.Domain;
 using Microsoft.Win32;
 using System.Security.Principal;
+using System.Security;
 using Xunit;
 
 /// <summary>
@@ -16,6 +17,24 @@ using Xunit;
 /// </summary>
 public class AclHardenerTests
 {
+    [Fact]
+    public async Task HardenRegistryKeyAsync_WhenRegistryBoundaryThrowsSecurityException_ReturnsFalse()
+    {
+        var previous = AclHardener.RegistryKeyOpener;
+        AclHardener.RegistryKeyOpener = (_, _) => throw new SecurityException("access denied");
+
+        try
+        {
+            var result = await new AclHardener().HardenRegistryKeyAsync("SYSTEM\\ControlParental");
+
+            Assert.False(result);
+        }
+        finally
+        {
+            AclHardener.RegistryKeyOpener = previous;
+        }
+    }
+
     [Fact]
     public async Task Hardening_HardenAgentFolderAsync_RepeatedApplication_IsSuccessful()
     {

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://controlparental.local/schemas/backend-identity-local-receipt.v1.json",
+  "title": "Backend identity deterministic local receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["Mode", "ContractVersion", "ExternalVerified", "PassedProbes", "EvidenceHash"],
+  "properties": {
+    "Mode": { "const": "local" },
+    "ContractVersion": { "const": 1 },
+    "ExternalVerified": { "const": false },
+    "PassedProbes": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9.-]{1,64}$" }
+    },
+    "EvidenceHash": { "type": "string", "pattern": "^[A-F0-9]{64}$" }
+  }
+}

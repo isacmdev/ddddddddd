@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "evidenceScope": "declared-target-matrix-cell",
+  "cell": "Windows 11 25H2 x64",
+  "matrixStatus": "passed-cell-1-of-3",
+  "externalVerified": false,
+  "environment": {
+    "edition": "Windows 11 Pro",
+    "displayVersion": "25H2",
+    "build": "26200.9168",
+    "architecture": "x64",
+    "interactiveSession": "console-active",
+    "developerMode": "enabled"
+  },
+  "driverSelection": {
+    "primary": {
+      "name": "WinAppDriver",
+      "version": "1.2.2009.02003",
+      "sha256": "ED39E7E1415C4E0AEBC4A821E39B200FF70DD6A2FEB2692214BB157051A91888",
+      "port": 4725,
+      "result": "failed-before-session",
+      "qualification": "Direct interactive startup printed the listening banner and Press ENTER prompt, then exited immediately; no readiness response or session was obtained. Nova fallback was permitted only after this recorded failure."
+    },
+    "fallback": {
+      "name": "NovaWindows2",
+      "appiumVersion": "3.6.0",
+      "driverVersion": "1.1.27",
+      "endpoint": "http://127.0.0.1:4731",
+      "ownership": "user-owned",
+      "result": "accepted"
+    },
+    "priorEvidencePaths": [
+      "C:\\Users\\Usuario\\AppData\\Local\\Temp\\ControlParental\\winappdriver-6.4-0c584c6cd2fe41f690e244539910ebfd"
+    ]
+  },
+  "immutableInputs": {
+    "productExeSha256": "6ADB97F6AB64CE85FC8BBE42EC65EA02B291BA1E106D323F39BDB14C44EF378B",
+    "e2eDllSha256": "DDEB40FCBCE7019DC8C01653B431472DC3E02111337ED67E86634A0CD3585A9F",
+    "runbookSha256": "59978441B4B5D37DABA2E779AEA2819117974645959049E5E591BC2BA915A467",
+    "scenarioSha256": "27A65449274101EB1FA92C956640C8093A996512057603A7B4A221BFEABDE450"
+  },
+  "result": {
+    "status": "passed",
+    "passed": 19,
+    "failed": 0,
+    "skipped": 0,
+    "durationSeconds": 7,
+    "processExitCode": 0,
+    "unchangedScenario": true,
+    "flow": "real App.UI->Service IPC",
+    "w3cSessionDelete": "passed",
+    "externalVerified": false
+  },
+  "evidence": {
+    "directory": "C:\\Users\\Usuario\\AppData\\Local\\Temp\\ControlParental\\e2e-evidence-win11-25H2-x64-20260814-172511878",
+    "files": [
+      { "name": "app-startup.log", "sizeBytes": 31504, "sha256": "C2FAA66DA65E8700C4175523FE92633F9CE7440A70A651D7E591417D2BA2AAB6" },
+      { "name": "page-source.xml", "sizeBytes": 9114, "sha256": "1E2248F4417282E0D6A322D31C6D76668F0BC38D51DDF7260DDF96E5EB930415" },
+      { "name": "registration.png", "sizeBytes": 28947, "sha256": "C0E901EF29CCC3612ACF1E11E53B6772B61907DEF53D24F8658445EB3111C75D" }
+    ],
+    "redaction": "PASS"
+  },
+  "cleanup": {
+    "appUiProcessCount": 0,
+    "port4725": "free",
+    "appium4731": "untouched",
+    "ownedRuntimeState": "cleaned"
+  },
+  "claimsExcluded": ["backend", "JWT", "RLS", "TLS endpoint", "WNS fan-out"],
+  "remainingMatrix": ["Windows 10 22H2 x64", "Windows 11 24H2 x64"]
+}

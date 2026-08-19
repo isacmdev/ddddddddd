@@ -22,6 +22,7 @@ public class SessionAgentHostTests
     private sealed class FakeIpcChannel : IIpcChannel
     {
         public bool IsConnected { get; private set; }
+        public bool ThrowOnSend { get; set; }
 
         public event Action? Disconnected;
         public event Action<IIpcMessage>? MessageReceived;
@@ -42,6 +43,11 @@ public class SessionAgentHostTests
 
         public Task SendAsync(IIpcMessage message, CancellationToken cancellationToken = default)
         {
+            if (this.ThrowOnSend)
+            {
+                throw new InvalidOperationException("send failed");
+            }
+
             this.SentMessages.Enqueue(message);
             return Task.CompletedTask;
         }
@@ -89,6 +95,7 @@ public class SessionAgentHostTests
     private sealed class FakeForegroundWatcher : IForegroundWatcher
     {
         public string? CurrentAppId { get; set; }
+        public bool StopCalled { get; private set; }
         public event Action<string>? ForegroundChanged;
 
         public Task StartAsync(CancellationToken cancellationToken = default)
@@ -98,7 +105,7 @@ public class SessionAgentHostTests
 
         public void Stop()
         {
-            // No-op
+            this.StopCalled = true;
         }
 
         public void SimulateForegroundChange(string appId)
@@ -118,7 +125,7 @@ public class SessionAgentHostTests
         var fakeOverlay = new FakeOverlayManager();
         var fakeWatcher = new FakeForegroundWatcher();
 
-        var host = new SessionAgentHostForTest(fakeIpc, fakeOverlay, fakeWatcher);
+        var host = new SessionAgentHost(fakeIpc, fakeOverlay, fakeWatcher);
 
         // Start the host (which will subscribe to foreground changes)
         var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
@@ -208,7 +215,7 @@ public class SessionAgentHostTests
         var fakeOverlay = new FakeOverlayManager();
         var fakeWatcher = new FakeForegroundWatcher();
 
-        var host = new SessionAgentHostForTest(fakeIpc, fakeOverlay, fakeWatcher);
+        var host = new SessionAgentHost(fakeIpc, fakeOverlay, fakeWatcher);
 
         var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
         var hostTask = host.StartAsync(cts.Token);
@@ -218,8 +225,37 @@ public class SessionAgentHostTests
         // Act
         await host.StopAsync(CancellationToken.None);
 
-        // Assert — no exception, host stopped cleanly
-        Assert.True(true);
+        Assert.True(fakeWatcher.StopCalled);
+        Assert.False(fakeIpc.IsConnected);
+    }
+
+    [Fact]
+    public async Task CorrelatedOverlayCommandReturnsExactResultAndAuthorityHeartbeat()
+    {
+        var ipc = new FakeIpcChannel();
+        var overlay = new FakeOverlayManager();
+        var watcher = new FakeForegroundWatcher();
+        var host = new SessionAgentHost(ipc, overlay, watcher);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await host.StartAsync(cts.Token);
+        await Task.Delay(30);
+
+        ipc.SimulateMessageReceived(new AgentAuthority(4, 7));
+        var envelope = new AgentCommandEnvelope(
+            Guid.NewGuid(), 4, 7, 11, AgentCommandKind.ShowOverlay,
+            DateTimeOffset.UtcNow.AddSeconds(1), new OverlayIntent(true, "limit", "Ask", 11));
+        ipc.SimulateMessageReceived(new AgentCommandRequest(envelope));
+        await Task.Delay(50);
+
+        var heartbeat = Assert.Single(ipc.SentMessages.OfType<AgentHeartbeat>().Where(x => x.ConnectionGeneration == 7));
+        Assert.Equal(4, heartbeat.SessionId);
+        var completed = Assert.Single(ipc.SentMessages.OfType<AgentCommandCompleted>());
+        Assert.Equal(envelope.CommandId, completed.Result.CommandId);
+        Assert.Equal((4, 7L, 11L, ActionStatus.Confirmed),
+            (completed.Result.SessionId, completed.Result.ConnectionGeneration, completed.Result.IntentVersion, completed.Result.Status));
+        Assert.True(overlay.IsOverlayVisible);
+
+        await host.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -245,6 +281,32 @@ public class SessionAgentHostTests
 
         // Assert
         Assert.Equal(1, disconnectedCount);
+    }
+
+    [Fact]
+    public async Task SessionAgentHost_ForegroundChanged_SwallowsSendFailures()
+    {
+        // Arrange
+        var fakeIpc = new FakeIpcChannel { ThrowOnSend = true };
+        var fakeOverlay = new FakeOverlayManager();
+        var fakeWatcher = new FakeForegroundWatcher();
+
+        var host = new SessionAgentHost(fakeIpc, fakeOverlay, fakeWatcher);
+
+        var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        _ = host.StartAsync(cts.Token);
+
+        await Task.Delay(50);
+
+        // Act — the production host should swallow the IPC send failure
+        fakeWatcher.SimulateForegroundChange("chrome.exe|hash123");
+
+        await Task.Delay(50);
+
+        // Assert
+        Assert.Empty(fakeIpc.SentMessages);
+
+        await host.StopAsync(CancellationToken.None);
     }
 
     // ── Testable SessionAgentHost ──────────────────────────────────
