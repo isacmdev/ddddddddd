@@ -4,12 +4,13 @@
 
 | Field | Value |
 |---|---|
-| Estimated changed lines | 1,300–1,700 additions/deletions; measured B2 test file alone is 446 lines |
+| Estimated changed lines | 1,300–1,700 additions/deletions; task 2.2 is 520–700 touched CODE+TEST lines |
 | 400-line budget risk | High |
 | Chained PRs recommended | Yes |
 | Suggested split | PR1A claim admission; PR1B1 completion/failure; PR1B2a recovery; PR1B2b bridge; PR1C schema; PR2 coordinator/REST; PR3 reconciliation/backup; PR4 evidence |
-| Delivery strategy | auto-chain |
-| Chain strategy | feature-branch-chain; no size exception |
+| Delivery strategy | exception-ok within feature-branch-chain |
+| Chain strategy | feature-branch-chain |
+| Maintainer cap / exception | 800 touched CODE+TEST lines per work unit; `size:exception` accepted for 401–800; no further decision needed |
 
 Decision needed before apply: No
 Chained PRs recommended: Yes
@@ -18,7 +19,7 @@ Chain strategy: feature-branch-chain
 
 ## Governance / Closure Criterion
 
-The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure of those four tasks once the fresh current foundation-focused green gate passes. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and MUST NOT be fabricated; they are no longer blockers under this governance decision. This is not a size exception and does not relax strict TDD, feature-branch-chain, real-worktree, or ≤400-line requirements for post-baseline units.
+The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure of those four tasks once the fresh current foundation-focused green gate passes. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and MUST NOT be fabricated; they are no longer blockers under this governance decision. This does not relax strict TDD, feature-branch-chain, real-worktree, behavioral verification, or ≤800-line requirements for post-baseline units.
 
 **Current gate status (2026-08-19):** Foundation implementation evidence is green in the preserved apply history. The fresh combined foundation suite passed 28, the scheduler suite passed 89, and the Domain suite passed 97 after minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`. The four foundation checkboxes are now accepted and the formal count is **5/11**.
 
@@ -26,12 +27,13 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 
 | Unit | Goal | PR | Base / budget |
 |---|---|---|---|
-| 1.1A | Claim admission/fixture | PR1A | tracker; ≤400 lines |
-| 1.1B1 | Conditional completion/failure | PR1B1 | immediate PR1A; ≤400 lines |
-| 1.1B2a | Recovery/restart | PR1B2a | immediate PR1B1; ≤400 lines |
-| 1.1B2b | Bridge/integration | PR1B2b | immediate PR1B2a; ≤400 lines |
-| 1.2 | Schema adoption | PR1C | immediate PR1B2b; ≤400 lines |
-| 2–4 | Downstream behavior/evidence | PR2–PR4 | each immediate parent |
+| 1.1A | Claim admission/fixture | PR1A | tracker; ≤800 lines |
+| 1.1B1 | Conditional completion/failure | PR1B1 | immediate PR1A; ≤800 lines |
+| 1.1B2a | Recovery/restart | PR1B2a | immediate PR1B1; ≤800 lines |
+| 1.1B2b | Bridge/integration | PR1B2b | immediate PR1B2a; ≤800 lines |
+| 1.2 | Schema adoption | PR1C | immediate PR1B2b; ≤800 lines |
+| 2.2 | Coordinator/REST ownership | PR2 | immediate PR1C; 520–700 touched CODE+TEST lines; one autonomous unit, ≤800 |
+| 3–4 | Downstream behavior/evidence | PR3–PR4 | each immediate parent; ≤800 lines |
 
 ## Phase 1: Durable Foundation
 
@@ -44,7 +46,7 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 ## Phase 2: Delivery and Admission (PR2)
 
 - [x] 2.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `BackendClientTests.cs`, `BackendClientSingleRequestTests.cs`, and `AuthenticatedBackendClientTests.cs`; update `BackendClient.cs`/`IBackendClient.cs` for T10-B identity gating, idempotency, redacted outcomes, bounded transport retry, timeout, and cancellation.
-- [ ] 2.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `ScheduledWorkServiceTests.cs`, `ScheduledWorkServiceBackoffDecrementTests.cs`, `ScheduledWorkServiceAsyncDispatchTests.cs`, and `ScheduledWorkServiceIdentityTests.cs`; update `ScheduledWorkService.cs` for one owner, finite backoff/scans, connectivity, non-overlap, lifecycle, and shutdown bounds; remove bridge.
+- [x] 2.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `ScheduledWorkServiceTests.cs`, `ScheduledWorkServiceBackoffDecrementTests.cs`, `ScheduledWorkServiceAsyncDispatchTests.cs`, and `ScheduledWorkServiceIdentityTests.cs`; update `ScheduledWorkService.cs` for one owner, finite backoff/scans, connectivity, non-overlap, lifecycle, and shutdown bounds; remove bridge. Controlled replay evidence is green; cumulative task2.2 delta is 561 touched CODE+TEST lines, under the 800-line cap.
 
 ## Phase 3: Restart and Backup Composition (PR3)
 
@@ -53,5 +55,5 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 
 ## Phase 4: Final Verification (PR4)
 
-- [ ] 4.1 Require each child to have an immutable sequential patch or actual branch/commit diff with exhaustive no-double-count numstat; verify ≤400-line boundaries, security, complexity, concurrency, restart, cancellation, bounds, and branch evidence. Historical compile/corrective RED chronology exists in `apply-progress`; raw standalone RED is incomplete and remains a warning.
+- [ ] 4.1 Require each child to have an immutable sequential patch or actual branch/commit diff with exhaustive no-double-count numstat; verify ≤800-line boundaries, security, complexity, concurrency, restart, cancellation, bounds, and branch evidence. Historical compile/corrective RED chronology exists in `apply-progress`; raw standalone RED is incomplete and remains a warning.
 - [ ] 4.2 Report changed-scope line coverage >80% and final evidence; mark live backend, unsupported Windows matrix, SDD5, SDD7, and SDD8 pending—no fabricated runtime claims.

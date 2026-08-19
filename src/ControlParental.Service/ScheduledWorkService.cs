@@ -53,6 +53,15 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     /// </summary>
     public const int ShutdownBudgetSeconds = 30;
 
+    /// <summary>Maximum number of durable entries admitted by one scan.</summary>
+    public const int OutboxBatchSize = 100;
+
+    /// <summary>Lease duration for one durable delivery attempt.</summary>
+    public const int OutboxLeaseSeconds = 30;
+
+    /// <summary>Maximum coordinator attempts before durable dead-lettering.</summary>
+    public const int MaxOutboxAttempts = 3;
+
     // ── Dependencies ────────────────────────────────────────────────
 
     private readonly IBackendClient backendClient;
@@ -293,33 +302,49 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         this.TryDispatchScheduledWork(WorkType.PolicySync, this.ExecutePolicySyncAsync);
     }
 
-    private void TryDispatchWork(WorkType workType, Func<Task> work)
+    private Task TryDispatchWork(WorkType workType, Func<Task> work)
     {
-        this.TryDispatchWorkCore(workType, _ => work());
+        return this.TryDispatchWorkCore(workType, _ => work());
     }
 
-    private void TryDispatchScheduledWork(
+    private Task TryDispatchScheduledWork(
         WorkType workType,
-        Func<CancellationToken, Task> work)
+        Func<CancellationToken, Task> work,
+        CancellationToken requestedCancellation = default,
+        bool allowWhenStopped = false)
     {
-        this.TryDispatchWorkCore(workType, work);
+        return this.TryDispatchWorkCore(
+            workType,
+            work,
+            requestedCancellation,
+            allowWhenStopped);
     }
 
-    private void TryDispatchWorkCore(
+    private Task TryDispatchWorkCore(
         WorkType workType,
-        Func<CancellationToken, Task> work)
+        Func<CancellationToken, Task> work,
+        CancellationToken requestedCancellation = default,
+        bool allowWhenStopped = false)
     {
         TaskCompletionSource completion;
         CancellationToken cancellationToken;
+        var propagateCallerCancellation = requestedCancellation.CanBeCanceled;
 
         lock (this.lockObj)
         {
-            if (!this.isRunning || this.disposed || this.inFlightWork.ContainsKey(workType))
+            if ((!this.isRunning && !allowWhenStopped) || this.disposed)
             {
-                return;
+                return Task.CompletedTask;
             }
 
-            cancellationToken = this.workCancellation?.Token ?? CancellationToken.None;
+            if (this.inFlightWork.TryGetValue(workType, out var existing))
+            {
+                return existing;
+            }
+
+            cancellationToken = requestedCancellation.CanBeCanceled
+                ? requestedCancellation
+                : this.workCancellation?.Token ?? CancellationToken.None;
             completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             this.inFlightWork.Add(workType, completion.Task);
         }
@@ -331,10 +356,15 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 {
                     await work(cancellationToken).ConfigureAwait(false);
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException ex)
+                    when (propagateCallerCancellation && requestedCancellation.IsCancellationRequested)
+                {
+                    completion.TrySetException(ex);
+                }
+                catch (Exception)
                 {
                     System.Diagnostics.Debug.WriteLine(
-                        $"[ScheduledWorkService] {workType} error: {ex.Message}");
+                        $"[ScheduledWorkService] {workType} failed.");
                 }
                 finally
                 {
@@ -351,6 +381,8 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 }
             },
             CancellationToken.None);
+
+        return completion.Task;
     }
 
     // ── Work Execution ────────────────────────────────────────────
@@ -405,9 +437,14 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         }
     }
 
-    private async Task ExecuteOutboxPushAsync(CancellationToken cancellationToken = default)
+    internal async Task ExecuteOutboxPushAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (!this.HasDefinitiveIdentity())
+        {
+            return;
+        }
 
         if (!IsNetworkAvailable())
         {
@@ -417,7 +454,11 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        var pending = await this.outboxManager.GetPendingEntriesAsync(100, cancellationToken);
+        await this.outboxManager.RecoverExpiredClaimsAsync(cancellationToken);
+        var pending = await this.outboxManager.ClaimAsync(
+            OutboxBatchSize,
+            TimeSpan.FromSeconds(OutboxLeaseSeconds),
+            cancellationToken);
 
         if (pending.Count == 0)
         {
@@ -425,167 +466,87 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
             return;
         }
 
-        // Group by table name
-        var usageLogs = new List<UsageLogEntry>();
-        var deviceAlerts = new List<DeviceAlertEntry>();
-        var behavioralEvents = new List<BehavioralEventEntry>();
-        var timeRequests = new List<TimeRequestEntry>();
-
+        var anyFailed = false;
         foreach (var entry in pending)
         {
             try
             {
-                var payload = JsonSerializer.Deserialize<object>(entry.PayloadJson, this.jsonOptions);
-                var dedupKey = entry.DedupKey;
-
-                switch (entry.TableName)
+                if (await this.DeliverOutboxEntryAsync(entry, cancellationToken))
                 {
-                    case "usage_logs":
-                        var usageEntry = JsonSerializer.Deserialize<UsageLogEntry>(entry.PayloadJson, this.jsonOptions);
-                        if (usageEntry != null)
-                        {
-                            usageLogs.Add(usageEntry);
-                        }
-                        break;
-
-                    case "device_alerts":
-                        var alertEntry = JsonSerializer.Deserialize<DeviceAlertEntry>(entry.PayloadJson, this.jsonOptions);
-                        if (alertEntry != null)
-                        {
-                            deviceAlerts.Add(alertEntry);
-                        }
-                        break;
-
-                    case "behavioral_events":
-                        var eventEntry = JsonSerializer.Deserialize<BehavioralEventEntry>(entry.PayloadJson, this.jsonOptions);
-                        if (eventEntry != null)
-                        {
-                            behavioralEvents.Add(eventEntry);
-                        }
-                        break;
-
-                    case "time_requests":
-                        var tr = JsonSerializer.Deserialize<TimeRequestEntry>(entry.PayloadJson, this.jsonOptions);
-                        if (tr != null)
-                        {
-                            timeRequests.Add(tr);
-                        }
-
-                        break;
-                }
-            }
-            catch (JsonException ex)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ScheduledWorkService] Failed to parse outbox entry {entry.Id}: {ex.Message}");
-                await this.outboxManager.MarkFailedAsync(entry.Id, ex.Message, cancellationToken);
-            }
-        }
-
-        var anyFailed = false;
-
-        // Push usage logs
-        if (usageLogs.Count > 0)
-        {
-            var result = await this.backendClient.PushUsageLogsAsync(usageLogs, cancellationToken);
-            if (result.Success)
-            {
-                foreach (var entry in pending.Where(e => e.TableName == "usage_logs"))
-                {
-                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
-                }
-            }
-            else
-            {
-                anyFailed = true;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ScheduledWorkService] Usage logs push failed: {result.ErrorMessage}");
-            }
-        }
-
-        // Push device alerts
-        if (deviceAlerts.Count > 0)
-        {
-            var result = await this.backendClient.PushDeviceAlertsAsync(deviceAlerts, cancellationToken);
-            if (result.Success)
-            {
-                foreach (var entry in pending.Where(e => e.TableName == "device_alerts"))
-                {
-                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
-                }
-            }
-            else
-            {
-                anyFailed = true;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ScheduledWorkService] Device alerts push failed: {result.ErrorMessage}");
-            }
-        }
-
-        // Push behavioral events
-        if (behavioralEvents.Count > 0)
-        {
-            var result = await this.backendClient.PushBehavioralEventsAsync(behavioralEvents, cancellationToken);
-            if (result.Success)
-            {
-                foreach (var entry in pending.Where(e => e.TableName == "behavioral_events"))
-                {
-                    await this.outboxManager.MarkSentAsync(entry.Id, cancellationToken);
-                }
-            }
-            else
-            {
-                anyFailed = true;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ScheduledWorkService] Behavioral events push failed: {result.ErrorMessage}");
-            }
-        }
-
-        // Push time requests
-        if (timeRequests.Count > 0)
-        {
-            // Build lookup: RequestId -> outbox entry Id
-            var timeRequestEntryIds = new Dictionary<string, int>();
-            foreach (var entry in pending.Where(e => e.TableName == "time_requests"))
-            {
-                var tr = JsonSerializer.Deserialize<TimeRequestEntry>(entry.PayloadJson, this.jsonOptions);
-                if (tr != null)
-                {
-                    timeRequestEntryIds[tr.RequestId] = entry.Id;
-                }
-            }
-
-            foreach (var tr in timeRequests)
-            {
-                var ok = await this.backendClient.CreateTimeRequestAsync(tr, cancellationToken);
-                if (ok)
-                {
-                    if (timeRequestEntryIds.TryGetValue(tr.RequestId, out var entryId))
-                    {
-                        await this.outboxManager.MarkSentAsync(entryId, cancellationToken);
-                    }
+                    await this.outboxManager.CompleteAsync(entry, cancellationToken);
                 }
                 else
                 {
                     anyFailed = true;
+                    await this.FailOutboxEntryAsync(entry, permanent: false, cancellationToken);
                 }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (JsonException)
+            {
+                anyFailed = true;
+                await this.FailOutboxEntryAsync(entry, permanent: true, cancellationToken);
+            }
+            catch (Exception)
+            {
+                anyFailed = true;
+                await this.FailOutboxEntryAsync(entry, permanent: false, cancellationToken);
             }
         }
 
         if (anyFailed)
         {
             this.ApplyBackoff(WorkType.OutboxPush);
-            foreach (var entry in pending)
-            {
-                await this.outboxManager.MarkFailedAsync(entry.Id, "Push failed", cancellationToken);
-            }
         }
         else
         {
             this.ResetBackoff(WorkType.OutboxPush);
-            System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Outbox push succeeded: {pending.Count} entries.");
         }
+    }
+
+    private async Task<bool> DeliverOutboxEntryAsync(OutboxEntry entry, CancellationToken cancellationToken)
+    {
+        switch (entry.TableName)
+        {
+            case "usage_logs":
+                var usage = JsonSerializer.Deserialize<UsageLogEntry>(entry.PayloadJson, this.jsonOptions)
+                    ?? throw new JsonException("Invalid usage payload.");
+                return (await this.backendClient.PushUsageLogsAsync(new[] { usage }, cancellationToken)).Success;
+            case "device_alerts":
+                var alert = JsonSerializer.Deserialize<DeviceAlertEntry>(entry.PayloadJson, this.jsonOptions)
+                    ?? throw new JsonException("Invalid alert payload.");
+                return (await this.backendClient.PushDeviceAlertsAsync(new[] { alert }, cancellationToken)).Success;
+            case "behavioral_events":
+                var behavioral = JsonSerializer.Deserialize<BehavioralEventEntry>(entry.PayloadJson, this.jsonOptions)
+                    ?? throw new JsonException("Invalid behavioral payload.");
+                return (await this.backendClient.PushBehavioralEventsAsync(new[] { behavioral }, cancellationToken)).Success;
+            case "time_requests":
+                var request = JsonSerializer.Deserialize<TimeRequestEntry>(entry.PayloadJson, this.jsonOptions)
+                    ?? throw new JsonException("Invalid time request payload.");
+                return await this.backendClient.CreateTimeRequestAsync(request, cancellationToken);
+            default:
+                throw new JsonException("Unsupported outbox table.");
+        }
+    }
+
+    private Task FailOutboxEntryAsync(
+        OutboxEntry entry,
+        bool permanent,
+        CancellationToken cancellationToken)
+    {
+        var nextEligibleAt = permanent
+            ? (DateTimeOffset?)null
+            : this.timeProvider.WallClockNow.AddSeconds(this.GetBackoffSeconds(WorkType.OutboxPush));
+        return this.outboxManager.FailAsync(
+            entry,
+            permanent ? "permanent" : "network",
+            nextEligibleAt,
+            permanent,
+            MaxOutboxAttempts,
+            cancellationToken);
     }
 
     internal async Task ExecuteReconciliationAsync(CancellationToken cancellationToken = default)
@@ -681,15 +642,30 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     /// <summary>
     /// Runs one scheduled operation directly for the Task Scheduler backup path.
     /// </summary>
-    internal Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default)
+    internal async Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default)
     {
-        return mode switch
+        cancellationToken.ThrowIfCancellationRequested();
+        var dispatch = mode switch
         {
-            BackupMode.Heartbeat => this.ExecuteHeartbeatAsync(cancellationToken),
-            BackupMode.Outbox => this.ExecuteOutboxPushAsync(cancellationToken),
-            BackupMode.Reconciliation => this.ExecuteReconciliationAsync(cancellationToken),
+            BackupMode.Heartbeat => this.TryDispatchScheduledWork(
+                WorkType.Heartbeat,
+                this.ExecuteHeartbeatAsync,
+                cancellationToken,
+                allowWhenStopped: true),
+            BackupMode.Outbox => this.TryDispatchScheduledWork(
+                WorkType.OutboxPush,
+                this.ExecuteOutboxPushAsync,
+                cancellationToken,
+                allowWhenStopped: true),
+            BackupMode.Reconciliation => this.TryDispatchScheduledWork(
+                WorkType.Reconciliation,
+                this.ExecuteReconciliationAsync,
+                cancellationToken,
+                allowWhenStopped: true),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown backup mode."),
         };
+
+        await dispatch.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // ── Backoff Logic ─────────────────────────────────────────────
@@ -747,6 +723,21 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
         }
     }
 
+    private int GetBackoffSeconds(WorkType workType)
+    {
+        lock (this.lockObj)
+        {
+            return this.backoffByWorkType.GetValueOrDefault(workType, InitialBackoffSeconds);
+        }
+    }
+
+    private bool HasDefinitiveIdentity()
+    {
+        var identity = this.identityCoordinator?.CurrentState;
+        return identity?.CanAuthorizeRemoteAccess == true
+            && !string.IsNullOrWhiteSpace(identity.DeviceId);
+    }
+
     /// <summary>
     /// Gets the next eligible time for a work type (for testing).
     /// </summary>
@@ -791,10 +782,10 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                 }
             });
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"[ScheduledWorkService] Failed to register Task Scheduler tasks: {ex.Message}");
+                "[ScheduledWorkService] Task Scheduler registration failed.");
         }
     }
 

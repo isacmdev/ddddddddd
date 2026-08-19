@@ -773,14 +773,14 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     public async Task RunBackupAsync_WithOutboxMode_DispatchesAndReturns()
     {
         this.mockOutboxManager
-            .Setup(m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Setup(m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Array.Empty<OutboxEntry>());
 
         var task = this.service.RunBackupAsync(BackupMode.Outbox, CancellationToken.None);
         await task;
 
         this.mockOutboxManager.Verify(
-            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -790,13 +790,218 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         using var cts = new CancellationTokenSource();
 
         this.mockOutboxManager
-            .Setup(m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.Is<CancellationToken>(ct => ct == cts.Token)))
+            .Setup(m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.Is<CancellationToken>(ct => ct == cts.Token)))
             .ReturnsAsync(Array.Empty<OutboxEntry>());
 
         await this.service.RunBackupAsync(BackupMode.Outbox, cts.Token);
 
         this.mockOutboxManager.Verify(
-            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.Is<CancellationToken>(ct => ct == cts.Token)),
+            m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.Is<CancellationToken>(ct => ct == cts.Token)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_ClaimsAndCompletesEachDurableEntry()
+    {
+        var entry = new OutboxEntry
+        {
+            Id = 41,
+            TableName = "usage_logs",
+            PayloadJson = "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-41\"}",
+            DedupKey = "op-41",
+            OperationId = "op-41",
+            ClaimVersion = 2,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+
+        await this.service.StartAsync();
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        this.mockOutboxManager.Verify(
+            m => m.CompleteAsync(It.Is<OutboxEntry>(claimed => claimed.Id == entry.Id && claimed.OperationId == entry.OperationId), It.IsAny<CancellationToken>()),
+            Times.Once);
+        this.mockOutboxManager.Verify(
+            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockOutboxManager.Verify(
+            m => m.MarkSentAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_CancellationLeavesClaimForDurableRecovery()
+    {
+        var entry = new OutboxEntry
+        {
+            Id = 42,
+            TableName = "usage_logs",
+            PayloadJson = "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-42\"}",
+            DedupKey = "op-42",
+            OperationId = "op-42",
+            ClaimVersion = 1,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        using var cts = new CancellationTokenSource();
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IEnumerable<UsageLogEntry> _, CancellationToken token) =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return DataPushResult.Succeeded(1);
+            });
+
+        await this.service.StartAsync();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+
+        await this.service.Invoking(s => s.ExecuteOutboxPushAsync(cts.Token))
+            .Should().ThrowAsync<OperationCanceledException>();
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(It.IsAny<OutboxEntry>(), It.IsAny<string>(), It.IsAny<DateTimeOffset?>(), It.IsAny<bool>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunBackupAsync_WhenCallerIsCancelledInFlight_PropagatesCancellation()
+    {
+        var enteredBackend = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBackend = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        this.mockBackendClient
+            .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), It.Is<CancellationToken>(token => token == cts.Token)))
+            .Returns(async (HeartbeatData _, CancellationToken token) =>
+            {
+                enteredBackend.SetResult(true);
+                await releaseBackend.Task.WaitAsync(token);
+                return HeartbeatResult.Succeeded();
+            });
+
+        var backup = this.service.RunBackupAsync(BackupMode.Heartbeat, cts.Token);
+
+        try
+        {
+            await enteredBackend.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cts.Cancel();
+
+            var act = async () => await backup;
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            releaseBackend.TrySetResult(true);
+            try
+            {
+                await backup;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_DeliversAllSupportedEntryTypesIndependently()
+    {
+        var entries = new[]
+        {
+            CreateEntry(43, "device_alerts", "{\"eventType\":\"warning\",\"detectedAt\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-43\"}"),
+            CreateEntry(44, "behavioral_events", "{\"eventType\":\"blocked\",\"timestamp\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-44\"}"),
+            CreateEntry(45, "time_requests", "{\"requestId\":\"request-45\",\"minutes\":5,\"createdAt\":\"2026-07-23T12:00:00Z\"}"),
+        };
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(entries);
+        this.mockBackendClient
+            .Setup(c => c.PushDeviceAlertsAsync(It.IsAny<IEnumerable<DeviceAlertEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+        this.mockBackendClient
+            .Setup(c => c.PushBehavioralEventsAsync(It.IsAny<IEnumerable<BehavioralEventEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+        this.mockBackendClient
+            .Setup(c => c.CreateTimeRequestAsync(It.IsAny<TimeRequestEntry>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.CompleteAsync(It.IsAny<OutboxEntry>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_MalformedAndUnsupportedEntriesArePermanentFailures()
+    {
+        var entries = new[]
+        {
+            CreateEntry(46, "usage_logs", "not-json"),
+            CreateEntry(47, "unknown", "{}"),
+        };
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(entries);
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.IsAny<OutboxEntry>(),
+                "permanent",
+                null,
+                true,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+        this.mockBackendClient.Verify(
+            c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_DeliveryExceptionUsesSafeTransientFailure()
+    {
+        var entry = CreateEntry(
+            48,
+            "usage_logs",
+            "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-48\"}");
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("secret-token=must-not-leak"));
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.Is<OutboxEntry>(failed => failed.Id == entry.Id),
+                "network",
+                It.IsAny<DateTimeOffset?>(),
+                false,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -805,6 +1010,22 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     {
         ScheduledWorkService.ShutdownBudgetSeconds.Should().Be(30);
         ScheduledWorkService.ShutdownBudgetSeconds.Should().NotBe(ScheduledWorkService.MaxBackoffSeconds);
+    }
+
+    private static OutboxEntry CreateEntry(int id, string tableName, string payloadJson)
+    {
+        return new OutboxEntry
+        {
+            Id = id,
+            TableName = tableName,
+            PayloadJson = payloadJson,
+            DedupKey = $"op-{id}",
+            OperationId = $"op-{id}",
+            ClaimVersion = 1,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

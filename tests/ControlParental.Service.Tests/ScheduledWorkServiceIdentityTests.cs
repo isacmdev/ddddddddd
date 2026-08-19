@@ -112,6 +112,23 @@ public class ScheduledWorkServiceIdentityTests : IDisposable
             Times.Once);
     }
 
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_WhenIdentityIsUnavailable_SkipsDurableAdmission()
+    {
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<OutboxEntry>());
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockBackendClient.Verify(
+            c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
     private Task InvokeExecutePolicySyncAsync()
     {
         // T20/P1 — ExecutePolicySyncAsync was promoted from private to internal

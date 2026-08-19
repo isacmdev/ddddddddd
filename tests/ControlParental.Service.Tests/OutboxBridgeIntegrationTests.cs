@@ -195,7 +195,7 @@ public sealed class OutboxBridgeIntegrationTests : OutboxManagerTestFixture
             health.Object,
             new Mock<IServiceRecoveryManager>().Object,
             new Mock<IPolicyRepository>().Object,
-            identityCoordinator: new Mock<IBackendIdentityCoordinator>().Object);
+            identityCoordinator: CreateDefinitiveIdentityCoordinator());
         try
         {
             var method = typeof(ScheduledWorkService).GetMethod(
@@ -206,7 +206,7 @@ public sealed class OutboxBridgeIntegrationTests : OutboxManagerTestFixture
             var row = await verifyDb.Outbox.AsNoTracking().SingleAsync(item => item.DedupKey == "scheduler-failure");
             Assert.Equal(OutboxEntryStatus.Pending, row.Status);
             Assert.Equal(1, row.Attempts);
-            Assert.Equal("redacted-failure", row.SafeFailureCode);
+            Assert.Equal("network", row.SafeFailureCode);
             Assert.DoesNotContain("secret-token", row.LastError, StringComparison.Ordinal);
             Assert.NotNull(row.NextEligibleAt);
         }
@@ -214,5 +214,13 @@ public sealed class OutboxBridgeIntegrationTests : OutboxManagerTestFixture
         {
             scheduler.Dispose();
         }
+    }
+
+    private static IBackendIdentityCoordinator CreateDefinitiveIdentityCoordinator()
+    {
+        var identity = new Mock<IBackendIdentityCoordinator>();
+        identity.SetupGet(value => value.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
+        return identity.Object;
     }
 }
