@@ -31,7 +31,9 @@ public sealed class NativeAotPublishConfigurationTests
     private static string LocateRepoRoot()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current != null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
+        while (current != null &&
+               !Directory.Exists(Path.Combine(current.FullName, ".git")) &&
+               !File.Exists(Path.Combine(current.FullName, ".git")))
         {
             current = current.Parent;
         }
