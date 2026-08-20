@@ -159,6 +159,53 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     // ── IScheduledWorkService ──────────────────────────────────────
 
     /// <inheritdoc />
+    public async Task<SyncAdmissionResult> AdmitSyncAsync(
+        SyncTriggerSource source,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(source))
+        {
+            return SyncAdmissionResult.Rejected;
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return SyncAdmissionResult.Cancelled;
+        }
+
+        Task dispatch;
+        var coalesced = false;
+        lock (this.lockObj)
+        {
+            if (!this.isRunning || this.disposed)
+            {
+                return SyncAdmissionResult.Rejected;
+            }
+
+            if (this.inFlightWork.ContainsKey(WorkType.PolicySync))
+            {
+                coalesced = true;
+            }
+
+            dispatch = this.TryDispatchScheduledWork(
+                WorkType.PolicySync,
+                this.ExecutePolicySyncAsync);
+        }
+
+        try
+        {
+            await dispatch.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return coalesced
+                ? SyncAdmissionResult.Coalesced
+                : SyncAdmissionResult.Accepted;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return SyncAdmissionResult.Cancelled;
+        }
+    }
+
+    /// <inheritdoc />
     public bool IsRunning
     {
         get

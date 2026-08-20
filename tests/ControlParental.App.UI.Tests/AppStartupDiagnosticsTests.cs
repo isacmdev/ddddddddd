@@ -169,12 +169,6 @@ public sealed class AppStartupDiagnosticsTests
 
     private static string ReadAppUiFile(string fileName)
     {
-        var current = new DirectoryInfo(Path.GetDirectoryName(typeof(AppStartupDiagnosticsTests).Assembly.Location)!);
-        while (current is not null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return File.ReadAllText(Path.Combine(current!.FullName, "src", "ControlParental.App.UI", fileName));
+        return File.ReadAllText(Path.Combine(RepositoryRootLocator.Locate(typeof(AppStartupDiagnosticsTests)), "src", "ControlParental.App.UI", fileName));
     }
 }

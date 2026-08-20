@@ -465,7 +465,8 @@ public static class Program
                 sp.GetRequiredService<EnforcementLevelQueryHandler>(),
                 sp.GetRequiredService<IServiceScopeFactory>(),
                 sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<UIMessageHandler>>(),
-                sp.GetRequiredService<IWnsRegistrationCoordinator>()));
+                 sp.GetRequiredService<IWnsRegistrationCoordinator>(),
+                 sp.GetRequiredService<IScheduledWorkService>()));
         builder.Services.AddSingleton<NamedPipeUIServer>(sp =>
             new NamedPipeUIServer(
                 null,

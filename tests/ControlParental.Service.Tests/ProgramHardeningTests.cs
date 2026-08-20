@@ -324,6 +324,9 @@ public class ProgramHardeningTests
     {
         public bool IsRunning => true;
 
+        public Task<SyncAdmissionResult> AdmitSyncAsync(SyncTriggerSource source, CancellationToken cancellationToken = default) =>
+            Task.FromResult(SyncAdmissionResult.Accepted);
+
         public Task StartAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public Task StopAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
@@ -344,6 +347,12 @@ public class ProgramHardeningTests
         public List<(BackupMode Mode, CancellationToken Token)> Calls { get; } = new();
 
         public bool IsRunning => true;
+
+        public Task<SyncAdmissionResult> AdmitSyncAsync(SyncTriggerSource source, CancellationToken cancellationToken = default)
+        {
+            this.events?.Add("sync-admission");
+            return Task.FromResult(SyncAdmissionResult.Accepted);
+        }
 
         public Task StartAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 

@@ -15,7 +15,7 @@ public sealed class AppResourceCompositionTests
     [Fact]
     public void AppResources_MergeExactlyOneWinUiControlsResourcesBeforeApplicationResources()
     {
-        var app = XDocument.Load(Path.Combine(LocateRepoRoot(), "src", "ControlParental.App.UI", "App.xaml"));
+        var app = XDocument.Load(Path.Combine(RepositoryRootLocator.Locate(typeof(AppResourceCompositionTests)), "src", "ControlParental.App.UI", "App.xaml"));
         var resourceDictionary = app.Root!
             .Descendants()
             .Single(element => element.Name.LocalName == "ResourceDictionary");
@@ -34,14 +34,4 @@ public sealed class AppResourceCompositionTests
         Assert.Equal("ResourceDictionary.MergedDictionaries", firstResource.Name.LocalName);
     }
 
-    private static string LocateRepoRoot()
-    {
-        var current = new DirectoryInfo(Path.GetDirectoryName(typeof(AppResourceCompositionTests).Assembly.Location)!);
-        while (current is not null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return current?.FullName ?? throw new InvalidOperationException("Could not locate repository root.");
-    }
 }

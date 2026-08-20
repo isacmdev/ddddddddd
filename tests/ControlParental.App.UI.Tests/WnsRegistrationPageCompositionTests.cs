@@ -140,7 +140,7 @@ public sealed class WnsRegistrationPageCompositionTests
 
     private static string ReadAppUiFile(string fileName)
     {
-        var repoRoot = LocateRepoRoot();
+        var repoRoot = RepositoryRootLocator.Locate(typeof(WnsRegistrationPageCompositionTests));
         return File.ReadAllText(Path.Combine(repoRoot, "src", "ControlParental.App.UI", fileName));
     }
 
@@ -157,14 +157,4 @@ public sealed class WnsRegistrationPageCompositionTests
         return count;
     }
 
-    private static string LocateRepoRoot()
-    {
-        var current = new DirectoryInfo(Path.GetDirectoryName(typeof(WnsRegistrationPageCompositionTests).Assembly.Location)!);
-        while (current != null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return current?.FullName ?? throw new InvalidOperationException("Could not locate repository root (no .git ancestor).");
-    }
 }

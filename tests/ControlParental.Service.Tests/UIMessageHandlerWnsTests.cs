@@ -73,6 +73,33 @@ public sealed class UIMessageHandlerWnsTests : IDisposable
         coordinator.VerifyNoOtherCalls();
     }
 
+    [Fact]
+    public async Task AuthenticatedTriggerSync_IsAdmittedByScheduler_WithoutBackendAuthority()
+    {
+        var scheduler = new Mock<IScheduledWorkService>(MockBehavior.Strict);
+        scheduler
+            .Setup(x => x.AdmitSyncAsync(SyncTriggerSource.Wns, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SyncAdmissionResult.Accepted);
+        var handler = CreateHandler(new Mock<IWnsRegistrationCoordinator>().Object, scheduler.Object);
+
+        var result = Assert.IsType<StepCompletedResponse>(await handler.HandleAuthenticatedAsync(new TriggerSync()));
+
+        Assert.True(result.Success);
+        scheduler.Verify(x => x.AdmitSyncAsync(SyncTriggerSource.Wns, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task UnauthenticatedTriggerSync_IsRejectedWithoutSchedulerAdmission()
+    {
+        var scheduler = new Mock<IScheduledWorkService>(MockBehavior.Strict);
+        var handler = CreateHandler(new Mock<IWnsRegistrationCoordinator>().Object, scheduler.Object);
+
+        var result = Assert.IsType<StepCompletedResponse>(await handler.HandleAsync(new TriggerSync()));
+
+        Assert.False(result.Success);
+        scheduler.VerifyNoOtherCalls();
+    }
+
     [Theory]
     [InlineData(BackendIdentityPhase.Unpaired)]
     [InlineData(BackendIdentityPhase.PairingPending)]
@@ -249,13 +276,15 @@ public sealed class UIMessageHandlerWnsTests : IDisposable
         return new WnsRegistrationCoordinator(store, backend, identity.Object, new FixedTimeProvider(Now));
     }
 
-    private static UIMessageHandler CreateHandler(IWnsRegistrationCoordinator coordinator)
+    private static UIMessageHandler CreateHandler(
+        IWnsRegistrationCoordinator coordinator,
+        IScheduledWorkService? scheduler = null)
     {
         var services = new ServiceCollection().BuildServiceProvider();
         var monitor = new Mock<IEnforcementLevelMonitor>();
         monitor.SetupGet(x => x.CurrentIssues).Returns([]);
         var onboarding = new OnboardingStateService(Path.GetTempPath(), Mock.Of<IChildAccountStore>(), NullLogger<OnboardingStateService>.Instance);
-        return new UIMessageHandler(onboarding, new EnforcementLevelQueryHandler(monitor.Object), services.GetRequiredService<IServiceScopeFactory>(), NullLogger<UIMessageHandler>.Instance, coordinator);
+        return new UIMessageHandler(onboarding, new EnforcementLevelQueryHandler(monitor.Object), services.GetRequiredService<IServiceScopeFactory>(), NullLogger<UIMessageHandler>.Instance, coordinator, scheduler);
     }
 
     private static SecretStore CreateSecretStore(string path) => new(path, new PassThroughProtector(), new NoOpAccessPolicy());

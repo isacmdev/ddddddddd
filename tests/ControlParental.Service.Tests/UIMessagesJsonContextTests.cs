@@ -129,6 +129,7 @@ public sealed class UIMessagesJsonContextTests
             ("AccountList", new AccountList(new[] { new AccountInfo("alice", "Standard", true) }), UIMessagesJsonContext.Default.AccountList),
             ("AdvanceOnboardingStep", new AdvanceOnboardingStep(), UIMessagesJsonContext.Default.AdvanceOnboardingStep),
             ("ResetOnboardingState", new ResetOnboardingState("test reason"), UIMessagesJsonContext.Default.ResetOnboardingState),
+            ("TriggerSync", new TriggerSync(), UIMessagesJsonContext.Default.TriggerSync),
         };
 
         foreach (var (name, value, typeInfo) in samples)

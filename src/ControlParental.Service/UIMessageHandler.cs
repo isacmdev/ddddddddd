@@ -19,6 +19,7 @@ public sealed class UIMessageHandler
     private readonly IServiceScopeFactory scopeFactory;
     private readonly ILogger<UIMessageHandler> logger;
     private readonly IWnsRegistrationCoordinator? wnsRegistrationCoordinator;
+    private readonly IScheduledWorkService? scheduledWorkService;
     private Func<IIpcMessage, CancellationToken, Task>? sendToAgentAsync;
 
     public UIMessageHandler(
@@ -26,13 +27,15 @@ public sealed class UIMessageHandler
         EnforcementLevelQueryHandler enforcementLevelQueryHandler,
         IServiceScopeFactory scopeFactory,
         ILogger<UIMessageHandler> logger,
-        IWnsRegistrationCoordinator? wnsRegistrationCoordinator = null)
+        IWnsRegistrationCoordinator? wnsRegistrationCoordinator = null,
+        IScheduledWorkService? scheduledWorkService = null)
     {
         this.onboardingStateService = onboardingStateService;
         this.enforcementLevelQueryHandler = enforcementLevelQueryHandler;
         this.scopeFactory = scopeFactory;
         this.logger = logger;
         this.wnsRegistrationCoordinator = wnsRegistrationCoordinator;
+        this.scheduledWorkService = scheduledWorkService;
     }
 
     /// <summary>
@@ -123,6 +126,18 @@ public sealed class UIMessageHandler
                 }
 
                 return await this.wnsRegistrationCoordinator.RegisterAsync(register, ct).ConfigureAwait(false);
+
+            case TriggerSync:
+                if (!isAuthenticatedPipeClient || this.scheduledWorkService is null)
+                {
+                    return new StepCompletedResponse(false);
+                }
+
+                var admission = await this.scheduledWorkService
+                    .AdmitSyncAsync(SyncTriggerSource.Wns, ct)
+                    .ConfigureAwait(false);
+                return new StepCompletedResponse(
+                    admission is SyncAdmissionResult.Accepted or SyncAdmissionResult.Coalesced);
 
             default:
                 System.Diagnostics.Debug.WriteLine(

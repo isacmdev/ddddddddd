@@ -519,6 +519,183 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     }
 
     [Fact]
+    public async Task AdmitSyncAsync_DeniedIdentityThenLaterAdmissionConvergesAcrossAllSources()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Unpaired());
+
+        var denied = await this.service.AdmitSyncAsync(SyncTriggerSource.Wns);
+
+        Assert.Equal(SyncAdmissionResult.Accepted, denied);
+        this.mockPolicyRepository.Verify(
+            r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockPolicyRepository.Invocations.Clear();
+        this.mockBackendClient.Invocations.Clear();
+
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 2, "device-test"));
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return 0;
+            });
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(0, string.Empty));
+
+        var sources = new[]
+        {
+            SyncTriggerSource.Startup,
+            SyncTriggerSource.Wns,
+            SyncTriggerSource.Ui,
+            SyncTriggerSource.Timer,
+            SyncTriggerSource.Polling,
+        };
+        var admissions = sources.Select(source => this.service.AdmitSyncAsync(source)).ToArray();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        release.SetResult();
+        var results = await Task.WhenAll(admissions);
+
+        Assert.Equal(1, results.Count(result => result == SyncAdmissionResult.Accepted));
+        Assert.Equal(4, results.Count(result => result == SyncAdmissionResult.Coalesced));
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_CancelledRequestDoesNotStartPolicyWork()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var result = await this.service.AdmitSyncAsync(SyncTriggerSource.Ui, cts.Token);
+
+        Assert.Equal(SyncAdmissionResult.Cancelled, result);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_UnknownSourceIsRejected()
+    {
+        var result = await this.service.AdmitSyncAsync((SyncTriggerSource)99);
+
+        Assert.Equal(SyncAdmissionResult.Rejected, result);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_CallerCancellationOnlyCancelsThatWaiter()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return 0;
+            });
+
+        using var callerCancellation = new CancellationTokenSource();
+        var owner = this.service.AdmitSyncAsync(SyncTriggerSource.Wns, callerCancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var coalesced = this.service.AdmitSyncAsync(SyncTriggerSource.Ui);
+
+        callerCancellation.Cancel();
+        Assert.Equal(SyncAdmissionResult.Cancelled, await owner);
+
+        release.SetResult();
+        Assert.Equal(SyncAdmissionResult.Coalesced, await coalesced);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_ShutdownCancellationCancelsSharedWork()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        var workEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns((string _, CancellationToken token) =>
+            {
+                workEntered.TrySetResult();
+                return ObserveCancellationAsync(token, cancellationObserved);
+            });
+
+        var admission = this.service.AdmitSyncAsync(SyncTriggerSource.Timer);
+        await workEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await this.service.StopAsync();
+
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SyncAdmissionResult.Accepted, await admission);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_StoppedAndDisposedServiceRejectsAdmission()
+    {
+        Assert.Equal(
+            SyncAdmissionResult.Rejected,
+            await this.service.AdmitSyncAsync(SyncTriggerSource.Polling));
+
+        this.service.Dispose();
+        Assert.Equal(
+            SyncAdmissionResult.Rejected,
+            await this.service.AdmitSyncAsync(SyncTriggerSource.Polling));
+    }
+
+    private async Task StartWithoutStartupPolicySyncAsync()
+    {
+        var startupCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Callback(() => startupCompleted.TrySetResult())
+            .ReturnsAsync(PolicyFetchResult.Succeeded(0, string.Empty));
+        await this.service.StartAsync();
+        await startupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        this.mockBackendClient.Invocations.Clear();
+        this.mockPolicyRepository.Invocations.Clear();
+    }
+    private static async Task<int> ObserveCancellationAsync(
+        CancellationToken cancellationToken,
+        TaskCompletionSource cancellationObserved)
+    {
+        using var registration = cancellationToken.Register(() => cancellationObserved.TrySetResult());
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            cancellationObserved.TrySetResult();
+            throw;
+        }
+
+        return 0;
+    }
+    [Fact]
     public async Task ExecuteHeartbeatAsync_WhenCancelled_ThrowsOperationCanceledException()
     {
         await this.service.StartAsync();
