@@ -78,6 +78,24 @@ public class HostRegistrationTests
     }
 
     [Fact]
+    public void ProgramCs_RegistersDurableWnsCoordinatorAndReconciliation_ExactlyOnce()
+    {
+        string source = ReadProgramSource();
+
+        CountOccurrences(source, "AddSingleton<IWnsRegistrationCoordinator>(").Should().Be(1);
+        CountOccurrences(source, "AddHostedService<WnsRegistrationReconciliationService>();").Should().Be(1);
+    }
+
+    [Fact]
+    public void ProgramCs_DoesNotRegisterLegacyWnsOwners()
+    {
+        string source = ReadProgramSource();
+
+        source.Should().NotContain("AddSingleton<IPushNotificationService>");
+        source.Should().NotContain("AddHostedService<WnsNotificationServiceHostedAdapter>();");
+    }
+
+    [Fact]
     public void HostBuilder_DuplicateAddSingleton_ProducesTwoDescriptors()
     {
         // Behavior contract: if someone re-introduces the duplicate, this test

@@ -239,6 +239,96 @@ public sealed class UIMessageHandlerWnsTests : IDisposable
         restoredBackend.Verify(x => x.RegisterPushTokenAsync(ValidUri, "wns", Now.AddDays(1), It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    [Fact]
+    public async Task RestartReconcile_DoesNotReplayRevokedIntent()
+    {
+        var store = new MemoryStore();
+        var revokedBackend = Backend(false);
+        revokedBackend
+            .Setup(x => x.RegisterPushTokenAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PushTokenRegistrationResult.Failed("redacted", PushTokenRegistrationFailureKind.Revoked));
+
+        await Coordinator(store, revokedBackend.Object, definitive: true).RegisterAsync(Request("op-revoked"));
+
+        var restoredBackend = Backend(true);
+        var result = await Coordinator(store, restoredBackend.Object, definitive: true).ReconcileAsync();
+
+        Assert.Null(result);
+        restoredBackend.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task FailedIntentWrite_DoesNotPublishPhantom_AndSameOperationRetriesDurably()
+    {
+        var store = new FailingThenSucceedStore();
+        var backend = Backend(true);
+        var coordinator = Coordinator(store, backend.Object, definitive: true);
+
+        var first = await coordinator.RegisterAsync(Request("op-write"));
+
+        Assert.Equal(WnsRegistrationStatus.Denied, first.Status);
+        Assert.Null(await store.ReadAsync());
+
+        var retry = await coordinator.RegisterAsync(Request("op-write"));
+
+        Assert.Equal(WnsRegistrationStatus.Accepted, retry.Status);
+        Assert.Equal("op-write", (await store.ReadAsync())!.OperationId);
+        Assert.Equal(3, store.WriteCount);
+        backend.Verify(x => x.RegisterPushTokenAsync(ValidUri, "wns", Now.AddDays(1), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RestartReconcile_DeniedIntentCanBeReplacedByNewOperation()
+    {
+        var store = new MemoryStore();
+        var revokedBackend = Backend(false);
+        revokedBackend
+            .Setup(x => x.RegisterPushTokenAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PushTokenRegistrationResult.Failed("redacted", PushTokenRegistrationFailureKind.Revoked));
+
+        await Coordinator(store, revokedBackend.Object, definitive: true).RegisterAsync(Request("op-old"));
+
+        var acceptedBackend = Backend(true);
+        var restored = Coordinator(store, acceptedBackend.Object, definitive: true);
+
+        Assert.Null(await restored.ReconcileAsync());
+        var result = await restored.RegisterAsync(Request("op-new"));
+
+        Assert.Equal(WnsRegistrationStatus.Accepted, result.Status);
+        Assert.Equal("op-new", (await store.ReadAsync())!.OperationId);
+        acceptedBackend.Verify(x => x.RegisterPushTokenAsync(ValidUri, "wns", Now.AddDays(1), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RestartReconcile_DoesNotReplayAcceptedIntent()
+    {
+        var store = new MemoryStore();
+        var initialBackend = Backend(true);
+        await Coordinator(store, initialBackend.Object, definitive: true).RegisterAsync(Request("op-accepted"));
+
+        var restoredBackend = Backend(true);
+        Assert.Null(await Coordinator(store, restoredBackend.Object, definitive: true).ReconcileAsync());
+
+        restoredBackend.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task RestartReconcile_DoesNotSendPersistedExpiredIntent()
+    {
+        var store = new MemoryStore();
+        await store.WriteAsync(new WnsRegistrationIntent(
+            "op-expired",
+            ValidUri,
+            "wns",
+            Now.AddMinutes(-1),
+            WnsRegistrationStatus.PendingOffline));
+        var backend = Backend(true);
+
+        Assert.Null(await Coordinator(store, backend.Object, definitive: true).ReconcileAsync());
+
+        backend.VerifyNoOtherCalls();
+    }
+
     private static RegisterWnsChannel Request(string operationId) => new(operationId, ValidUri, "wns", Now.AddDays(1));
 
     private static Mock<IBackendClient> Backend(bool success, string error = "RemoteUnavailable")
@@ -304,6 +394,30 @@ public sealed class UIMessageHandlerWnsTests : IDisposable
         private WnsRegistrationIntent? value;
         public Task<WnsRegistrationIntent?> ReadAsync(CancellationToken cancellationToken = default) => Task.FromResult(this.value);
         public Task<bool> WriteAsync(WnsRegistrationIntent intent, CancellationToken cancellationToken = default) { this.value = intent; return Task.FromResult(true); }
+    }
+
+    private sealed class FailingThenSucceedStore : IWnsRegistrationIntentStore
+    {
+        private WnsRegistrationIntent? value;
+        private bool failNextWrite = true;
+
+        public int WriteCount { get; private set; }
+
+        public Task<WnsRegistrationIntent?> ReadAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult(this.value);
+
+        public Task<bool> WriteAsync(WnsRegistrationIntent intent, CancellationToken cancellationToken = default)
+        {
+            this.WriteCount++;
+            if (this.failNextWrite)
+            {
+                this.failNextWrite = false;
+                return Task.FromResult(false);
+            }
+
+            this.value = intent;
+            return Task.FromResult(true);
+        }
     }
 
     private sealed class PassThroughProtector : ICredentialProtector

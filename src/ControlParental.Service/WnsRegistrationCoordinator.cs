@@ -109,12 +109,18 @@ public sealed class WnsRegistrationCoordinator : IWnsRegistrationCoordinator
                     : Result(request.OperationId, WnsRegistrationStatus.Denied);
             }
 
-            this.latest = new(request.OperationId, request.ChannelUri, request.Channel, request.ExpiresAt, WnsRegistrationStatus.PendingOffline);
-            if (!await this.store.WriteAsync(this.latest, cancellationToken).ConfigureAwait(false))
+            var candidate = new WnsRegistrationIntent(
+                request.OperationId,
+                request.ChannelUri,
+                request.Channel,
+                request.ExpiresAt,
+                WnsRegistrationStatus.PendingOffline);
+            if (!await this.store.WriteAsync(candidate, cancellationToken).ConfigureAwait(false))
             {
                 return Result(request.OperationId, WnsRegistrationStatus.Denied);
             }
 
+            this.latest = candidate;
             return await this.SendLatestAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -129,7 +135,9 @@ public sealed class WnsRegistrationCoordinator : IWnsRegistrationCoordinator
         try
         {
             await this.LoadOnceAsync(cancellationToken).ConfigureAwait(false);
-            if (this.latest is null || this.latest.Status == WnsRegistrationStatus.Accepted || this.latest.ExpiresAt <= this.timeProvider.GetUtcNow())
+            if (this.latest is null ||
+                this.latest.Status is WnsRegistrationStatus.Accepted or WnsRegistrationStatus.Denied ||
+                this.latest.ExpiresAt <= this.timeProvider.GetUtcNow())
             {
                 return null;
             }

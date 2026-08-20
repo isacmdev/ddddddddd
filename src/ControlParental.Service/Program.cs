@@ -503,21 +503,6 @@ public static class Program
         });
         builder.Services.AddHostedService<ScheduledWorkServiceHostedAdapter>();
 
-        // T19: Register WNS push notification service
-        var wnsPackageSid = Environment.GetEnvironmentVariable("WNS_PACKAGE_SID") ?? string.Empty;
-        var wnsClientSecret = Environment.GetEnvironmentVariable("WNS_CLIENT_SECRET") ?? string.Empty;
-        var wnsConfig = new WnsConfig(wnsPackageSid, wnsClientSecret);
-        builder.Services.AddSingleton<IPushNotificationService>(sp =>
-        {
-            var httpClient = new HttpClient();
-            return new WnsNotificationService(
-                httpClient,
-                wnsConfig.PackageSid,
-                wnsConfig.ClientSecret,
-                sp.GetRequiredService<ITimeProvider>());
-        });
-        builder.Services.AddHostedService<WnsNotificationServiceHostedAdapter>();
-
         // T10: Service persistence
         builder.Services.AddWindowsService();
         builder.Services.AddHostedService<ControlParentalService>();
