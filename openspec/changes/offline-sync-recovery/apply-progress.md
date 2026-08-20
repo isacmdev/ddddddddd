@@ -5,7 +5,7 @@ Mode: Strict TDD
 Artifact store: hybrid
 Delivery: exception-ok within feature-branch-chain
 Boundary: PR2 task 2.2 from exact parent `0c671fa8ad937231be73dc19a93d37cac59c760c`; one autonomous scheduled-delivery unit, 800-line cap.
-Current boundary: task 4.1 evidence-only child from exact parent/base `6b48044a1b07163480bdba60cd08c67dfea7ca6d`; task 4.2 excluded. Current task-4.1 artifact set is 272 additions / 2 deletions = 274 touched docs/evidence lines, excluding the preserved independent FAIL report; CODE+TEST = 0.
+Current boundary: final task 4.2 evidence-only child from exact parent/base `e224401018caebe4c84d9a861cc9c305fa559511`; task-4.2 artifact set is docs/evidence/tasks/apply-progress only; CODE+TEST = 0.
 
 ## Cumulative State
 
@@ -17,9 +17,9 @@ Current boundary: task 4.1 evidence-only child from exact parent/base `6b48044a1
 - [x] 2.1 — implementation/evidence complete; current linked worktree evidence passed the required full Service regression and the task remains checked.
 - [x] 2.2 — controlled replay produced contemporaneous pre-fix RED and post-fix GREEN for the already-correct cancellation path; final safety-snapshot equality, replay patch reproduction, and all gates pass. Formal progress 7/11.
 - [x] 3.1 — remediation complete after independent FAIL; 3.2 remains open.
-- [x] 3.2 — prior implementation failed independent verification; cumulative remediation closes behavior RED/GREEN, runtime composition, bounded timeout admission, complete changed-scope coverage, assertion quality, and all-tracked-file raw-byte reproduction. Formal progress is 9/11; 4.1–4.2 remain open.
-- [x] 4.1 — independently failed, then closed with the user's explicit narrow historical exception for only the unrecoverable foundation-terminal → first task-1.2 pre-state link. Task-1.2 whole-child no-double-count numstat remains UNKNOWN under that exception; internal chain, final blobs, runtime gates, and all other child evidence remain required. Corrected totals are 2.2 DOC/EVIDENCE=726 and 3.1=413; stale 3.2 external hashes are superseded by the committed diff authority. CODE+TEST remains 0; 4.2 remains open.
-- [ ] 4.2 — final coverage/evidence report.
+- [x] 3.2 — prior implementation failed independent verification; cumulative remediation closes behavior RED/GREEN, runtime composition, bounded timeout admission, complete changed-scope coverage, assertion quality, and all-tracked-file raw-byte reproduction. Historical formal progress was 9/11 before later evidence children.
+- [x] 4.1 — independently failed, then closed with the user's explicit narrow historical exception for only the unrecoverable foundation-terminal → first task-1.2 pre-state link. Task-1.2 whole-child no-double-count numstat remains UNKNOWN under that exception; internal chain, final blobs, runtime gates, and all other child evidence remain required. Corrected totals are 2.2 DOC/EVIDENCE=726 and 3.1=413; stale 3.2 external hashes are superseded by the committed diff authority. CODE+TEST remains 0; task 4.2 subsequently closed as final evidence.
+- [x] 4.2 — final coverage/evidence report. Fresh final mapping against `7b74a0a..HEAD` covers 379/390 changed executable production lines (97.18%) and 107/116 branches (92.24%); focused SDD6 filter 315/315 and exactly one final full Service regression 1,156/1,156 pass. Coverage XML: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task42-final-coverage\10177cf9-b8ef-43a8-8a6b-376ea6b45f15\coverage.cobertura.xml`, SHA-256 `599e3d14a126554737f29c58af3f0e347c2503eb438a62c8134160af212d9509`. CODE+TEST=0; live backend, unsupported Windows matrix, SDD5, SDD7, and SDD8 remain PENDING/NOT CLAIMED.
 
 ## Task 3.2 Controlled-Mutation Closure — 2026-08-20
 
@@ -622,4 +622,4 @@ The independent task 3.2 FAIL findings are preserved unchanged in the three veri
 - No second retry, delivery, claim, or scheduler owner was introduced; backup remains trigger-only and delegates to the existing scheduler owner.
 - Existing package/analyzer warnings remain; no task-specific failure remains in the final gates.
 
-**Formal progress:** **9/11**. Task 3.2 is checked in filesystem and this cumulative artifact; tasks 4.1–4.2 remain open for final evidence verification.
+**Historical formal progress at task-3.2 closure:** **9/11**. Later task 4.1 and task 4.2 evidence children are now checked; current cumulative state is **11/11**.
