@@ -35,7 +35,9 @@ public interface IUsageReconciler
 
     /// <summary>
     /// Performs a one-time reconciliation: compares WMI events with recorded usage
-    /// and backfills gaps. Idempotent — calling multiple times has no extra effect.
+    /// and backfills gaps in bounded, cancellable checkpoint batches. Idempotent —
+    /// applied event markers make retries and restarts safe, and concurrent calls
+    /// are serialized by the reconciler.
     /// </summary>
     /// <returns>A reconciliation result with backfill summary and discrepancies.</returns>
     Task<ReconciliationResult> ReconcileAsync(CancellationToken cancellationToken = default);

@@ -5,11 +5,13 @@
 namespace ControlParental.Service.Tests;
 
 using System.Collections.Concurrent;
+using System.Data.Common;
 using ControlParental.Domain;
 using ControlParental.Service;
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Moq;
 using Xunit;
 
@@ -783,5 +785,326 @@ public class UsageReconcilerTests : IDisposable
         channel2.MessageReceivedUnsubscriptions.Should().Be(0);
 
         reconciler.Stop();
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_PersistsAppliedMarkersAndProcessesBoundedBatches()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var reconciler = this.CreateReconciler();
+
+        for (var index = 0; index < 55; index++)
+        {
+            this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+            {
+                AppId = $"app-{index % 3}",
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 2),
+                EndedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 1),
+                ServerDate = today,
+                Source = "T05",
+            });
+        }
+
+        await this.dbContext.SaveChangesAsync();
+
+        var result = await reconciler.ReconcileAsync();
+
+        result.Success.Should().BeTrue();
+        await using var command = this.connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM usage_reconciliation_applied WHERE server_date = $date;";
+        command.Parameters.AddWithValue("$date", today.ToString("yyyy-MM-dd"));
+        Convert.ToInt32(await command.ExecuteScalarAsync()).Should().Be(50);
+        await using var checkpoint = this.connection.CreateCommand();
+        checkpoint.CommandText = "SELECT last_event_id FROM usage_reconciliation_checkpoint WHERE server_date = $date;";
+        checkpoint.Parameters.AddWithValue("$date", today.ToString("yyyy-MM-dd"));
+        Convert.ToInt32(await checkpoint.ExecuteScalarAsync()).Should().Be(50);
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        await using var finalCount = this.connection.CreateCommand();
+        finalCount.CommandText = "SELECT COUNT(*) FROM usage_reconciliation_applied WHERE server_date = $date;";
+        finalCount.Parameters.AddWithValue("$date", today.ToString("yyyy-MM-dd"));
+        Convert.ToInt32(await finalCount.ExecuteScalarAsync()).Should().Be(55);
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_DoesNotPassAnOpenLowerIdEvent()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var openEvent = new ForegroundEventDbEntity
+        {
+            AppId = "gap-app",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-20),
+            ServerDate = today,
+            Source = "T05",
+        };
+        this.dbContext.ForegroundEvents.Add(openEvent);
+        await this.dbContext.SaveChangesAsync();
+        this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+        {
+            AppId = "gap-app",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            ServerDate = today,
+            Source = "T05",
+        });
+        await this.dbContext.SaveChangesAsync();
+        var reconciler = this.CreateReconciler();
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        await using (var checkpoint = this.connection.CreateCommand())
+        {
+            checkpoint.CommandText = "SELECT last_event_id FROM usage_reconciliation_checkpoint WHERE server_date = $date;";
+            checkpoint.Parameters.AddWithValue("$date", today.ToString("yyyy-MM-dd"));
+            Convert.ToInt32(await checkpoint.ExecuteScalarAsync()).Should().Be(0);
+        }
+
+        openEvent.EndedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await this.dbContext.SaveChangesAsync();
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        (await this.dbContext.UsageToday.SingleAsync()).ElapsedSeconds.Should().Be(1_440);
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_ReplayedContributionDoesNotDoubleApply()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var reconciler = this.CreateReconciler();
+        this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+        {
+            AppId = "restart-app",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-30),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-20),
+            ServerDate = today,
+            Source = "T05",
+        });
+        await this.dbContext.SaveChangesAsync();
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        var first = await this.dbContext.UsageToday.SingleAsync();
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        var second = await this.dbContext.UsageToday.SingleAsync();
+
+        second.ElapsedSeconds.Should().Be(first.ElapsedSeconds);
+        second.Minutes.Should().Be(first.Minutes);
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_FileBackedRestartResumesFromDurableState()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"usage-reconcile-{Guid.NewGuid():N}.db");
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        try
+        {
+            var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
+                .UseSqlite($"Data Source={path};Pooling=False")
+                .Options;
+            await using (var firstDb = new ControlParentalDbContext(options))
+            {
+                await firstDb.Database.EnsureCreatedAsync();
+                for (var index = 0; index < 51; index++)
+                {
+                    firstDb.ForegroundEvents.Add(new ForegroundEventDbEntity
+                    {
+                        AppId = "file-backed",
+                        StartedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 20),
+                        EndedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 10),
+                        ServerDate = today,
+                        Source = "T05",
+                    });
+                }
+                await firstDb.SaveChangesAsync();
+                var firstReconciler = new UsageReconciler(
+                    new TrackingDbContextFactory(options),
+                    CreateMockTimeProvider(DateTimeOffset.UtcNow, today),
+                    null,
+                    name => name);
+                (await firstReconciler.ReconcileAsync()).Success.Should().BeTrue();
+                firstReconciler.Dispose();
+                await firstDb.Database.OpenConnectionAsync();
+                await using var firstCheckpoint = firstDb.Database.GetDbConnection().CreateCommand();
+                firstCheckpoint.CommandText = "SELECT last_event_id FROM usage_reconciliation_checkpoint WHERE server_date = $date;";
+                firstCheckpoint.Parameters.Add(new SqliteParameter("$date", today.ToString("yyyy-MM-dd")));
+                Convert.ToInt32(await firstCheckpoint.ExecuteScalarAsync()).Should().Be(50);
+            }
+
+            await using (var secondDb = new ControlParentalDbContext(options))
+            {
+                var secondReconciler = new UsageReconciler(
+                    new TrackingDbContextFactory(options),
+                    CreateMockTimeProvider(DateTimeOffset.UtcNow, today),
+                    null,
+                    name => name);
+                (await secondReconciler.ReconcileAsync()).Success.Should().BeTrue();
+                (await secondDb.UsageToday.SingleAsync()).ElapsedSeconds.Should().Be(30_600);
+                secondReconciler.Dispose();
+            }
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_CancellationPropagatesAndLeavesCheckpointUsable()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        for (var index = 0; index < 3; index++)
+        {
+            this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+            {
+                AppId = $"cancel-{index}",
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 2),
+                EndedAt = DateTimeOffset.UtcNow.AddMinutes(-index - 1),
+                ServerDate = today,
+                Source = "T05",
+            });
+        }
+
+        await this.dbContext.SaveChangesAsync();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var reconciler = this.CreateReconciler();
+
+        var act = () => reconciler.ReconcileAsync(cancellation.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        (await this.dbContext.ReconciliationHistory.CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_InFlightCancellationRollsBackAndReleasesSingleFlight()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+        {
+            AppId = "in-flight",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-20),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            ServerDate = today,
+            Source = "T05",
+        });
+        await this.dbContext.SaveChangesAsync();
+        var blocker = new BlockingReaderInterceptor();
+        var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
+            .UseSqlite(this.connection)
+            .AddInterceptors(blocker)
+            .Options;
+        var reconciler = new UsageReconciler(
+            new TrackingDbContextFactory(options),
+            CreateMockTimeProvider(DateTimeOffset.UtcNow, today),
+            null,
+            name => name);
+        using var cancellation = new CancellationTokenSource();
+        var run = reconciler.ReconcileAsync(cancellation.Token);
+
+        await blocker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        try
+        {
+            Func<Task> awaitRun = async () => await run;
+            await awaitRun.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            blocker.Enabled = false;
+            blocker.Release.TrySetResult(true);
+        }
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        (await this.dbContext.UsageToday.SingleAsync()).ElapsedSeconds.Should().Be(600);
+        reconciler.Dispose();
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_FailedBatchRollsBackMarkerAndCheckpoint()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+        {
+            AppId = "rollback-app",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-20),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            ServerDate = today,
+            Source = "T05",
+        });
+        await this.dbContext.SaveChangesAsync();
+
+        await using (var trigger = this.connection.CreateCommand())
+        {
+            trigger.CommandText = "CREATE TRIGGER fail_usage_insert BEFORE INSERT ON usage_today BEGIN SELECT RAISE(ABORT, 'controlled rollback'); END;";
+            await trigger.ExecuteNonQueryAsync();
+        }
+
+        var reconciler = this.CreateReconciler();
+        (await reconciler.ReconcileAsync()).Success.Should().BeFalse();
+
+        await using (var markerCount = this.connection.CreateCommand())
+        {
+            markerCount.CommandText = "SELECT COUNT(*) FROM usage_reconciliation_applied;";
+            Convert.ToInt32(await markerCount.ExecuteScalarAsync()).Should().Be(0);
+        }
+
+        await using (var dropTrigger = this.connection.CreateCommand())
+        {
+            dropTrigger.CommandText = "DROP TRIGGER fail_usage_insert;";
+            await dropTrigger.ExecuteNonQueryAsync();
+        }
+
+        (await reconciler.ReconcileAsync()).Success.Should().BeTrue();
+        (await this.dbContext.UsageToday.SingleAsync()).ElapsedSeconds.Should().Be(600);
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_ConcurrentTriggersRemainSingleFlight()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        this.dbContext.ForegroundEvents.Add(new ForegroundEventDbEntity
+        {
+            AppId = "single-flight",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-15),
+            EndedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            ServerDate = today,
+            Source = "T05",
+        });
+        await this.dbContext.SaveChangesAsync();
+        var reconciler = this.CreateReconciler();
+
+        var results = await Task.WhenAll(
+            reconciler.ReconcileAsync(),
+            reconciler.ReconcileAsync(),
+            reconciler.ReconcileAsync());
+
+        results.Should().OnlyContain(result => result.Success);
+        (await this.dbContext.ReconciliationHistory.CountAsync()).Should().Be(1);
+        (await this.dbContext.UsageToday.SingleAsync()).ElapsedSeconds.Should().Be(600);
+    }
+
+    private sealed class BlockingReaderInterceptor : DbCommandInterceptor
+    {
+        public TaskCompletionSource<bool> Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool Enabled { get; set; } = true;
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (this.Enabled && command.CommandText.Contains("foreground_events", StringComparison.OrdinalIgnoreCase))
+            {
+                this.Entered.TrySetResult(true);
+                await this.Release.Task.WaitAsync(cancellationToken);
+            }
+
+            return await base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
     }
 }

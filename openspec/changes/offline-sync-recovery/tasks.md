@@ -50,7 +50,7 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 
 ## Phase 3: Restart and Backup Composition (PR3)
 
-- [ ] 3.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `UsageReconcilerTests.cs`; update `UsageReconciler.cs`/`IUsageReconciler.cs` for bounded cancellable checkpoints, applied markers, restart continuity, duplicate safety, and single-flight.
+- [x] 3.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `UsageReconcilerTests.cs`; update `UsageReconciler.cs`/`IUsageReconciler.cs` for bounded cancellable checkpoints, applied markers, restart continuity, duplicate safety, and single-flight.
 - [ ] 3.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `TaskSchedulerBackupServiceTests.cs`, `ProgramBackupArgsTests.cs`, and `ProgramHardeningTests.cs`; update backup interfaces/service and `Program.cs` for trigger-only shared admission and lifecycle ordering.
 
 ## Phase 4: Final Verification (PR4)

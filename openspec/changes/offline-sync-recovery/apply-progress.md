@@ -15,7 +15,7 @@ Boundary: PR2 task 2.2 from exact parent `0c671fa8ad937231be73dc19a93d37cac59c76
 - [x] 1.2 — base-column-definition remediation complete after final verification; latest reverify FAIL was remediated without changing unrelated scope.
 - [x] 2.1 — implementation/evidence complete; current linked worktree evidence passed the required full Service regression and the task remains checked.
 - [x] 2.2 — controlled replay produced contemporaneous pre-fix RED and post-fix GREEN for the already-correct cancellation path; final safety-snapshot equality, replay patch reproduction, and all gates pass. Formal progress 7/11.
-- [ ] 3.1–3.2 — reconciliation/backup.
+- [x] 3.1 — remediation complete after independent FAIL; 3.2 remains open.
 - [ ] 4.1–4.2 — final evidence.
 
 ## Preserved Failed Attempt
@@ -423,3 +423,51 @@ The approved independent report `verify-report-task-2.1-approved.md` is preserve
 - Complete code/test delta relative to prerequisite `3315ffb`: `BackendClient.cs` 42 additions / 25 deletions (67 touched); `BackendClientTests.cs` 199 additions; `AuthenticatedBackendClientTests.cs` 47 additions; **313 touched code/test lines**, under 400. Docs/evidence remain outside the budget.
 
 All required timeout, cancellation, identity-rejection, compatibility, focused, full-regression, and coverage gates pass. Task 2.1 is ready to be checked again in filesystem and Engram at formal progress **6/11**, then independently re-verified.
+
+## Task 3.1 Usage Reconciliation — 2026-08-19
+
+**Boundary:** Worktree `C:\Users\Usuario\AppData\Local\Temp\opencode\control-parental-windows-sdd6-task-3-1`, branch `feat/sdd6-3-1-usage-reconciliation`, exact HEAD/base `7e0a173b248cab7b3e42d568efd9cf629e65ab09`, feature-branch-chain. No commit, push, PR, dependency, scheduler, backend, or task 3.2 change was made.
+
+**Forecast / budget:** Complete task 3.1 was forecast safe at **465 touched CODE+TEST lines** (374 additions, 91 deletions), under the hard 800-line cap. The approved `exception-ok` / `size:exception` path applies because the unit exceeds 400 lines.
+
+### Strict-TDD Matrix
+
+| Task | RED | GREEN | TRIANGULATE / REFACTOR |
+|---|---|---|---|
+| 3.1 | Tests-first additions produced 2 failures / 28 passes after locked local assets were materialized; restored-asset RED SHA `C82657A9DAA4E87846F7ED254D4B4025187339CEF142339C59BCFEC7C33CB745`. | Actual Service.Tests build 0 errors; focused **32/32**; exactly one full Service regression **1135/1135**. Build SHA `867306C4CF2B62FDCDB80250EE5F4159F515AAA1FA126B3ADD9A5AC1E4D9582D`; focused SHA `613762B006BB2557B0C5179BDFE074A2959483E949D96D1A996833DCC9CEFAFF`; full SHA `454D4E75BD5663BE15F1BF8700970260621497B8243E744E8A7BA272399F67B1`. | Added bounded 50-event checkpoint batches, transactionally durable applied markers, restart continuity, cancellation propagation, single-flight serialization, duplicate replay safety, rollback proof, and redacted failure results. Tests use real SQLite paths and deterministic cancellation/concurrency; no sleeps. |
+
+### Evidence
+
+- Exact discovery: **32 unique tests**, SHA `F4A271F842A932BFEC64C15596B5F468FE4C56DF64624D4B06EE798FCC6B9986`.
+- Fresh changed production scope: **124/127 = 97.64% line**, **13/13 = 100.00% branch**; Cobertura `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-20260819\coverage-final\5159e851-311c-40ba-8027-8dddaf4f0a40\coverage.cobertura.xml`, SHA `84DE48180F99959741629273AD5F27D36B248BD886153CA71BE5F692E685B2B6`.
+- Pre-edit manifest `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-20260819\pre-edit-manifest.txt`, SHA `5D8E4267FE5F3A0D8038DE62DA0191F117C836E6E4D0614490B2C5212BDD9D0D`.
+- Final patch `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-20260819\final-task31.patch`, SHA `F6A09A5DDB85285018EAD0307FFE5AE23AD65994DA28FCAFD1AAFDEAE78DB627`; final manifest SHA `56A3F873B28591AEA22E37C2248B539D248AEB8E5B535D5CE4347BABEB3E135C`.
+- No schema/model migration was added: additive recovery tables use `CREATE TABLE IF NOT EXISTS`, preserving existing compiled-model and restart compatibility. Marker/checkpoint, usage, and history writes share transaction boundaries; cancellation rolls back and leaves the prior checkpoint usable.
+
+**Formal progress:** **8/11**. Task 3.1 is checked in filesystem and Engram; 3.2, 4.1, and 4.2 remain open. Independent verification is ready; no live backend, Windows matrix, or fabricated runtime claim was made.
+
+## Task 3.1 Narrow Remediation — 2026-08-19
+
+The independent `verify-report-task-3.1.md` FAIL is preserved unchanged. Task 3.1 was reset unchecked in filesystem and Engram before remediation; the prior seven tasks stayed checked. The previously supplied corrupt patch remains invalid history and was not overwritten: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-20260819\final-task31.patch`, SHA `F6A09A5DDB85285018EAD0307FFE5AE23AD65994DA28FCAFD1AAFDEAE78DB627`.
+
+**Remediation semantics:** One invocation admits exactly one deterministic `Take(50)` workset. It selects closed and open rows by ID, applies only the contiguous closed prefix, and never advances past the first unresolved/open row. A bounded repair query rewinds a legacy checkpoint to the earliest unresolved lower ID. Durable `usage_reconciliation_totals` stores per-app observed totals, while marker insertion's affected-row result controls contribution ownership; marker, totals, usage, checkpoint, and completion history remain in one transaction. No `while(true)` or cumulative prefix scan remains in reconciliation.
+
+### Remediation Strict-TDD Matrix
+
+| Concern | RED | GREEN / triangulation |
+|---|---|---|
+| Lower-ID continuity, one-batch cap, interrupted restart, in-flight cancellation | Tests were added before production edits. RED focused run: 4 failing / 30 passing; raw log SHA `FC0B346DBE242DFE1879DD31D9992012BF38EE88FCB3169FAD8EE1228606ABE3`; test-first build SHA `1A3A78AF795700A00FD050140721C23B97EACE3C11EA2CB4F4DB3C5934232EEF`. | Minimal production correction plus final tests: exact UsageReconciler discovery **34 unique**, focused **34/34 passed**; final build 0 errors SHA `B94F52DC6808E5A106636421254AC6E354E25C1F0C206883FF0244EFF71560C0`; focused SHA `984D6E5B0BA5F02FB18829555062902B2723ECA8E5BBE695D12C9505834FA3B8`. Existing rollback/duplicate tests triangulate transaction and marker behavior; the new file-backed test proves checkpoint 50 before disposal and resumes event 51 after recreation. |
+| Meaningful cancellation | Live SQLite `DbCommandInterceptor` TCS proves the production foreground-event query is active before caller cancellation; cancellation propagates, transaction rolls back, and the same reconciler successfully retries after the gate is released. | No pre-cancel substitute is used for this scenario; no arbitrary sleep or production test hook was added. |
+
+### Remediation Gates / Immutable Evidence
+
+- Exactly one final full Service regression after the validated build: **1137/1137 passed, 0 failed, 0 skipped**, SHA `F4E611AD75A6587CAD484F30B56495837F9B3E21EB4BD6C24F4A93ED1A0690BD`.
+- Fresh final coverage: complete changed `UsageReconciler.cs` delta relative to exact base **150/150 = 100.00% lines**, **20/21 = 95.24% branches**; Cobertura `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-remediation-20260819\coverage-final\08c31796-a7d8-4f9d-ae26-56d780dcdc92\coverage.cobertura.xml`, SHA `7D44629015F8B771E8531ED3503F8AA35C2570FF532719C519BA05DAAC36D4CB`.
+- Remediation pre-edit manifest: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-remediation-20260819\pre-edit-manifest.txt`, SHA `5FB7F7A74375351984A2ECA2CC29445C8743C84EF5D3A4DA462C6C5E5AF30A40`.
+- Final native binary-capable base-anchored patch: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-remediation-20260819\final-task31-base.patch`, SHA `684ADA1FC2B1B099363F4AEEFFD3C2EA6257EAEDC6C2E06ABE39321BE7CD4544`. Native patch headers are `dd63bb9..d99abfe`, `733e015..ccfab51`, and `b727d55..293c269`; old blobs match exact base.
+- Final raw-byte manifest: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task31-remediation-20260819\final-manifest.txt`, SHA `7703A0A2A519C158692FA79F0F362C3382BC39AB4A42AC4805072EBE7F91EB62`.
+- Reproduction: native `git apply --check --binary` succeeded in a clean temporary worktree at exact base; native binary apply succeeded; all three final raw SHA-256 values matched byte-for-byte. The temporary reconstruction was removed afterward. No PowerShell text re-encoding was used for the patch.
+
+**Cumulative budget:** Relative to base `7e0a173b248cab7b3e42d568efd9cf629e65ab09`: `IUsageReconciler.cs` 3/1, `UsageReconciler.cs` 210/88, and `UsageReconcilerTests.cs` 323/0 = **625 touched CODE+TEST lines**, under the hard 800 ceiling. Approved `size:exception` remains applicable; no further exception is needed.
+
+**Final status:** Task 3.1 is checked in filesystem and Engram; formal progress **8/11**. Tasks 3.2, 4.1, and 4.2 remain open. All five verifier CRITICAL findings are remediated and the slice is ready for independent re-verification.
