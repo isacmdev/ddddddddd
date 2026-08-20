@@ -12,6 +12,13 @@ namespace ControlParental.Domain;
 public interface IScheduledWorkService
 {
     /// <summary>
+    /// Runs one backup operation through this service's existing single-flight coordinator.
+    /// </summary>
+    /// <param name="mode">The backup operation to run.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Gets whether the service is currently running.
     /// </summary>
     bool IsRunning { get; }

@@ -642,7 +642,7 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
     /// <summary>
     /// Runs one scheduled operation directly for the Task Scheduler backup path.
     /// </summary>
-    internal async Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default)
+    public async Task RunBackupAsync(BackupMode mode, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var dispatch = mode switch

@@ -6,7 +6,6 @@ namespace ControlParental.Service.Tests;
 
 using ControlParental.Domain;
 using FluentAssertions;
-using Moq;
 using Xunit;
 
 /// <summary>
@@ -56,8 +55,81 @@ public class TaskSchedulerBackupServiceTests : IDisposable
         // Assert
         act.Should().NotThrow();
     }
-}
 
+    [Fact]
+    public async Task TriggerBackupAsync_UsesTheSharedAdmissionCallback()
+    {
+        BackupMode? observedMode = null;
+        CancellationToken observedToken = default;
+        var callback = new Func<BackupMode, CancellationToken, Task>((mode, token) =>
+        {
+            observedMode = mode;
+            observedToken = token;
+            return Task.CompletedTask;
+        });
+        using var service = new TaskSchedulerBackupService(callback);
+        using var cts = new CancellationTokenSource();
+
+        await service.TriggerBackupAsync(BackupMode.Outbox, cts.Token);
+
+        observedMode.Should().Be(BackupMode.Outbox);
+        observedToken.CanBeCanceled.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task TriggerBackupAsync_WhenCancelled_DoesNotInvokeAdmission()
+    {
+        var invoked = false;
+        using var service = new TaskSchedulerBackupService((_, _) =>
+        {
+            invoked = true;
+            return Task.CompletedTask;
+        });
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            service.TriggerBackupAsync(BackupMode.Heartbeat, cts.Token));
+
+        invoked.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task TriggerBackupAsync_WhenDisposed_RejectsTheTrigger()
+    {
+        this.service.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            this.service.TriggerBackupAsync(BackupMode.Outbox));
+    }
+
+    [Fact]
+    public async Task TriggerBackupAsync_WhenAdmissionIsNotConfigured_RejectsTheTrigger()
+    {
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            this.service.TriggerBackupAsync(BackupMode.Outbox));
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsAnInFlightAdmission()
+    {
+        var admissionStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var admissionCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var service = new TaskSchedulerBackupService((_, token) =>
+        {
+            admissionStarted.SetResult();
+            token.Register(admissionCancelled.SetResult);
+            return admissionCancelled.Task;
+        });
+
+        var trigger = service.TriggerBackupAsync(BackupMode.Outbox);
+        await admissionStarted.Task;
+        service.Dispose();
+
+        (await Task.WhenAny(trigger, Task.Delay(TimeSpan.FromMilliseconds(250))))
+            .Should().Be(trigger);
+    }
+}
 /// <summary>
 /// T20 — Tests for TaskSchedulerBackupService.RegisterBackupTasksAsync behavior.
 /// </summary>
@@ -99,6 +171,7 @@ public class TaskSchedulerBackupServiceRegisterTests : IDisposable
         // Assert
         result.Should().BeFalse();
     }
+
 }
 
 /// <summary>
@@ -141,78 +214,5 @@ public class TaskSchedulerBackupServiceUnregisterTests : IDisposable
         // Assert
         result.Should().BeFalse();
     }
-}
 
-/// <summary>
-/// T20 — Tests verifying ITaskSchedulerBackup interface contract.
-/// </summary>
-public class TaskSchedulerBackupServiceInterfaceTests : IDisposable
-{
-    private readonly Mock<ITaskSchedulerBackup> mockBackup;
-
-    public TaskSchedulerBackupServiceInterfaceTests()
-    {
-        this.mockBackup = new Mock<ITaskSchedulerBackup>();
-    }
-
-    public void Dispose()
-    {
-        GC.SuppressFinalize(this);
-    }
-
-    [Fact]
-    public async Task RegisterBackupTasksAsync_CalledOnce_ReturnsResult()
-    {
-        // Arrange
-        this.mockBackup.Setup(b => b.RegisterBackupTasksAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-
-        // Act
-        var result = await this.mockBackup.Object.RegisterBackupTasksAsync();
-
-        // Assert
-        result.Should().BeTrue();
-        this.mockBackup.Verify(b => b.RegisterBackupTasksAsync(It.IsAny<CancellationToken>()), Times.Once);
-    }
-
-    [Fact]
-    public async Task UnregisterBackupTasksAsync_CalledOnce_ReturnsResult()
-    {
-        // Arrange
-        this.mockBackup.Setup(b => b.UnregisterBackupTasksAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-
-        // Act
-        var result = await this.mockBackup.Object.UnregisterBackupTasksAsync();
-
-        // Assert
-        result.Should().BeTrue();
-        this.mockBackup.Verify(b => b.UnregisterBackupTasksAsync(It.IsAny<CancellationToken>()), Times.Once);
-    }
-
-    [Fact]
-    public void AreBackupTasksRegistered_WhenRegistered_ReturnsTrue()
-    {
-        // Arrange
-        this.mockBackup.SetupGet(b => b.AreBackupTasksRegistered).Returns(true);
-
-        // Act
-        var result = this.mockBackup.Object.AreBackupTasksRegistered;
-
-        // Assert
-        result.Should().BeTrue();
-    }
-
-    [Fact]
-    public void AreBackupTasksRegistered_WhenNotRegistered_ReturnsFalse()
-    {
-        // Arrange
-        this.mockBackup.SetupGet(b => b.AreBackupTasksRegistered).Returns(false);
-
-        // Act
-        var result = this.mockBackup.Object.AreBackupTasksRegistered;
-
-        // Assert
-        result.Should().BeFalse();
-    }
 }

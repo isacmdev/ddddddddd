@@ -74,6 +74,8 @@ public static class Program
     /// </summary>
     public const string IpcPipeName = "SessionAgent";
 
+    internal static readonly TimeSpan DefaultBackupAdmissionTimeout = TimeSpan.FromSeconds(30);
+
     internal static bool TryParseBackupMode(string[]? args, out BackupMode mode)
     {
         mode = default;
@@ -96,6 +98,16 @@ public static class Program
             default:
                 return false;
         }
+    }
+
+    internal static bool TryParseBackupRequest(
+        string[]? args,
+        out bool isBackupMode,
+        out BackupMode mode)
+    {
+        var hasBackupArgument = args?.Any(arg => arg.StartsWith("--backup", StringComparison.Ordinal)) == true;
+        isBackupMode = TryParseBackupMode(args, out mode);
+        return !hasBackupArgument || isBackupMode;
     }
 
     /// <summary>
@@ -144,8 +156,97 @@ public static class Program
         services.AddScoped<IPairingService, PairingService>();
     }
 
-    public static async Task Main(string[] args)
+    internal static void ConfigureBackupAdmission(IServiceCollection services)
     {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddSingleton<ITaskSchedulerBackup>(sp =>
+            new TaskSchedulerBackupService((mode, cancellationToken) =>
+                sp.GetRequiredService<IScheduledWorkService>().RunBackupAsync(mode, cancellationToken)));
+    }
+
+    internal static async Task RunBackupModeAsync(
+        IServiceProvider services,
+        BackupMode mode,
+        CancellationToken callerToken = default,
+        TimeSpan? timeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        var timeoutCts = new CancellationTokenSource(timeout ?? DefaultBackupAdmissionTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            callerToken,
+            timeoutCts.Token);
+
+        try
+        {
+            await services.GetRequiredService<ITaskSchedulerBackup>()
+                .TriggerBackupAsync(mode, linkedCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            throw new TimeoutException("Backup admission exceeded its finite timeout.");
+        }
+        finally
+        {
+            timeoutCts.Dispose();
+        }
+    }
+
+    internal static async Task RunBackupHostModeAsync(
+        IHost host,
+        BackupMode mode,
+        CancellationToken callerToken = default,
+        TimeSpan? timeout = null)
+    {
+        try
+        {
+            await RunBackupModeAsync(host.Services, mode, callerToken, timeout)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            Console.Error.WriteLine("[Program] Backup admission timed out.");
+        }
+        finally
+        {
+            await host.StopAsync().ConfigureAwait(false);
+        }
+    }
+
+    internal static async Task RunSelectedModeAsync(
+        IHost host,
+        bool isBackupMode,
+        BackupMode backupMode,
+        CancellationToken callerToken = default)
+    {
+        if (isBackupMode)
+        {
+            await RunBackupHostModeAsync(host, backupMode, callerToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await host.WaitForShutdownAsync().ConfigureAwait(false);
+    }
+
+    public static Task Main(string[] args) => RunMainAsync(args);
+
+    internal static Task RunMainAsync(string[] args) => RunMainAsync(args, static () => { });
+
+    internal static async Task RunMainAsync(string[] args, Action compositionStarted)
+    {
+        if (!TryParseBackupRequest(args, out var isBackupMode, out var backupMode))
+        {
+            Console.Error.WriteLine("[Program] Invalid or ambiguous backup arguments.");
+            return;
+        }
+
+        compositionStarted();
+
         // T18: Load Supabase config from .env (repo root or ProgramData)
         if (!ConfigurationLoader.TryLoad(out var supabaseConfig))
         {
@@ -373,7 +474,7 @@ public static class Program
         builder.Services.AddHostedService<NamedPipeUIServerHostedAdapter>();
 
         // T20: Register TaskSchedulerBackupService as safety net for timer failures
-        builder.Services.AddSingleton<ITaskSchedulerBackup, TaskSchedulerBackupService>();
+        ConfigureBackupAdmission(builder.Services);
 
         // T20: Register ScheduledWorkService as hosted service
         builder.Services.AddSingleton<IScheduledWorkService>((sp) =>
@@ -430,10 +531,11 @@ public static class Program
         // applied by the first run's ApplyHardeningAsync and persists on the folder.
         await ApplyHardeningAsync(host.Services);
 
-        // T03: Database adoption must complete before hosted services start.
-        await StartHostAfterDatabaseInitializationAsync(host);
-
-        await host.WaitForShutdownAsync();
+        await StartHostAndRunSelectedModeAsync(
+            host,
+            isBackupMode,
+            backupMode,
+            host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping);
     }
 
     internal static void ConfigureDbContextOptions(
@@ -462,6 +564,16 @@ public static class Program
             scope.ServiceProvider.GetRequiredService<ControlParentalDbContext>(),
             cancellationToken);
         await host.StartAsync(cancellationToken);
+    }
+
+    internal static async Task StartHostAndRunSelectedModeAsync(
+        IHost host,
+        bool isBackupMode,
+        BackupMode backupMode,
+        CancellationToken cancellationToken = default)
+    {
+        await StartHostAfterDatabaseInitializationAsync(host, cancellationToken);
+        await RunSelectedModeAsync(host, isBackupMode, backupMode, cancellationToken);
     }
 
     private static async Task EnsureUsageTodayElapsedSecondsColumnAsync(ControlParentalDbContext db)

@@ -25,8 +25,48 @@ public sealed class TaskSchedulerBackupService : ITaskSchedulerBackup, IDisposab
     private const int PeriodicIntervalMinutes = 15;
 
     private readonly object lockObj = new();
+    private readonly Func<BackupMode, CancellationToken, System.Threading.Tasks.Task>? triggerAdmission;
+    private readonly CancellationTokenSource lifetimeCancellation = new();
     private bool isRegistered;
     private bool disposed;
+
+    public TaskSchedulerBackupService(
+        Func<BackupMode, CancellationToken, System.Threading.Tasks.Task>? triggerAdmission = null)
+    {
+        this.triggerAdmission = triggerAdmission;
+    }
+
+    /// <inheritdoc />
+    public async System.Threading.Tasks.Task TriggerBackupAsync(
+        BackupMode mode,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        CancellationTokenSource linkedCancellation;
+        Func<BackupMode, CancellationToken, System.Threading.Tasks.Task> admission;
+        lock (this.lockObj)
+        {
+            if (this.disposed)
+            {
+                throw new ObjectDisposedException(nameof(TaskSchedulerBackupService));
+            }
+
+            admission = this.triggerAdmission
+                ?? throw new InvalidOperationException("Backup admission is not configured.");
+            linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                ct,
+                this.lifetimeCancellation.Token);
+        }
+
+        try
+        {
+            await admission(mode, linkedCancellation.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            linkedCancellation.Dispose();
+        }
+    }
 
     /// <inheritdoc />
     public bool AreBackupTasksRegistered
@@ -43,6 +83,7 @@ public sealed class TaskSchedulerBackupService : ITaskSchedulerBackup, IDisposab
     /// <inheritdoc />
     public System.Threading.Tasks.Task<bool> RegisterBackupTasksAsync(CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         if (this.disposed)
         {
             return System.Threading.Tasks.Task.FromResult(false);
@@ -130,7 +171,12 @@ public sealed class TaskSchedulerBackupService : ITaskSchedulerBackup, IDisposab
         }
     }
 
-    private void RegisterTask(TaskService ts, string taskName, string description, string argument, Trigger[] triggers)
+    private void RegisterTask(
+        TaskService ts,
+        string taskName,
+        string description,
+        string argument,
+        Trigger[] triggers)
     {
         var td = ts.NewTask();
         td.RegistrationInfo.Description = description;
@@ -240,9 +286,16 @@ public sealed class TaskSchedulerBackupService : ITaskSchedulerBackup, IDisposab
 
     public void Dispose()
     {
-        if (!this.disposed)
+        lock (this.lockObj)
         {
+            if (this.disposed)
+            {
+                return;
+            }
+
             this.disposed = true;
+            this.lifetimeCancellation.Cancel();
+            this.lifetimeCancellation.Dispose();
         }
 
         GC.SuppressFinalize(this);

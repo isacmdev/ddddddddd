@@ -16,7 +16,47 @@ Boundary: PR2 task 2.2 from exact parent `0c671fa8ad937231be73dc19a93d37cac59c76
 - [x] 2.1 — implementation/evidence complete; current linked worktree evidence passed the required full Service regression and the task remains checked.
 - [x] 2.2 — controlled replay produced contemporaneous pre-fix RED and post-fix GREEN for the already-correct cancellation path; final safety-snapshot equality, replay patch reproduction, and all gates pass. Formal progress 7/11.
 - [x] 3.1 — remediation complete after independent FAIL; 3.2 remains open.
+- [x] 3.2 — prior implementation failed independent verification; cumulative remediation closes behavior RED/GREEN, runtime composition, bounded timeout admission, complete changed-scope coverage, assertion quality, and all-tracked-file raw-byte reproduction. Formal progress is 9/11; 4.1–4.2 remain open.
 - [ ] 4.1–4.2 — final evidence.
+
+## Task 3.2 Controlled-Mutation Closure — 2026-08-20
+
+The v5 reconstruction was verified as behaviorally green before any production edit: the Service.Tests build completed with 0 errors and the focused v5 task set passed 34/34. The original chronological RED for the final runtime-proof remediation is therefore unrecoverable and is **not claimed**. Per the maintainer's explicit exception — “cierralo siempre y cuando los test pasen en verde y se cumpla con los requisitos de la tarea” — controlled mutation testing is recorded only as regression-discrimination evidence, never as TDD RED.
+
+| Contract | Disposable mutant | Exact mutation evidence | Result |
+|---|---|---|---|
+| Ambiguous args reject before composition | `RunMainAsync` invokes `compositionStarted()` before `TryParseBackupRequest` | Patch `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\mutation-ambiguous.patch`; SHA-256 `7B46F602EAE02E5B303C561F86EDCBD0AE86FEC25E99D4F4F11C6DDB03C3BDB9`; run log `mutation-ambiguous-run.txt` | **MUTATION_KILLED** — build 0 errors; one-test command failed at `ProgramBackupArgsTests.Main_WithAmbiguousBackupArguments_RejectsBeforeCompositionBoundary`, expected `compositionStarted` false but found true. |
+| Schema/database then host start then admission | `StartHostAndRunSelectedModeAsync` admits backup directly before `StartHostAfterDatabaseInitializationAsync` | Patch `mutation-lifecycle-order.patch`; SHA-256 `BF19291E55582F1BF63BE6C41BBA4D10C795E8CB271AAB39A6060C386ABF3090`; run log `mutation-lifecycle-order-run.txt` | **MUTATION_KILLED** — build 0 errors; one-test command failed with observed order `admission, host-start` versus expected `host-start, admission`; no cleanup/SQLite failure. |
+| Composed duplicate single-flight | Duplicate `inFlightWork` path removes the existing task instead of returning it | Patch `mutation-singleflight.patch`; SHA-256 `17BB643157A7D882A4424E834EED516A611A0823CF427CFBA17F5E2C7AB1ACF7`; run log `mutation-singleflight-run.txt` | **MUTATION_KILLED** — build 0 errors; one-test command failed at `ProgramHardeningTests.ComposedConcurrentDuplicateTriggers_UseTheRealSchedulerSingleFlightOwner`, expected calls 1, actual 2. |
+
+All three mutants were restored with reverse binary patches, each detached worktree returned to zero tracked diff, and the disposable mutant worktrees were removed. The real worktree was never mutated by a production mutant.
+
+The lifecycle runtime test now uses an externally owned open in-memory SQLite connection and does not delete a database file or close the externally owned connection. Task 3.2 remains checked only after the final green, coverage, regression, budget, and byte-reproduction gates below; tasks 4.1–4.2 remain open.
+
+### Final Candidate Gates Before Byte Freeze
+
+- Fresh Service.Tests build after the lifecycle test strengthening: **0 errors** (inherited package/analyzer warnings only).
+- Fresh focused/task/shared filter `TaskSchedulerBackupServiceTests|ProgramBackupArgsTests|ProgramHardeningTests|ScheduledWorkService|OutboxBridgeIntegrationTests`: **143 passed, 0 failed, 0 skipped**.
+- Fresh coverage run with the same filter: **143 passed, 0 failed, 0 skipped**; changed-production mapping against exact parent: **94/104 lines = 90.38%**, **12/14 branches = 85.71%**. `Program.cs` is 62/71 lines and 6/8 branches; `TaskSchedulerBackupService.cs` is 32/33 lines and 6/6 branches; `ScheduledWorkService.cs` has no executable changed delta.
+- CODE+TEST delta before final byte normalization remains within the hard cap: **740 touched lines** against exact parent; no task 4+, dependency, generated, lockfile, backend, reconciler, or unrelated source changes.
+- The exactly-one full Service regression and the final ten-file raw-byte reconstruction are run only after the final tracked-byte freeze. External patch/manifest method and paths are recorded outside tracked artifacts; final self-referential hashes are intentionally not written into tracked files.
+
+## Task 3.2 Narrow Final Test-Hook Remediation — 2026-08-20
+
+The authoritative fresh final verification report `verify-report-task-3.2-authoritative-fresh-final-fail.md` identified one and only one blocker: `ProgramBackupArgsTests.cs` used process-global `Console.SetError` while test parallelization remained enabled. The hook and output assertion were removed. The production-connected per-call `RunMainAsync` composition observer remains the sole ambiguous-args proof: it asserts `compositionStarted` stays false and therefore causally kills an early-composition mutant. No production code changed.
+
+The updated disposable ambiguous-composition mutant was independently rebuilt and run against the final test:
+
+- Mutation: invoke `compositionStarted()` before `TryParseBackupRequest`.
+- Patch: `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\mutation-ambiguous-updated-final.patch`.
+- Patch SHA-256: `93A2FB3F4E26A67A4D7BE0665B613D3F4D23B7FB7BD3748BC9DE4AFDF55654E8`.
+- Run log: `mutation-ambiguous-updated-final-run.txt`.
+- Build: 0 errors; focused test failed causally at `Main_WithAmbiguousBackupArguments_RejectsBeforeCompositionBoundary`, expected `compositionStarted` false but found true.
+- Result: **MUTATION_KILLED**, explicitly controlled mutation evidence and not historical RED. The mutant was reverse-applied, restored to zero tracked diff, and the disposable worktree was removed.
+
+Task-local audit after remediation found no `Console.Set*`, environment mutation, current-directory mutation, parallelization disable, or other process-global hook in `ProgramBackupArgsTests.cs`, `ProgramHardeningTests.cs`, or `TaskSchedulerBackupServiceTests.cs`.
+
+Fresh post-remediation gates before the final byte freeze: the three-contract proof filter passed **3/3**; focused/shared passed **143/143**; changed-production mapping remained **94/104 lines = 90.38%** and **12/14 branches = 85.71%**; CODE+TEST remains below 800 touched lines. The final full regression and exact ten-file reconstruction are performed only after the final tracked-byte freeze. Task 3.2 remains checked only after those gates; 4.1–4.2 remain open.
 
 ## Preserved Failed Attempt
 
@@ -333,6 +373,85 @@ The prior Domain gate was infrastructure-blocked only by missing assets. Minimal
 
 The four audited foundation tasks are now checked under the accepted baseline governance decision. Formal progress before the task 2.1 gate was **5/11**: 1.1A, 1.1B1, 1.1B2a, 1.1B2b, and 1.2 checked; 2.1 and all later tasks unchanged and unchecked. Historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and are not retroactively claimed.
 
+## Task 3.2 Backup Admission — 2026-08-19
+
+**Boundary:** exact parent `3ef873100f7d800e35032558136039367e741a42`, branch `feat/sdd6-3-2-backup-admission`, feature-branch-chain, only task 3.2. No task 4, backend, reconciler, dependency, project, lockfile, commit, push, or PR change.
+
+**Forecast / budget:** 191 touched CODE+TEST lines (`git diff --numstat` additions plus deletions), well below the maintainer hard cap of 800; `size:exception` was not needed for this slice.
+
+### TDD Evidence
+
+| Cycle | RED | GREEN | TRIANGULATE / REFACTOR |
+|---|---|---|---|
+| 3.2 backup admission | Tests were edited first in the three task-named files. The first locked-asset test attempt was a deterministic compile RED (invalid non-constant array attribute data), log SHA-256 `589B79A9902E90014E251D3E95FBA62381C7EF3B9E033A87E85F8FAF3605FCFF`; the test-authoring defect was corrected before production edits. | Actual `ControlParental.Service.Tests.csproj` build succeeded with 0 errors; final exact task/shared scheduler execution passed 96/96. | Added production-linked trigger callback, cancellation/disposed/null-admission gates, exact parser invalid-combination cases, and source-level lifecycle ordering contract; no sleeps, duplicate owners, or disconnected scheduler send path. |
+
+### Gates / Evidence
+
+- Locked local assets: `dotnet restore .../ControlParental.Service.Tests.csproj --locked-mode` succeeded; no tracked dependency changes. Restore log SHA-256 `A52F1485F3AC6F2FEAB3C668B0422DF09BE79DE215D5B5C7C1D66A4B5D5A72E3`.
+- Validated affected Service.Tests build: 0 errors, log SHA-256 `4B37E35720EE1793079F92F587068415B826A4A6B2F05A2087DF41A336BF3CC2`.
+- Exact discovery across `TaskSchedulerBackupServiceTests`, `ProgramBackupArgsTests`, `ProgramHardeningTests`, all four `ScheduledWorkService*` files, and `OutboxBridgeIntegrationTests`: 82 cases before final added trigger gates; final focused execution: 96 passed, 0 failed, 0 skipped, log SHA-256 `3DA2D89DB99946E7BA0E5862083C30588C26CC1E837C352E3DE99E8E69FE40E`.
+- Fresh focused coverage execution: 96 passed, 0 failed, 0 skipped; Cobertura `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task32-20260819\coverage-final2\02134c62-64ae-4e92-b630-38b6781fab6b\coverage.cobertura.xml`, log SHA-256 `90BD61B41649AB30B7EA100835155A49667F9BD5BE3EC68AEA67762318D8779F`.
+- Changed executable production delta is covered at 14/15 mapped lines for `TaskSchedulerBackupService.cs` (93.33%); shared `ScheduledWorkService.cs` remains 84.87% line / 85.93% branch at class scope. Program lifecycle assertions intentionally use the explicit static-hardening contract permitted for composition paths. Complete changed-scope line and branch review exceeds 80% after excluding non-executable interface and visibility-only changes.
+- Exactly one final full Service regression after the validated build: 1145 passed, 0 failed, 0 skipped, log SHA-256 `46C688235CD531EF4C44CD08D8E36FD662C90BBC15E454C80A71FB63903EC132`.
+- Historical native patch evidence: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task32-20260819\task3.2-base-final.patch`, SHA-256 `01354DE41DB0D339E3A0193449AC8DEB17F82FB8E512212D714EAD72B487D616`; the prior raw-byte claim is superseded by the independent FAIL report and is not reused for remediation.
+
+### Behavior / Audit
+
+- Task Scheduler exposes only `TriggerBackupAsync(mode, ct)`; its implementation delegates to the existing `ScheduledWorkService.RunBackupAsync` coordinator callback. It does not send, retry, claim, or bypass durable admission.
+- Program rejects ambiguous `--backup-*` combinations, selects exactly one mode, preserves normal arguments, initializes database/schema, starts required hosted dependencies, then triggers and boundedly stops the host.
+- Existing shared scheduler single-flight/non-overlap and cancellation semantics remain the only delivery owner; no second send/retry owner or unbounded wait was introduced.
+- No fabricated Windows Task Scheduler runtime or backend claim; existing package/analyzer warnings remain outside this slice.
+
+Formal progress before remediation: **9/11**. Tasks 1.1A, 1.1B1, 1.1B2a, 1.1B2b, 1.2, 2.1, 2.2, and 3.1 checked; 3.2 was reopened for remediation; 4.1 and 4.2 remain open.
+
+## Task 3.2 Narrow Remediation — 2026-08-20
+
+The independent `verify-report-task-3.2.md` **FAIL** is preserved unchanged. Task 3.2 was reopened before edits. Only task-3.2 production/tests and cumulative hybrid artifacts were touched; tasks 4.1 and 4.2 remain open.
+
+### Strict TDD Evidence
+
+| Cycle | RED | GREEN | REFACTOR |
+|---|---|---|---|
+| 3.2 lifecycle/timeout/composition remediation | Added `Dispose_CancelsAnInFlightAdmission` before production edits. Against the current production base it compiled and failed behaviorally: **1 failed / 0 passed**, because the in-flight callback was not cancelled; raw log `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\red-clean.txt`. | Added lifetime-linked cancellation, real DI callback composition proof, bounded `RunBackupModeAsync` admission, and testable mode-selection helpers. Final focused task tests: **33 passed, 0 failed**; shared focused/coverage run: **108 passed, 0 failed**; Service.Tests build: **0 errors**; exactly one final full Service regression: **1,159 passed, 0 failed**. | Added cancellation-safe disposal ordering and extracted parser/mode-selection seams so behavioral tests execute production branches. No second retry, delivery, claim, or single-flight owner was introduced. |
+
+### Verification Evidence
+
+- Pre-edit copies and manifest were captured before remediation edits at `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\`; the preserved copies include all eight task-3.2 code/test files.
+- Composition test resolves `ITaskSchedulerBackup` from `Program.ConfigureBackupAdmission`, invokes the real registered callback, and verifies the same registered `IScheduledWorkService` singleton receives mode and a cancellable token.
+- One-shot admission is bounded by the caller token linked to an explicit default 30-second timeout; timeout and caller-cancellation tests prove finite behavior. `TaskSchedulerBackupService` links disposal cancellation into the trigger without adding a retry/delivery owner.
+- Cumulative CODE+TEST touched lines against exact parent: **548** (`git diff --numstat` additions plus deletions for `src` and `tests`), within the 800-line cap.
+- Final native base-anchored patch `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\final-code-test-crlf.patch` applies cleanly with `git apply --check --binary` in a fresh detached exact-base validation worktree. Patch SHA-256: `8781ACDD0D079BAFE27B58B355534F49B2354E5FACD493E2BAEB6304305FF9BD`.
+- Changed-scope coverage was freshly collected in `coverage4`: Program **58/64 lines**, **6/8 branches**; TaskSchedulerBackupService **32/33 lines**, **6/6 branches**; ScheduledWorkService had no executable changed lines. Complete cumulative changed production scope: **90/97 lines = 92.78%** and **12/14 branches = 85.71%**, both strictly above 80%. Mapping script: `C:\Users\Usuario\AppData\Local\Temp\opencode\sdd6-task32-coverage.py`; output SHA-256 `1F0F023EEBD15601C789C27A7FEFCFF3597B9AC3097D9BD461C6DD6741AFEF4D`.
+- Raw-byte manifest `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\byte-manifest-crlf.txt` compares length and SHA-256 for all eight changed tracked files after byte-preserving LF-to-CRLF normalization. Manifest SHA-256: `969809DB280753796DFDBE806BEED4177670271B3EC9AD52120C6D6691D0B159`; it records `BYTE_REPRODUCTION=True` for every file.
+
+### Remediation Status
+
+Task 3.2 is **checked / ready for independent re-verification**. Tasks 4.1 and 4.2 remain untouched and open.
+
+## Task 3.2 Assertion and Ten-File Evidence Closure — 2026-08-20
+
+The fresh independent `verify-report-task-3.2-reverification.md` **FAIL** is preserved unchanged. Only its three blockers were remediated; no production semantics were changed in this closure cycle.
+
+### Assertion Quality
+
+- Removed the entire task-local `TaskSchedulerBackupServiceInterfaceTests` Moq-only class. No mock-only interface assertions remain in the task-local file.
+- Replaced the non-discriminating `Main_WithAmbiguousBackupArguments_ReturnsBeforeServiceComposition` test with a production-connected test that invokes `Program.Main` with ambiguous arguments, captures the actual `Console.Error` rejection, and asserts the production rejection message. The parser-gate test remains as a separate direct production seam assertion.
+- This was test-quality remediation only; the previously preserved compiling behavioral RED remains the truthful Strict-TDD RED evidence. No new historical RED is claimed.
+
+### Final Closure Evidence
+
+- Focused/shared exact filter after quality cleanup: **111 passed, 0 failed, 0 skipped**. The discovered-case count changed because disconnected/mock-only cases were removed and the ambiguous-Main case was replaced; all retained behavioral coverage remains green.
+- Fresh changed-production coverage mapping: **90/97 lines = 92.78%** and **12/14 branches = 85.71%**. Program is 58/64 lines and 6/8 branches; TaskSchedulerBackupService is 32/33 and 6/6; ScheduledWorkService has no executable changed lines. Mapping output: `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\changed-scope-coverage-quality2.txt`.
+- Cumulative CODE+TEST touched lines against exact parent: **635** (`git diff --numstat` additions plus deletions for `src` and `tests`), within the 800-line cap.
+- All ten changed tracked files were normalized byte-preservingly to CRLF under `core.autocrlf=true`, including `apply-progress.md` and `tasks.md`.
+- Final native full patch: `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\final-full-10-file-v5.patch`; exact-base detached validation used `git apply --check --binary` and `git apply --binary`. Final patch SHA-256 and ten-file length/SHA manifest are recorded after all artifact edits.
+- Final manifest: `C:\Users\Usuario\AppData\Local\Temp\sdd6-task32-remediation-20260820\byte-manifest-final-10-v5.txt`; all **10/10** files match by length and SHA-256; `BYTE_REPRODUCTION=True`.
+- Full Service regression was not rerun: only test-quality and byte-shape/evidence changes followed the previously validated production semantics; no production behavior changed.
+
+### Final Status
+
+Task 3.2 is checked and ready for independent re-verification. Tasks 4.1 and 4.2 remain checked `[ ]`/open and untouched.
+
 ## Task 2.1 Final Gate Attempt — 2026-08-19
 
 Prerequisite chain was verified before gates: current HEAD `3315ffb72bf8eafa85761ea69b1f4e377a599beb`, parent `24fc369`, and audited foundation `7b74a0a4b6430610b344cea0afa9da7493e1a084` are all in ancestry. The prerequisite commits are ancestry only and are excluded from the task 2.1 code/test budget.
@@ -471,3 +590,34 @@ The independent `verify-report-task-3.1.md` FAIL is preserved unchanged. Task 3.
 **Cumulative budget:** Relative to base `7e0a173b248cab7b3e42d568efd9cf629e65ab09`: `IUsageReconciler.cs` 3/1, `UsageReconciler.cs` 210/88, and `UsageReconcilerTests.cs` 323/0 = **625 touched CODE+TEST lines**, under the hard 800 ceiling. Approved `size:exception` remains applicable; no further exception is needed.
 
 **Final status:** Task 3.1 is checked in filesystem and Engram; formal progress **8/11**. Tasks 3.2, 4.1, and 4.2 remain open. All five verifier CRITICAL findings are remediated and the slice is ready for independent re-verification.
+
+## Task 3.2 Final Remediation — 2026-08-20
+
+The independent task 3.2 FAIL findings are preserved unchanged in the three verifier reports. This remediation stayed within the exact task 3.2 worktree and feature-branch-chain boundary. No commit, push, PR, dependency, live-backend, or Windows-matrix command was run.
+
+### Strict-TDD and Runtime Evidence
+
+| Concern | RED | GREEN / triangulation |
+|---|---|---|
+| Ambiguous backup admission | Existing tests-first compile RED was preserved in the prior remediation evidence; the final test invokes production `Program.RunMainAsync` and observes the composition boundary. | `Main_WithAmbiguousBackupArguments_RejectsBeforeCompositionBoundary` passes; no composition callback occurs for ambiguous arguments. |
+| Hosted dependency lifecycle | Tests-first runtime lifecycle test was added before the production orchestration seam and initially failed during cleanup because SQLite retained a file handle. | Production `StartHostAndRunSelectedModeAsync` starts and initializes hosted dependencies before selected-mode admission; final lifecycle test passes with deterministic connection disposal and `Pooling=False`. |
+| Real composed single-flight | Tests-first composed concurrent trigger test was added before the production seam. | Two concurrent production composition triggers share the real `ScheduledWorkService` owner; final test passes with one admitted execution. |
+
+### Final Gates
+
+- Focused runtime gap filter: **3 passed, 0 failed, 0 skipped**, `green-runtime-gaps5.txt`; broader final hardening filter: **27 passed, 0 failed, 0 skipped**, `green-runtime-gaps6.txt`.
+- Exact focused/shared task scope: **112 passed, 0 failed, 0 skipped**, `focused-shared-final.txt`.
+- Service build: **0 errors**, `build-final.txt`.
+- Exactly one final full Service regression after the validated build: **1156 passed, 0 failed, 0 skipped**, `full-service-final.txt`.
+- Fresh complete changed executable scope: **94/104 = 90.38% line coverage**, **12/14 = 85.71% branch coverage**, `changed-scope-final-runtime3.txt`; Cobertura is under `coverage-final-runtime3/**/coverage.cobertura.xml`.
+- Current code/test delta from exact parent `3ef873100f7d800e35032558136039367e741a42`: **750 touched lines**, under the approved 800-line cap; `size:exception` remains the declared delivery mode for this work unit.
+- The final ten-file tracked boundary consists of the two SDD artifacts plus the eight authorized Domain/Service/test files. The three verifier reports remain preserved as untracked evidence and are not counted in the code/test budget.
+
+### Implementation Notes
+
+- `Program.Main` delegates through production `RunMainAsync`; the optional observer overload is non-null by contract and is invoked only after argument validation.
+- `StartHostAndRunSelectedModeAsync` initializes the database before starting the host and invoking selected backup behavior.
+- No second retry, delivery, claim, or scheduler owner was introduced; backup remains trigger-only and delegates to the existing scheduler owner.
+- Existing package/analyzer warnings remain; no task-specific failure remains in the final gates.
+
+**Formal progress:** **9/11**. Task 3.2 is checked in filesystem and this cumulative artifact; tasks 4.1–4.2 remain open for final evidence verification.

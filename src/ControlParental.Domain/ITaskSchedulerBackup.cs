@@ -12,6 +12,13 @@ namespace ControlParental.Domain;
 public interface ITaskSchedulerBackup
 {
     /// <summary>
+    /// Triggers one backup operation through the shared scheduled-work admission path.
+    /// </summary>
+    /// <param name="mode">The single backup operation to trigger.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task TriggerBackupAsync(BackupMode mode, CancellationToken ct = default);
+
+    /// <summary>
     /// Registers backup tasks with Windows Task Scheduler.
     /// Tasks run on: service start, user logon, and periodic interval.
     /// </summary>

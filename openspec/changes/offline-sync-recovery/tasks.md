@@ -21,7 +21,7 @@ Chain strategy: feature-branch-chain
 
 The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure of those four tasks once the fresh current foundation-focused green gate passes. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and MUST NOT be fabricated; they are no longer blockers under this governance decision. This does not relax strict TDD, feature-branch-chain, real-worktree, behavioral verification, or ≤800-line requirements for post-baseline units.
 
-**Current gate status (2026-08-19):** Foundation implementation evidence is green in the preserved apply history. The fresh combined foundation suite passed 28, the scheduler suite passed 89, and the Domain suite passed 97 after minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`. The four foundation checkboxes are now accepted and the formal count is **5/11**.
+**Current gate status (2026-08-20):** Foundation implementation evidence is green in the preserved apply history. The fresh combined foundation suite passed 28, the scheduler suite passed 89, and the Domain suite passed 97 after minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`. Task 3.2 remediation now has runtime composition evidence, fresh changed-scope coverage, and controlled-mutation discrimination under the user's explicit closure exception. The unrecoverable v5 historical RED is disclosed and not relabeled. The formal count is **9/11** until the final full Service regression and byte freeze complete. Tasks 4.1–4.2 remain open.
 
 ### Suggested Work Units
 
@@ -51,7 +51,7 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 ## Phase 3: Restart and Backup Composition (PR3)
 
 - [x] 3.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `UsageReconcilerTests.cs`; update `UsageReconciler.cs`/`IUsageReconciler.cs` for bounded cancellable checkpoints, applied markers, restart continuity, duplicate safety, and single-flight.
-- [ ] 3.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `TaskSchedulerBackupServiceTests.cs`, `ProgramBackupArgsTests.cs`, and `ProgramHardeningTests.cs`; update backup interfaces/service and `Program.cs` for trigger-only shared admission and lifecycle ordering.
+- [x] 3.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `TaskSchedulerBackupServiceTests.cs`, `ProgramBackupArgsTests.cs`, and `ProgramHardeningTests.cs`; update backup interfaces/service and `Program.cs` for trigger-only shared admission and lifecycle ordering. Historical final-remediation RED is unrecoverable because the v5 baseline was already green; the user's explicit exception authorizes separately labeled controlled mutation evidence, with all three required mutants killed. Final test-only cleanup removed the process-global `Console.SetError` hook; the updated ambiguous mutant remains killed through the per-call composition observer.
 
 ## Phase 4: Final Verification (PR4)
 
