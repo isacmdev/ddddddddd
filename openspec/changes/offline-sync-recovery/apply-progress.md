@@ -5,6 +5,7 @@ Mode: Strict TDD
 Artifact store: hybrid
 Delivery: exception-ok within feature-branch-chain
 Boundary: PR2 task 2.2 from exact parent `0c671fa8ad937231be73dc19a93d37cac59c760c`; one autonomous scheduled-delivery unit, 800-line cap.
+Current boundary: task 4.1 evidence-only child from exact parent/base `6b48044a1b07163480bdba60cd08c67dfea7ca6d`; task 4.2 excluded. Current task-4.1 artifact set is 272 additions / 2 deletions = 274 touched docs/evidence lines, excluding the preserved independent FAIL report; CODE+TEST = 0.
 
 ## Cumulative State
 
@@ -17,7 +18,8 @@ Boundary: PR2 task 2.2 from exact parent `0c671fa8ad937231be73dc19a93d37cac59c76
 - [x] 2.2 — controlled replay produced contemporaneous pre-fix RED and post-fix GREEN for the already-correct cancellation path; final safety-snapshot equality, replay patch reproduction, and all gates pass. Formal progress 7/11.
 - [x] 3.1 — remediation complete after independent FAIL; 3.2 remains open.
 - [x] 3.2 — prior implementation failed independent verification; cumulative remediation closes behavior RED/GREEN, runtime composition, bounded timeout admission, complete changed-scope coverage, assertion quality, and all-tracked-file raw-byte reproduction. Formal progress is 9/11; 4.1–4.2 remain open.
-- [ ] 4.1–4.2 — final evidence.
+- [x] 4.1 — independently failed, then closed with the user's explicit narrow historical exception for only the unrecoverable foundation-terminal → first task-1.2 pre-state link. Task-1.2 whole-child no-double-count numstat remains UNKNOWN under that exception; internal chain, final blobs, runtime gates, and all other child evidence remain required. Corrected totals are 2.2 DOC/EVIDENCE=726 and 3.1=413; stale 3.2 external hashes are superseded by the committed diff authority. CODE+TEST remains 0; 4.2 remains open.
+- [ ] 4.2 — final coverage/evidence report.
 
 ## Task 3.2 Controlled-Mutation Closure — 2026-08-20
 

@@ -55,5 +55,5 @@ The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the ac
 
 ## Phase 4: Final Verification (PR4)
 
-- [ ] 4.1 Require each child to have an immutable sequential patch or actual branch/commit diff with exhaustive no-double-count numstat; verify ≤800-line boundaries, security, complexity, concurrency, restart, cancellation, bounds, and branch evidence. Historical compile/corrective RED chronology exists in `apply-progress`; raw standalone RED is incomplete and remains a warning.
+- [x] 4.1 Require each child to have an immutable sequential patch or actual branch/commit diff with exhaustive no-double-count numstat; verify ≤800-line boundaries, security, complexity, concurrency, restart, cancellation, bounds, and branch evidence. Closed with the user's explicit narrow historical exception for only the unrecoverable foundation-terminal → first task-1.2 pre-state link; task-1.2 whole-child numstat remains UNKNOWN under that exception. Corrected totals and committed task-3.2 authority are preserved in the task-4.1 evidence artifacts. Task 4.2 remains open.
 - [ ] 4.2 Report changed-scope line coverage >80% and final evidence; mark live backend, unsupported Windows matrix, SDD5, SDD7, and SDD8 pending—no fabricated runtime claims.
