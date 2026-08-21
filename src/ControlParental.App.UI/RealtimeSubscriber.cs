@@ -9,37 +9,20 @@ using ControlParental.Domain;
 
 public sealed class RealtimeSubscriber : IRealtimeSubscriber
 {
-    // ── Dependencies ────────────────────────────────────────────────────────
-
     private readonly IRealtimeChannel policyChannel;
     private readonly IRealtimeChannel grantsChannel;
     private readonly IWindowLifecycleObserver lifecycleObserver;
     private readonly string deviceId;
-
-    // ── State ─────────────────────────────────────────────────────────────
-
     private readonly object lockObj = new();
+    private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private bool disposed;
     private bool isConnected;
+    private long generation; private long lifecycleEpoch; private long? readyGeneration; private CancellationTokenSource? generationCancellation; private EventHandler<Broadcast>? policyHandler; private EventHandler<Broadcast>? grantsHandler; private Task lifecycleTask = Task.CompletedTask;
 
-    // ── Events ─────────────────────────────────────────────────────────────
-
-    /// <inheritdoc />
     public event EventHandler<PolicyChangedEventArgs>? PolicyChanged;
 
-    /// <inheritdoc />
     public event EventHandler<GrantsChangedEventArgs>? GrantsChanged;
 
-    // ── Construction ──────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="RealtimeSubscriber"/> class.
-    /// </summary>
-    /// <param name="policyChannel">Realtime channel for policy changes.</param>
-    /// <param name="grantsChannel">Realtime channel for grants changes.</param>
-    /// <param name="lifecycleObserver">Window lifecycle observer for foreground/background events.</param>
-    /// <param name="deviceId">Device ID for channel identification.</param>
-    /// <exception cref="ArgumentNullException">Thrown when any parameter is null.</exception>
     public RealtimeSubscriber(
         IRealtimeChannel policyChannel,
         IRealtimeChannel grantsChannel,
@@ -50,17 +33,10 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
         this.grantsChannel = grantsChannel ?? throw new ArgumentNullException(nameof(grantsChannel));
         this.lifecycleObserver = lifecycleObserver ?? throw new ArgumentNullException(nameof(lifecycleObserver));
         this.deviceId = deviceId ?? throw new ArgumentNullException(nameof(deviceId));
-
-        this.policyChannel.BroadcastReceived += this.HandlePolicyBroadcast;
-        this.grantsChannel.BroadcastReceived += this.HandleGrantBroadcast;
-
         this.lifecycleObserver.EnteredForeground += this.OnEnteredForeground;
         this.lifecycleObserver.EnteredBackground += this.OnEnteredBackground;
     }
 
-    // ── IRealtimeSubscriber ─────────────────────────────────────────────────
-
-    /// <inheritdoc />
     public bool IsConnected
     {
         get
@@ -72,87 +48,214 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
         }
     }
 
-    /// <inheritdoc />
+    public Task LifecycleTask
+    {
+        get
+        {
+            lock (this.lockObj)
+            {
+                return this.lifecycleTask;
+            }
+        }
+    }
+
     public Task ConnectAsync(CancellationToken ct = default)
     {
-        if (this.disposed)
-        {
-            throw new ObjectDisposedException(nameof(RealtimeSubscriber));
-        }
-
-        return this.ConnectInternalAsync(ct);
+        long epoch; lock (this.lockObj) { epoch = this.lifecycleEpoch; }
+        return this.RunLifecycleCoreAsync(() => this.ConnectCoreAsync(ct, epoch), ct);
     }
 
-    /// <inheritdoc />
     public Task DisconnectAsync(CancellationToken ct = default)
     {
-        return this.DisconnectInternalAsync(ct);
+        this.InvalidateCurrentGeneration();
+        return this.RunLifecycleCoreAsync(() => Task.CompletedTask, ct);
     }
 
-    // ── Private Methods ────────────────────────────────────────────────────
+    private Task ConnectAsync(long epoch) => this.RunLifecycleCoreAsync(() => this.ConnectCoreAsync(CancellationToken.None, epoch), CancellationToken.None);
 
-    private async Task ConnectInternalAsync(CancellationToken ct = default)
+    private async Task ConnectCoreAsync(CancellationToken ct, long? requestedEpoch = null)
     {
+        long currentGeneration;
+        if (!this.lifecycleObserver.IsInForeground) return;
         lock (this.lockObj)
         {
-            if (this.isConnected || this.disposed)
-            {
-                return;
-            }
+            if (this.disposed)
+            { throw new ObjectDisposedException(nameof(RealtimeSubscriber)); }
+
+            if (requestedEpoch is not null && this.lifecycleEpoch != requestedEpoch.Value) return;
+
+            if (this.isConnected)
+            { return; }
 
             this.isConnected = true;
+            currentGeneration = ++this.generation;
+            this.generationCancellation = new CancellationTokenSource();
+            this.AttachHandlers(currentGeneration);
         }
 
+        Task? subscription = null; IRealtimeChannel? activeChannel = null;
         try
         {
-            await this.policyChannel.SubscribeAsync().ConfigureAwait(false);
-            await this.grantsChannel.SubscribeAsync().ConfigureAwait(false);
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, this.GetGenerationCancellation(currentGeneration));
+            if (!this.CanSubscribe(currentGeneration, requestedEpoch)) { this.InvalidateCurrentGeneration(); return; }
+            activeChannel = this.policyChannel;
+            subscription = activeChannel.SubscribeAsync();
+            await subscription.WaitAsync(cancellation.Token).ConfigureAwait(false);
+            if (!this.IsCurrentGeneration(currentGeneration, requestedEpoch)) { activeChannel.Unsubscribe(); return; }
+
+            if (!this.CanSubscribe(currentGeneration, requestedEpoch)) { this.InvalidateCurrentGeneration(); return; }
+            activeChannel = this.grantsChannel;
+            subscription = activeChannel.SubscribeAsync();
+            await subscription.WaitAsync(cancellation.Token).ConfigureAwait(false);
+            if (!this.IsCurrentGeneration(currentGeneration, requestedEpoch)) { activeChannel.Unsubscribe(); return; }
+
+            var isForeground = this.lifecycleObserver.IsInForeground;
+            lock (this.lockObj)
+            {
+                if (isForeground && this.IsCurrentGenerationLocked(currentGeneration, requestedEpoch))
+                {
+                    this.readyGeneration = currentGeneration;
+                }
+            }
 
             Trace.WriteLine($"[RealtimeSubscriber] Connected for device {this.deviceId}");
         }
         catch
         {
-            lock (this.lockObj)
+            var wasCurrent = this.IsCurrentGeneration(currentGeneration);
+            if (subscription is not null)
             {
-                this.isConnected = false;
+                try { await subscription.ConfigureAwait(false); } catch { }
             }
+            if (!wasCurrent)
+            {
+                activeChannel?.Unsubscribe();
+            }
+            this.InvalidateCurrentGeneration();
+            if (!wasCurrent)
+            { return; }
 
             throw;
         }
     }
 
-    private async Task DisconnectInternalAsync(CancellationToken ct = default)
+    private void InvalidateCurrentGeneration()
     {
+        EventHandler<Broadcast>? oldPolicyHandler;
+        EventHandler<Broadcast>? oldGrantsHandler;
+        CancellationTokenSource? oldCancellation;
         lock (this.lockObj)
         {
-            if (!this.isConnected)
+            if (!this.isConnected && this.readyGeneration is null)
             {
                 return;
             }
 
             this.isConnected = false;
+            this.readyGeneration = null;
+            this.generation++;
+            oldPolicyHandler = this.policyHandler;
+            oldGrantsHandler = this.grantsHandler;
+            this.policyHandler = null;
+            this.grantsHandler = null;
+            oldCancellation = this.generationCancellation;
+            this.generationCancellation = null;
         }
+
+        oldCancellation?.Cancel();
+        oldCancellation?.Dispose();
+
+        if (oldPolicyHandler is not null) this.policyChannel.BroadcastReceived -= oldPolicyHandler;
+        if (oldGrantsHandler is not null) this.grantsChannel.BroadcastReceived -= oldGrantsHandler;
 
         this.policyChannel.Unsubscribe();
         this.grantsChannel.Unsubscribe();
-
-        // Allow unsubscribe operations to complete
-        await Task.Yield();
-
         Trace.WriteLine($"[RealtimeSubscriber] Disconnected for device {this.deviceId}");
     }
 
-    private void HandlePolicyBroadcast(object? sender, Broadcast broadcast)
+    private CancellationToken GetGenerationCancellation(long currentGeneration)
+    {
+        lock (this.lockObj)
+        {
+            return this.generation == currentGeneration && this.generationCancellation is not null
+                ? this.generationCancellation.Token
+                : new CancellationToken(canceled: true);
+        }
+    }
+
+    private async Task RunLifecycleCoreAsync(Func<Task> operation, CancellationToken ct)
+    {
+        await this.lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await operation().ConfigureAwait(false);
+        }
+        finally
+        {
+            this.lifecycleGate.Release();
+        }
+    }
+
+    private void QueueLifecycleOperation(Func<Task> operation)
+    {
+        lock (this.lockObj)
+        {
+            this.lifecycleTask = this.lifecycleTask.ContinueWith(
+                async _ =>
+                {
+                    try
+                    {
+                        await operation().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine($"[RealtimeSubscriber] Lifecycle operation failed: {ex.Message}");
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default).Unwrap();
+        }
+    }
+
+    private void AttachHandlers(long currentGeneration)
+    {
+        this.policyHandler = (_, broadcast) => this.HandlePolicyBroadcast(currentGeneration, broadcast);
+        this.grantsHandler = (_, broadcast) => this.HandleGrantBroadcast(currentGeneration, broadcast);
+        this.policyChannel.BroadcastReceived += this.policyHandler;
+        this.grantsChannel.BroadcastReceived += this.grantsHandler;
+    }
+
+    private bool IsCurrentGeneration(long currentGeneration, long? requestedEpoch = null)
+    {
+        lock (this.lockObj)
+        {
+            return this.IsCurrentGenerationLocked(currentGeneration, requestedEpoch);
+        }
+    }
+
+    private bool CanSubscribe(long currentGeneration, long? requestedEpoch) => this.lifecycleObserver.IsInForeground && this.IsCurrentGeneration(currentGeneration, requestedEpoch);
+
+    private bool IsCurrentGenerationLocked(long currentGeneration, long? requestedEpoch = null) =>
+        !this.disposed && this.isConnected && this.generation == currentGeneration &&
+        (requestedEpoch is null || this.lifecycleEpoch == requestedEpoch.Value);
+
+    private void HandlePolicyBroadcast(long currentGeneration, Broadcast broadcast)
     {
         try
         {
-            // Payload contains { "version": <int> }
+            lock (this.lockObj)
+            {
+                if (this.readyGeneration != currentGeneration)
+                {
+                    return;
+                }
+            }
+
             if (broadcast.Payload.TryGetValue("version", out var versionObj) &&
                 int.TryParse(versionObj?.ToString(), out var version))
             {
-                this.PolicyChanged?.Invoke(
-                    this,
-                    new PolicyChangedEventArgs { NewVersion = version });
+                this.PolicyChanged?.Invoke(this, new PolicyChangedEventArgs { NewVersion = version });
             }
         }
         catch (Exception ex)
@@ -161,22 +264,26 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
         }
     }
 
-    private void HandleGrantBroadcast(object? sender, Broadcast broadcast)
+    private void HandleGrantBroadcast(long currentGeneration, Broadcast broadcast)
     {
         try
         {
-            // Payload contains { "grant_id": <string>, "is_approved": <bool> }
+            lock (this.lockObj)
+            {
+                if (this.readyGeneration != currentGeneration)
+                {
+                    return;
+                }
+            }
+
             if (broadcast.Payload.TryGetValue("grant_id", out var grantIdObj) &&
                 broadcast.Payload.TryGetValue("is_approved", out var isApprovedObj))
             {
                 var grantId = grantIdObj?.ToString();
                 var isApproved = isApprovedObj is bool b && b;
-
                 if (!string.IsNullOrEmpty(grantId))
                 {
-                    this.GrantsChanged?.Invoke(
-                        this,
-                        new GrantsChangedEventArgs { GrantId = grantId, IsApproved = isApproved });
+                    this.GrantsChanged?.Invoke(this, new GrantsChangedEventArgs { GrantId = grantId, IsApproved = isApproved });
                 }
             }
         }
@@ -188,33 +295,33 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
 
     private void OnEnteredForeground(object? sender, EventArgs e)
     {
-        _ = this.ConnectAsync();
+        long epoch; lock (this.lockObj) { epoch = ++this.lifecycleEpoch; }
+
+        this.QueueLifecycleOperation(() => this.ConnectAsync(epoch));
     }
 
     private void OnEnteredBackground(object? sender, EventArgs e)
     {
-        _ = this.DisconnectAsync();
+        lock (this.lockObj) { ++this.lifecycleEpoch; }
+
+        this.InvalidateCurrentGeneration();
+        this.QueueLifecycleOperation(() => this.DisconnectAsync());
     }
 
-    // ── IDisposable ────────────────────────────────────────────────────────
-
-    /// <inheritdoc />
     public void Dispose()
     {
-        if (this.disposed)
+        lock (this.lockObj)
         {
-            return;
+            if (this.disposed)
+            { return; }
+
+            this.disposed = true;
+            ++this.lifecycleEpoch;
         }
-
-        this.disposed = true;
-
-        this.policyChannel.BroadcastReceived -= this.HandlePolicyBroadcast;
-        this.grantsChannel.BroadcastReceived -= this.HandleGrantBroadcast;
 
         this.lifecycleObserver.EnteredForeground -= this.OnEnteredForeground;
         this.lifecycleObserver.EnteredBackground -= this.OnEnteredBackground;
-
-        // Synchronously disconnect (fire and forget is acceptable on dispose)
-        _ = this.DisconnectAsync();
+        this.InvalidateCurrentGeneration();
+        this.QueueLifecycleOperation(() => this.DisconnectAsync());
     }
 }

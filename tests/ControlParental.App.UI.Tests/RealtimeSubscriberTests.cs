@@ -39,10 +39,22 @@ public class RealtimeSubscriberTests : IDisposable
         return this.subscriber;
     }
 
-    [Fact]
-    public async Task ConnectAsync_SetsIsConnectedTrue()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ConnectAsync_SetsIsConnectedTrue(bool foreground)
     {
+        if (!foreground)
+        {
+            var policy = new CountingFakeRealtimeChannel(); var grants = new CountingFakeRealtimeChannel();
+            var backgroundSubscriber = new RealtimeSubscriber(policy, grants, this.lifecycle, this.deviceId);
+            await backgroundSubscriber.ConnectAsync();
+            (backgroundSubscriber.IsConnected, policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((false, 0, 0));
+            return;
+        }
+
         // Arrange
+        this.lifecycle.SimulateEnterForeground();
         var subscriber = this.CreateSubscriber();
 
         // Act
@@ -58,6 +70,7 @@ public class RealtimeSubscriberTests : IDisposable
     public async Task DisconnectAsync_SetsIsConnectedFalse()
     {
         // Arrange
+        this.lifecycle.SimulateEnterForeground();
         var subscriber = this.CreateSubscriber();
         await subscriber.ConnectAsync();
 
@@ -75,6 +88,7 @@ public class RealtimeSubscriberTests : IDisposable
     {
         // Arrange
         var subscriber = this.CreateSubscriber();
+        this.lifecycle.SimulateEnterForeground();
         await subscriber.ConnectAsync();
 
         // Act
@@ -93,6 +107,7 @@ public class RealtimeSubscriberTests : IDisposable
     public async Task PolicyBroadcast_FiresPolicyChangedWithCorrectVersion()
     {
         // Arrange
+        this.lifecycle.SimulateEnterForeground();
         var subscriber = this.CreateSubscriber();
         await subscriber.ConnectAsync();
 
@@ -114,6 +129,7 @@ public class RealtimeSubscriberTests : IDisposable
     public async Task GrantBroadcast_FiresGrantsChangedWithCorrectData()
     {
         // Arrange
+        this.lifecycle.SimulateEnterForeground();
         var subscriber = this.CreateSubscriber();
         await subscriber.ConnectAsync();
 
@@ -136,30 +152,23 @@ public class RealtimeSubscriberTests : IDisposable
     [Fact]
     public async Task ConnectAsync_Idempotent()
     {
-        // Arrange
         var freshPolicy = new CountingFakeRealtimeChannel();
         var freshGrants = new CountingFakeRealtimeChannel();
         var freshSubscriber = new RealtimeSubscriber(freshPolicy, freshGrants, this.lifecycle, this.deviceId);
-
-        // Act
+        this.lifecycle.SimulateEnterForeground();
         await freshSubscriber.ConnectAsync();
         await freshSubscriber.ConnectAsync();
-
-        // Assert
         freshPolicy.SubscribeCallCount.Should().Be(1);
         freshGrants.SubscribeCallCount.Should().Be(1);
-
         freshSubscriber.Dispose();
     }
 
     [Fact]
     public async Task DisconnectAsync_Idempotent()
     {
-        // Arrange
         var subscriber = this.CreateSubscriber();
+        this.lifecycle.SimulateEnterForeground();
         await subscriber.ConnectAsync();
-
-        // Act & Assert - Should not throw
         await subscriber.DisconnectAsync();
         await subscriber.DisconnectAsync();
     }
@@ -167,44 +176,142 @@ public class RealtimeSubscriberTests : IDisposable
     [Fact]
     public async Task BroadcastWithMissingFields_DoesNotThrow()
     {
-        // Arrange
+        this.lifecycle.SimulateEnterForeground();
         var subscriber = this.CreateSubscriber();
         await subscriber.ConnectAsync();
-
-        // Act & Assert - Should not throw with null/missing fields
         var act = () => this.policyChannel.FireBroadcast(new Dictionary<string, object?>());
         act.Should().NotThrow();
-
         act = () => this.grantsChannel.FireBroadcast(new Dictionary<string, object?>());
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public async Task QueuedForegroundConnectBeforeBackground_DoesNotStartAfterBackground()
+    {
+        var policy = new BarrierRealtimeChannel { BlockSubscribe = true }; var grants = new BarrierRealtimeChannel(); var subscriber = new RealtimeSubscriber(policy, grants, this.lifecycle, this.deviceId);
+        this.lifecycle.SimulateEnterForeground();
+        await policy.SubscribeStarted.Task;
+        this.lifecycle.SimulateEnterForeground(); this.lifecycle.SimulateEnterBackground(); policy.ReleaseSubscribe();
+        await subscriber.LifecycleTask;
+        (subscriber.IsConnected, policy.IsSubscribed, policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((false, false, 1, 0)); subscriber.Dispose();
+        await subscriber.DisconnectAsync(); await subscriber.DisconnectAsync();
+    }
+
+    [Fact]
+    public async Task FailedConnectAndQueuedFailure_CleanUpAndReconnect()
+    {
+        var policy = new CountingFakeRealtimeChannel(); var grants = new CountingFakeRealtimeChannel();
+        this.lifecycle.SimulateEnterForeground();
+        var subscriber = new RealtimeSubscriber(policy, grants, this.lifecycle, this.deviceId); policy.SubscribeException = new InvalidOperationException("first");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.ConnectAsync());
+        (policy.IsSubscribed, grants.IsSubscribed).Should().Be((false, false)); (policy.HandlerCount, grants.HandlerCount).Should().Be((0, 0));
+        policy.SubscribeException = new InvalidOperationException("queued"); this.lifecycle.SimulateEnterForeground(); await subscriber.LifecycleTask;
+        subscriber.IsConnected.Should().BeFalse();
+        (policy.IsSubscribed, grants.IsSubscribed).Should().Be((false, false)); (policy.HandlerCount, grants.HandlerCount).Should().Be((0, 0));
+        grants.SubscribeException = new InvalidOperationException("grant"); await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.ConnectAsync());
+        (policy.IsSubscribed, grants.IsSubscribed).Should().Be((false, false)); (policy.HandlerCount, grants.HandlerCount).Should().Be((0, 0));
+        await subscriber.ConnectAsync();
+        (policy.SubscribeCallCount, grants.SubscribeCallCount, policy.HandlerCount, grants.HandlerCount).Should().Be((4, 2, 1, 1));
+    }
+
+    [Fact]
+    public async Task OldPolicyAndGrantCallbacks_AreIgnoredAfterRestart()
+    {
+        var policy = new CountingFakeRealtimeChannel(); var grants = new CountingFakeRealtimeChannel();
+        this.lifecycle.SimulateEnterForeground();
+        var subscriber = new RealtimeSubscriber(policy, grants, this.lifecycle, this.deviceId); var policies = 0; var grantsSeen = 0;
+        subscriber.PolicyChanged += (_, _) => policies++; subscriber.GrantsChanged += (_, _) => grantsSeen++;
+        await subscriber.ConnectAsync(); await subscriber.DisconnectAsync(); await subscriber.ConnectAsync(); await subscriber.ConnectAsync();
+        policy.FireLateBroadcast(new() { { "version", 1 } }); grants.FireLateBroadcast(new() { { "grant_id", "old" }, { "is_approved", true } });
+        policy.FireBroadcast(new() { { "version", 2 } }); grants.FireBroadcast(new() { { "grant_id", "new" }, { "is_approved", true } });
+        policy.FireBroadcast(new()); grants.FireBroadcast(new());
+        (policies, grantsSeen).Should().Be((1, 1));
+        (policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((2, 2));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartedLateCompletion_AfterConcurrentBackgroundDispose_CleansBothChannels(bool policyBlocks)
+    {
+        var policy = new BarrierRealtimeChannel { BlockSubscribe = policyBlocks };
+        var grants = new BarrierRealtimeChannel { BlockSubscribe = !policyBlocks };
+        var subscriber = new RealtimeSubscriber(policy, grants, this.lifecycle, this.deviceId);
+        this.lifecycle.SimulateEnterForeground(); var connect = subscriber.ConnectAsync();
+        await (policyBlocks ? policy : grants).SubscribeStarted.Task;
+        var background = Task.Run(() => this.lifecycle.SimulateEnterBackground()); var dispose = Task.Run(subscriber.Dispose); subscriber.Dispose();
+        (policyBlocks ? policy : grants).ReleaseSubscribe();
+        await Task.WhenAll(background, dispose, connect, subscriber.LifecycleTask);
+        (subscriber.IsConnected, policy.IsSubscribed, grants.IsSubscribed, policy.HandlerCount, grants.HandlerCount).Should().Be((false, false, false, 0, 0));
     }
 
     private class CountingFakeRealtimeChannel : Domain.IRealtimeChannel
     {
         private bool subscribed;
+        private EventHandler<Broadcast>? handlers;
+        private EventHandler<Broadcast>? firstHandler;
 
-        public int SubscribeCallCount { get; private set; }
+        public int SubscribeCallCount { get; private set; } public int HandlerCount => this.handlers?.GetInvocationList().Length ?? 0;
+        public Exception? SubscribeException { get; set; }
+        public Action? OnSubscribed { get; set; }
 
         public bool IsSubscribed => this.subscribed;
 
-        public event EventHandler<Broadcast>? BroadcastReceived;
+        public event EventHandler<Broadcast>? BroadcastReceived { add { this.firstHandler ??= value; this.handlers += value; } remove { this.handlers -= value; } }
 
         public Task SubscribeAsync()
         {
             this.SubscribeCallCount++;
+            var exception = this.SubscribeException; this.SubscribeException = null;
+            if (exception is not null) return Task.FromException(exception);
+
             this.subscribed = true;
+            this.OnSubscribed?.Invoke();
             return Task.CompletedTask;
         }
+
+        public void FireBroadcast(Dictionary<string, object?> payload) => this.handlers?.Invoke(this, new Broadcast(payload));
+
+        public void FireLateBroadcast(Dictionary<string, object?> payload) => this.firstHandler?.Invoke(this, new Broadcast(payload));
 
         public void Unsubscribe()
         {
             this.subscribed = false;
         }
 
+        public void Dispose() => (this.subscribed, this.handlers) = (false, null);
+    }
+
+    private sealed class BarrierRealtimeChannel : Domain.IRealtimeChannel
+    {
+        private bool subscribed;
+        private EventHandler<Broadcast>? handlers;
+        private TaskCompletionSource<bool> release = NewSignal();
+
+        public bool BlockSubscribe { get; set; }
+
+        public TaskCompletionSource<bool> SubscribeStarted { get; } = NewSignal();
+
+        public int SubscribeCallCount { get; private set; }
+        public int HandlerCount => this.handlers?.GetInvocationList().Length ?? 0;
+
+        public bool IsSubscribed => this.subscribed;
+
+        public event EventHandler<Broadcast>? BroadcastReceived { add => this.handlers += value; remove => this.handlers -= value; }
+
+        public async Task SubscribeAsync() { this.SubscribeCallCount++; this.SubscribeStarted.TrySetResult(true); if (this.BlockSubscribe) await this.release.Task; this.subscribed = true; }
+
+        public void ReleaseSubscribe() => this.release.TrySetResult(true);
+
+        public void Unsubscribe() => this.subscribed = false;
+
         public void Dispose()
         {
-            this.subscribed = false;
-            this.BroadcastReceived = null;
+            this.Unsubscribe();
+            this.handlers = null;
         }
+
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
