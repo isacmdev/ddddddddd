@@ -76,6 +76,25 @@ public interface IEnforcementLevelMonitor
     {
     }
 
+    Task AddIssueAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string description,
+        CancellationToken cancellationToken = default)
+    {
+        this.AddIssue(key, severity, description);
+        return Task.CompletedTask;
+    }
+
+    Task ResolveIssueAsync(
+        IssueKey key,
+        string recoveryEvidence,
+        CancellationToken cancellationToken = default)
+    {
+        this.ResolveIssue(key);
+        return Task.CompletedTask;
+    }
+
     /// <summary>
     /// Evento cuando el nivel de enforcement cambia.
     /// </summary>
@@ -175,7 +194,7 @@ public enum EnforcementIssueType
     RestoreFailure,
 }
 
-public sealed record IssueKey(int SessionId, EnforcementIssueType Type, string Cause);
+public sealed record IssueKey(int SessionId, EnforcementIssueType Type, string Cause, string? IdentityScope = null);
 
 /// <summary>
 /// Severidad de issues.

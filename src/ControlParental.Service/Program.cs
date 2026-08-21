@@ -421,8 +421,9 @@ public static class Program
                 enforcementLevelMonitor: enforcementLevelMonitor,
                 integrityChecker: integrityChecker,
                 backendClient: backendClient,
-                verdictHandler: verdictHandler,
-                onTamperDetected: tamperEvent =>
+                 verdictHandler: verdictHandler,
+                 identityCoordinator: sp.GetRequiredService<IBackendIdentityCoordinator>(),
+                 onTamperDetected: tamperEvent =>
                 {
                     System.Diagnostics.Debug.WriteLine(
                         $"[AntiTamperMonitor] Tamper event: {tamperEvent.Type} - {tamperEvent.Description}");

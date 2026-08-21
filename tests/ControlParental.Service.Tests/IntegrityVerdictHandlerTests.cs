@@ -29,7 +29,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
                 It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        this.handler = new IntegrityVerdictHandler(this.mockOutboxManager.Object);
+        this.handler = new IntegrityVerdictHandler(this.mockOutboxManager.Object, shadowMode: true);
     }
 
     public void Dispose()
@@ -460,7 +460,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
     }
 
     /// <summary>
-    /// Shadow mode starts as true by default.
+    /// Production handlers are authoritative by default.
     /// </summary>
     [Fact]
     public void IsShadowMode_DefaultsToTrue()
@@ -469,7 +469,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
         var newHandler = new IntegrityVerdictHandler();
 
         // Assert
-        newHandler.IsShadowMode.Should().BeTrue();
+        newHandler.IsShadowMode.Should().BeFalse();
         newHandler.Dispose();
     }
 
@@ -531,5 +531,22 @@ public class IntegrityVerdictHandlerTests : IDisposable
         // Assert
         reaction.Action.Should().Be(VerdictAction.ShadowWarn);
         reaction.Reason.Should().Contain("Shadow mode");
+    }
+
+    [Fact]
+    public void HandleVerdict_RecoveryThreshold_EmitsAuthoritativeRecoverySignal()
+    {
+        this.handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
+        this.handler.DisableShadowMode();
+        var timestamp = DateTimeOffset.UtcNow;
+
+        this.handler.HandleVerdict("revoked", true, timestamp);
+        this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(1));
+        this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(2));
+        var recovery = this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(3));
+
+        var recoveryProperty = recovery.GetType().GetProperty("IsAuthoritativeRecovery");
+        recoveryProperty.Should().NotBeNull();
+        recoveryProperty!.GetValue(recovery).Should().Be(true);
     }
 }

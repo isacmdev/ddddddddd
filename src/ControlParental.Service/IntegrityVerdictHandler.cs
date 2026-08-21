@@ -79,7 +79,10 @@ public enum VerdictAction
 public sealed record VerdictReaction(
     VerdictAction Action,
     EnforcementIssueSeverity? Severity,
-    string? Reason);
+    string? Reason)
+{
+    public bool IsAuthoritativeRecovery { get; init; }
+}
 
 /// <summary>
 /// T23 — Implementation of IIntegrityVerdictHandler with all 8 anti-false-positive mechanisms.
@@ -103,7 +106,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     private DateTimeOffset? lastVerdictTime;
     private Timer? escalationTimer;
     private bool pendingDegradeNotified;
-    private bool shadowMode = true;
+    private bool shadowMode;
     private bool disposed;
 
     private readonly IOutboxManager? outboxManager;
@@ -112,9 +115,10 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     /// Initializes a new instance of the <see cref="IntegrityVerdictHandler"/> class.
     /// </summary>
     /// <param name="outboxManager">Optional outbox manager for admin notifications.</param>
-    public IntegrityVerdictHandler(IOutboxManager? outboxManager = null)
+    public IntegrityVerdictHandler(IOutboxManager? outboxManager = null, bool shadowMode = false)
     {
         this.outboxManager = outboxManager;
+        this.shadowMode = shadowMode;
         this.serviceStartTime = DateTimeOffset.UtcNow;
     }
 
@@ -207,6 +211,11 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
                 // remove the degradation issue when trust is restored
                 System.Diagnostics.Debug.WriteLine(
                     $"[IntegrityVerdictHandler] Trust threshold met ({RecoveryThreshold}). System can recover from degraded state.");
+
+                return new VerdictReaction(VerdictAction.None, null, "Authoritative trust recovery")
+                {
+                    IsAuthoritativeRecovery = true,
+                };
             }
 
             return new VerdictReaction(VerdictAction.None, null, "Trust verdict received");
@@ -296,7 +305,6 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         {
             // Schedule escalation timer
             this.ScheduleEscalation(timestamp);
-
             // Enqueue admin notification
             _ = this.EnqueueNotificationAsync(
                 "integrity_degrade_pending",

@@ -473,4 +473,5 @@ public class AntiTamperMonitorTests : IDisposable
         // Assert
         this.monitor.CurrentTimezone.Should().NotBeNullOrEmpty();
     }
+
 }

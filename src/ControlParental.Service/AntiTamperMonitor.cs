@@ -26,6 +26,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private bool isRunning;
     private bool disposed;
     private readonly object lockObject = new();
+    private readonly IBackendIdentityCoordinator? identityCoordinator;
     private readonly List<TamperEvent> detectedEvents = new();
     private string currentTimezone;
     private long lastMonotonicTick;
@@ -50,7 +51,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         IIntegrityChecker integrityChecker,
         IBackendClient backendClient,
         IIntegrityVerdictHandler verdictHandler,
-        Action<TamperEvent>? onTamperDetected = null)
+        Action<TamperEvent>? onTamperDetected = null,
+        IBackendIdentityCoordinator? identityCoordinator = null)
     {
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.outboxManager = outboxManager ?? throw new ArgumentNullException(nameof(outboxManager));
@@ -60,6 +62,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         this.backendClient = backendClient ?? throw new ArgumentNullException(nameof(backendClient));
         this.verdictHandler = verdictHandler ?? throw new ArgumentNullException(nameof(verdictHandler));
         this.onTamperDetected = onTamperDetected ?? (_ => { });
+        this.identityCoordinator = identityCoordinator;
 
         this.currentTimezone = TimeZoneInfo.Local.Id;
         this.lastMonotonicTick = timeProvider.MonotonicNow;
@@ -396,17 +399,20 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             };
 
             // R3: Report to backend
+            var identity = this.identityCoordinator?.CurrentState;
             var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken);
+            if (identity is not null && identity != this.identityCoordinator!.CurrentState)
+            {
+                return;
+            }
 
-            // T23: Handle local integrity failure via verdict handler
+            // Local evidence is report-only. It cannot change durable enforcement.
             if (!result.IsSignatureValid)
             {
                 var timestamp = this.timeProvider.WallClockNow;
-                var reaction = this.verdictHandler.HandleLocalFailure(
+                _ = this.verdictHandler.HandleLocalFailure(
                     $"Signature invalid for {result.ExecutablePath}",
                     timestamp);
-
-                this.ProcessVerdictReaction(reaction, "local failure");
             }
 
             // T23: Handle server verdict via verdict handler
@@ -415,7 +421,15 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 reportResult.Success,
                 this.timeProvider.WallClockNow);
 
-            this.ProcessVerdictReaction(verdictReaction, $"server verdict: {reportResult.Verdict}");
+            if (reportResult.Success
+                && reportResult.Verdict is "trust" or "revoked")
+            {
+                await this.ProcessVerdictReactionAsync(
+                    verdictReaction,
+                    $"server verdict: {reportResult.Verdict}",
+                    cancellationToken,
+                    identity);
+            }
         }
         catch (Exception ex)
         {
@@ -424,8 +438,26 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private void ProcessVerdictReaction(VerdictReaction reaction, string context)
+    private async Task ProcessVerdictReactionAsync(
+        VerdictReaction reaction,
+        string context,
+        CancellationToken cancellationToken,
+        BackendIdentityState? identity)
     {
+        var integrityIssueKey = new IssueKey(
+            0,
+            EnforcementIssueType.BinaryIntegrityFailure,
+            "integrity/binary",
+            identity?.DeviceId);
+        if (reaction.IsAuthoritativeRecovery)
+        {
+            await this.enforcementLevelMonitor.ResolveIssueAsync(
+                integrityIssueKey,
+                "authoritative backend trust verdict",
+                cancellationToken);
+            return;
+        }
+
         switch (reaction.Action)
         {
             case VerdictAction.None:
@@ -440,19 +472,21 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             case VerdictAction.Limit:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity limit ({context}): {reaction.Reason}");
-                this.enforcementLevelMonitor.AddIssue(
-                    EnforcementIssueType.BinaryIntegrityFailure,
+                await this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey,
                     reaction.Severity ?? EnforcementIssueSeverity.Warning,
-                    reaction.Reason ?? "Integrity limit reached");
+                    reaction.Reason ?? "Integrity limit reached",
+                    cancellationToken);
                 break;
 
             case VerdictAction.Degrade:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity degrade ({context}): {reaction.Reason}");
-                this.enforcementLevelMonitor.AddIssue(
-                    EnforcementIssueType.BinaryIntegrityFailure,
+                await this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey,
                     reaction.Severity ?? EnforcementIssueSeverity.Severe,
-                    reaction.Reason ?? "Integrity degradation triggered");
+                    reaction.Reason ?? "Integrity degradation triggered",
+                    cancellationToken);
                 break;
 
             case VerdictAction.ShadowWarn:
@@ -569,4 +603,5 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
         GC.SuppressFinalize(this);
     }
+
 }
