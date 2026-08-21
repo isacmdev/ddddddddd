@@ -21,11 +21,11 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private readonly IIntegrityVerdictHandler verdictHandler;
     private readonly Action<TamperEvent>? onTamperDetected;
 
-    private Timer? monitorTimer;
-    private Timer? timezoneTimer;
-    private bool isRunning;
     private bool disposed;
     private readonly object lockObject = new();
+    private Generation? generation;
+    private int generationAllocations;
+    private readonly Func<CancellationToken, ValueTask<bool>>? tickSource;
     private readonly IBackendIdentityCoordinator? identityCoordinator;
     private readonly List<TamperEvent> detectedEvents = new();
     private string currentTimezone;
@@ -33,6 +33,21 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private DateTimeOffset lastWallClockTime;
     private bool clockJumpDetected;
     private bool timezoneChangedDetected;
+    private readonly AsyncLocal<Generation?> callbackGeneration = new();
+    private sealed class Generation
+    {
+        internal readonly CancellationTokenSource Cancellation;
+        internal readonly SemaphoreSlim Gate = new(1, 1);
+        internal readonly TaskCompletionSource InitialCheck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal Task? InitialOperation;
+        internal readonly HashSet<Task> OwnedTasks = new();
+        internal readonly Func<CancellationToken, ValueTask<bool>>? TickSource;
+        internal Timer? TimezoneTimer; internal PeriodicTimer? TickTimer; internal Task? Loop; internal Task? Drain;
+        internal int CancellationDisposals; internal int GateDisposals; internal int TickTimerDisposals; internal int TimezoneTimerDisposals;
+        internal bool AdmissionOpen = true; internal string Timezone = TimeZoneInfo.Local.Id;
+        internal Generation(CancellationToken cancellationToken, Func<CancellationToken, ValueTask<bool>>? tickSource) { this.TickSource = tickSource; this.Cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); }
+    }
+    private sealed record Admission(Task Task, TaskCompletionSource Gate);
 
     // Thresholds
     private const double MaxAllowedClockDriftSeconds = 300; // 5 minutes
@@ -52,7 +67,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         IBackendClient backendClient,
         IIntegrityVerdictHandler verdictHandler,
         Action<TamperEvent>? onTamperDetected = null,
-        IBackendIdentityCoordinator? identityCoordinator = null)
+        IBackendIdentityCoordinator? identityCoordinator = null,
+        Func<CancellationToken, ValueTask<bool>>? tickSource = null)
     {
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.outboxManager = outboxManager ?? throw new ArgumentNullException(nameof(outboxManager));
@@ -63,7 +79,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         this.verdictHandler = verdictHandler ?? throw new ArgumentNullException(nameof(verdictHandler));
         this.onTamperDetected = onTamperDetected ?? (_ => { });
         this.identityCoordinator = identityCoordinator;
-
+        this.tickSource = tickSource;
         this.currentTimezone = TimeZoneInfo.Local.Id;
         this.lastMonotonicTick = timeProvider.MonotonicNow;
         this.lastWallClockTime = timeProvider.WallClockNow;
@@ -129,51 +145,116 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     /// <inheritdoc />
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (this.disposed)
+        while (true)
         {
-            throw new ObjectDisposedException(nameof(AntiTamperMonitor));
+            Task initialization; Task? stopping = null; Admission? release = null;
+            lock (this.lockObject)
+            {
+                if (this.disposed) throw new ObjectDisposedException(nameof(AntiTamperMonitor));
+                var current = this.generation;
+                if (current is not null && current.AdmissionOpen) initialization = current.InitialCheck.Task;
+                else if (current is not null) { stopping = current.Drain!; initialization = Task.CompletedTask; }
+                else
+                {
+                    current = new Generation(cancellationToken, this.tickSource)
+                    {
+                        TimezoneTimer = new Timer(_ => this.AdmitTimezoneCheck(current), null, TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds), TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds)),
+                        TickTimer = this.tickSource is null ? new PeriodicTimer(TimeSpan.FromSeconds(MonitorIntervalSeconds)) : null,
+                    };
+                    this.generation = current; this.generationAllocations++; this.currentTimezone = current.Timezone;
+                    this.lastMonotonicTick = this.timeProvider.MonotonicNow; this.lastWallClockTime = this.timeProvider.WallClockNow;
+                    var initial = this.AdmitCheckLocked(current, true); current.InitialOperation = initial.Task; current.Loop = this.RunMonitorLoopAsync(current); initialization = current.InitialCheck.Task; release = initial;
+                }
+            }
+            release?.Gate.TrySetResult(); if (stopping is not null) { await stopping.ConfigureAwait(false); continue; }
+            await initialization.ConfigureAwait(false); break;
         }
-
-        if (this.isRunning)
-        {
-            return;
-        }
-
-        this.isRunning = true;
-
-        // Initialize timezone
-        this.currentTimezone = TimeZoneInfo.Local.Id;
-        this.lastMonotonicTick = this.timeProvider.MonotonicNow;
-        this.lastWallClockTime = this.timeProvider.WallClockNow;
-
-        // Start periodic integrity checks
-        this.monitorTimer = new Timer(
-            _ => _ = this.PerformIntegrityCheckAsync(CancellationToken.None),
-            null,
-            TimeSpan.FromSeconds(MonitorIntervalSeconds),
-            TimeSpan.FromSeconds(MonitorIntervalSeconds));
-
-        // Start timezone monitoring
-        this.timezoneTimer = new Timer(
-            _ => this.CheckTimezone(),
-            null,
-            TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds),
-            TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds));
-
-        // Initial check
-        await this.PerformIntegrityCheckAsync(cancellationToken);
-
         System.Diagnostics.Debug.WriteLine("[AntiTamperMonitor] Started.");
     }
 
     /// <inheritdoc />
-    public Task StopAsync()
+    public async Task StopAsync()
     {
-        this.isRunning = false;
-        this.monitorTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-        this.timezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        Task task;
+        lock (this.lockObject)
+        {
+            var current = this.generation;
+            if (current is null) task = Task.CompletedTask;
+            else
+            {
+                current.AdmissionOpen = false; current.Cancellation.Cancel();
+                current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                task = this.BeginDrainLocked(current);
+            }
+        }
+        if (!ReferenceEquals(this.callbackGeneration.Value, this.generation)) await task.ConfigureAwait(false);
+
         System.Diagnostics.Debug.WriteLine("[AntiTamperMonitor] Stopped.");
-        return Task.CompletedTask;
+    }
+
+    private Task BeginDrainLocked(Generation current) => current.Drain ??= this.DrainGenerationAsync(current);
+    internal Task TriggerIntegrityCheckAsync(bool cancelWithOwner = false)
+    {
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (this.disposed) return Task.CompletedTask;
+            var current = this.generation;
+            if (current is null || !current.AdmissionOpen) return Task.CompletedTask;
+            admission = this.AdmitCheckLocked(current, cancelWithOwner);
+        }
+        admission.Gate.TrySetResult(); return admission.Task;
+    }
+
+    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner) => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner));
+    private Admission AdmitLocked(Generation current, Func<Task> work) { var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var task = RunAfterGateAsync(gate.Task, work); this.AdmitTask(current, task); return new(task, gate); }
+    private static async Task RunAfterGateAsync(Task gate, Func<Task> work) { await gate.ConfigureAwait(false); await work().ConfigureAwait(false); }
+    private void AdmitTimezoneCheck(Generation current)
+    {
+        Admission? admission = null; lock (this.lockObject) if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen) admission = this.AdmitLocked(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }); admission?.Gate.TrySetResult();
+    }
+    private void AdmitTask(Generation current, Task task)
+    {
+        current.OwnedTasks.Add(task);
+        _ = task.ContinueWith(completed => { _ = completed.Exception; lock (this.lockObject) current.OwnedTasks.Remove(completed); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+    private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner)
+    {
+        var ownerToken = current.Cancellation.Token; var gate = current.Gate;
+        await gate.WaitAsync(cancelWithOwner ? ownerToken : CancellationToken.None).ConfigureAwait(false);
+        try { await this.PerformIntegrityCheckAsync(current, cancelWithOwner ? ownerToken : CancellationToken.None, cancelWithOwner).ConfigureAwait(false); }
+        finally { gate.Release(); }
+    }
+    private async Task DrainGenerationAsync(Generation current)
+    {
+        var failure = await CaptureFailureAsync(current.Loop, current.Cancellation.IsCancellationRequested).ConfigureAwait(false);
+        while (true) { Task[] owned; lock (this.lockObject) owned = current.OwnedTasks.ToArray(); if (owned.Length == 0) break; failure ??= await CaptureFailureAsync(Task.WhenAll(owned), true).ConfigureAwait(false); }
+
+        lock (this.lockObject) { if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
+
+        current.Cancellation.Dispose(); current.CancellationDisposals++;
+        if (failure is not null) throw failure;
+    }
+    private static async Task<Exception?> CaptureFailureAsync(Task? task, bool ignoreCancellation)
+    {
+        if (task is null) return null;
+        try { await task.ConfigureAwait(false); return null; }
+        catch (OperationCanceledException) when (ignoreCancellation) { return null; } catch (Exception exception) { return exception; }
+    }
+    private async Task RunMonitorLoopAsync(Generation current)
+    {
+        var cancellationToken = current.Cancellation.Token;
+        try
+        {
+            await current.InitialOperation!.ConfigureAwait(false); cancellationToken.ThrowIfCancellationRequested(); current.InitialCheck.TrySetResult();
+            if (current.TickSource is not null) while (await current.TickSource(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
+            else while (await current.TickTimer!.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { current.InitialCheck.TrySetCanceled(cancellationToken); } catch (Exception exception) { current.InitialCheck.TrySetException(exception); throw; }
+    }
+    private void AdmitPeriodicCheck(Generation current)
+    {
+        Admission? admission = null; lock (this.lockObject) if (current.AdmissionOpen && ReferenceEquals(this.generation, current)) admission = this.AdmitCheckLocked(current, false); admission?.Gate.TrySetResult();
     }
 
     /// <inheritdoc />
@@ -248,37 +329,36 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private async Task PerformIntegrityCheckAsync(CancellationToken cancellationToken)
+    private async Task PerformIntegrityCheckAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
-        if (this.disposed || !this.isRunning)
+        if (!this.IsGenerationActive(current))
         {
             return;
         }
 
         try
         {
-            // Check for clock jumps
-            await this.CheckClockIntegrityAsync(cancellationToken);
-
-            // Check timezone changes
-            this.CheckTimezone();
+            await this.CheckClockIntegrityAsync(current, cancellationToken);
+            this.CheckTimezone(current);
 
             // Check if child became admin
             await this.CheckPrivilegeStatusAsync(cancellationToken);
 
             // T23: Check binary integrity (Authenticode + SHA256)
-            await this.PerformBinaryIntegrityCheckAsync(cancellationToken);
+            await this.PerformBinaryIntegrityCheckAsync(cancellationToken, propagateFailure);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            if (propagateFailure) throw;
             System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Integrity check failed: {ex.Message}");
         }
     }
 
-    private async Task CheckClockIntegrityAsync(CancellationToken cancellationToken)
+    private async Task CheckClockIntegrityAsync(Generation current, CancellationToken cancellationToken)
     {
         var currentMonotonic = this.timeProvider.MonotonicNow;
         var currentWallClock = this.timeProvider.WallClockNow;
+        double jump = 0; var direction = 0;
 
         lock (this.lockObject)
         {
@@ -291,54 +371,62 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             // If wall clock went backwards more than a small threshold, it's suspicious
             if (wallClockDelta < -MaxAllowedClockJumpSeconds && monotonicDelta > 0)
             {
-                this.FireClockJump(wallClockDelta, -1);
+                jump = wallClockDelta; direction = -1;
             }
             // If wall clock jumped forward significantly without monotonic increase, suspicious
             else if (wallClockDelta > MaxAllowedClockJumpSeconds && monotonicDelta < wallClockDelta * 1000)
             {
-                this.FireClockJump(wallClockDelta, 1);
+                jump = wallClockDelta; direction = 1;
             }
 
             this.lastMonotonicTick = currentMonotonic;
             this.lastWallClockTime = currentWallClock;
         }
 
+        if (direction != 0) this.FireClockJump(jump, direction, current);
+
         await Task.CompletedTask;
     }
 
-    private void CheckTimezone()
+    private bool IsGenerationActive(Generation current) { lock (this.lockObject) return !this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen; }
+
+    private void CheckTimezone(Generation current)
     {
-        if (this.disposed || !this.isRunning)
+        if (!this.IsGenerationActive(current))
         {
             return;
         }
 
         var newTimezone = TimeZoneInfo.Local.Id;
 
+        string? oldTimezone = null;
         lock (this.lockObject)
         {
-            if (!string.Equals(this.currentTimezone, newTimezone, StringComparison.OrdinalIgnoreCase))
+            if (current.AdmissionOpen && ReferenceEquals(this.generation, current) && !string.Equals(current.Timezone, newTimezone, StringComparison.OrdinalIgnoreCase))
             {
-                var oldTimezone = this.currentTimezone;
+                oldTimezone = current.Timezone;
+                current.Timezone = newTimezone;
                 this.currentTimezone = newTimezone;
                 this.timezoneChangedDetected = true;
-
-                this.RecordTamperEvent(
-                    TamperEventType.TimezoneChanged,
-                    $"Timezone changed from '{oldTimezone}' to '{newTimezone}'",
-                    TamperSeverity.Warning);
-
-                this.FireTimezoneChanged(oldTimezone, newTimezone);
-
-                System.Diagnostics.Debug.WriteLine(
-                    $"[AntiTamperMonitor] Timezone changed: {oldTimezone} -> {newTimezone}");
             }
+        }
+
+        if (oldTimezone is not null)
+        {
+            this.RecordTamperEvent(
+                TamperEventType.TimezoneChanged,
+                $"Timezone changed from '{oldTimezone}' to '{newTimezone}'",
+                TamperSeverity.Warning,
+                current);
+            this.FireTimezoneChanged(oldTimezone, newTimezone, current);
+            System.Diagnostics.Debug.WriteLine(
+                $"[AntiTamperMonitor] Timezone changed: {oldTimezone} -> {newTimezone}");
         }
     }
 
     private async Task CheckPrivilegeStatusAsync(CancellationToken cancellationToken)
     {
-        if (this.disposed || !this.isRunning)
+        if (this.disposed)
         {
             return;
         }
@@ -366,16 +454,15 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AntiTamperMonitor] Privilege check failed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Privilege check failed: {ex.Message}");
         }
     }
 
-    private async Task PerformBinaryIntegrityCheckAsync(CancellationToken cancellationToken)
+    private async Task PerformBinaryIntegrityCheckAsync(CancellationToken cancellationToken, bool propagateFailure = false)
     {
-        if (this.disposed || !this.isRunning)
+        if (this.disposed)
         {
             return;
         }
@@ -400,7 +487,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
             // R3: Report to backend
             var identity = this.identityCoordinator?.CurrentState;
-            var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken);
+            var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken) ?? new(false, null);
             if (identity is not null && identity != this.identityCoordinator!.CurrentState)
             {
                 return;
@@ -419,7 +506,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             var verdictReaction = this.verdictHandler.HandleVerdict(
                 reportResult.Verdict,
                 reportResult.Success,
-                this.timeProvider.WallClockNow);
+                this.timeProvider.WallClockNow) ?? new(VerdictAction.None, null, null);
 
             if (reportResult.Success
                 && reportResult.Verdict is "trust" or "revoked")
@@ -431,10 +518,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                     identity);
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AntiTamperMonitor] Binary integrity check failed: {ex.Message}");
+            if (propagateFailure) throw;
+            System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Binary integrity check failed: {ex.Message}");
         }
     }
 
@@ -496,8 +583,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private void RecordTamperEvent(TamperEventType type, string description, TamperSeverity severity)
+    private void RecordTamperEvent(TamperEventType type, string description, TamperSeverity severity, Generation? owner = null)
     {
+        Admission? outbox = null;
         var tamperEvent = new TamperEvent
         {
             Type = type,
@@ -509,14 +597,23 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         lock (this.lockObject)
         {
             this.detectedEvents.Add(tamperEvent);
+            if (owner is not null && owner.AdmissionOpen && ReferenceEquals(this.generation, owner))
+            {
+                outbox = this.AdmitLocked(owner, () => this.EnqueueToOutboxAsync(tamperEvent, owner.Cancellation.Token));
+            }
         }
 
-        // Enqueue to outbox (T03)
-        this.EnqueueToOutboxAsync(tamperEvent, CancellationToken.None).ConfigureAwait(false);
+        outbox?.Gate.TrySetResult();
 
-        // Fire events
-        this.TamperDetected?.Invoke(this, new TamperEventArgs { Event = tamperEvent });
-        this.onTamperDetected(tamperEvent);
+        // Enqueue to outbox (T03)
+        if (owner is null)
+        {
+            _ = this.EnqueueToOutboxAsync(tamperEvent, CancellationToken.None);
+        }
+
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.TamperDetected?.Invoke(this, new TamperEventArgs { Event = tamperEvent }); this.onTamperDetected(tamperEvent); }
+        finally { this.callbackGeneration.Value = previous; }
 
         System.Diagnostics.Debug.WriteLine(
             $"[AntiTamperMonitor] Tamper detected: {type} - {description}");
@@ -560,7 +657,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private void FireClockJump(double offsetSeconds, int direction)
+    private void FireClockJump(double offsetSeconds, int direction, Generation? owner = null)
     {
         lock (this.lockObject)
         {
@@ -574,10 +671,12 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             DetectedAt = this.timeProvider.WallClockNow,
         };
 
-        this.OnClockJumpDetected?.Invoke(this, args);
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.OnClockJumpDetected?.Invoke(this, args); }
+        finally { this.callbackGeneration.Value = previous; }
     }
 
-    private void FireTimezoneChanged(string? oldTimezone, string newTimezone)
+    private void FireTimezoneChanged(string? oldTimezone, string newTimezone, Generation? owner = null)
     {
         var args = new TimezoneChangedEventArgs
         {
@@ -586,21 +685,32 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             ChangedAt = this.timeProvider.WallClockNow,
         };
 
-        this.TimezoneChanged?.Invoke(this, args);
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.TimezoneChanged?.Invoke(this, args); }
+        finally { this.callbackGeneration.Value = previous; }
     }
 
     public void Dispose()
     {
-        if (!this.disposed)
+        Task drain;
+        lock (this.lockObject)
         {
             this.disposed = true;
-            this.isRunning = false;
-            this.monitorTimer?.Dispose();
-            this.timezoneTimer?.Dispose();
-            this.monitorTimer = null;
-            this.timezoneTimer = null;
+            var current = this.generation;
+            if (current is null)
+            {
+                drain = Task.CompletedTask;
+            }
+            else
+            {
+                current.AdmissionOpen = false;
+                current.Cancellation.Cancel();
+                current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                drain = this.BeginDrainLocked(current);
+            }
         }
 
+        if (!ReferenceEquals(this.callbackGeneration.Value, this.generation)) drain.GetAwaiter().GetResult();
         GC.SuppressFinalize(this);
     }
 
