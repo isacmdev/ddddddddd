@@ -78,7 +78,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
     /// </summary>
     [Theory]
     [InlineData(1, VerdictAction.Warn, "1/3")]
-    [InlineData(2, VerdictAction.Warn, "2/3")]
+    [InlineData(2, VerdictAction.Limit, "2/3")]
     public void HandleVerdict_ConsecutiveRevoked_StagedResponse(int count, VerdictAction expectedAction, string expectedCount)
     {
         // Arrange
@@ -122,7 +122,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
         var third = this.handler.HandleVerdict("revoked", true, timestamp.AddSeconds(2));
 
         // Assert - 3rd triggers escalation warning, not immediate Degrade
-        third.Action.Should().Be(VerdictAction.Warn);
+        third.Action.Should().Be(VerdictAction.Limit);
         third.Reason.Should().Contain("5 minutes"); // escalation delay message
     }
 
@@ -132,24 +132,13 @@ public class IntegrityVerdictHandlerTests : IDisposable
     [Fact]
     public void HandleVerdict_AfterEscalationWindow_SubsequentRevoked_ReturnsDegrade()
     {
-        // Arrange
-        this.handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
-        this.handler.ResetForTesting();
-        this.handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
-        this.handler.DisableShadowMode();
-
         var timestamp = DateTimeOffset.UtcNow;
-
-        // Act - 3 consecutive revoked (triggers escalation)
-        this.handler.HandleVerdict("revoked", true, timestamp);
-        this.handler.HandleVerdict("revoked", true, timestamp.AddSeconds(1));
-        this.handler.HandleVerdict("revoked", true, timestamp.AddSeconds(2));
-
-        // Next revoked after escalation notification is sent
-        var degrade = this.handler.HandleVerdict("revoked", true, timestamp.AddSeconds(3));
-
-        // Assert - should now degrade
-        degrade.Action.Should().Be(VerdictAction.Degrade);
+        using var ordered = new IntegrityVerdictHandler(this.mockOutboxManager.Object, clock: () => timestamp);
+        ordered.SetServiceStartTime(DateTimeOffset.MinValue);
+        ordered.DisableShadowMode();
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, timestamp);
+        timestamp = timestamp.AddMinutes(6);
+        ordered.HandleVerdict("revoked", true, timestamp).Action.Should().Be(VerdictAction.Degrade);
     }
 
     /// <summary>
@@ -312,7 +301,7 @@ public class IntegrityVerdictHandlerTests : IDisposable
 
         // Assert - should now be Warn, not ShadowWarn
         reaction1.Action.Should().Be(VerdictAction.Warn);
-        reaction2.Action.Should().Be(VerdictAction.Warn);
+        reaction2.Action.Should().Be(VerdictAction.Limit);
     }
 
     /// <summary>
@@ -336,8 +325,8 @@ public class IntegrityVerdictHandlerTests : IDisposable
 
         // Assert
         r1.Action.Should().Be(VerdictAction.Warn);
-        r2.Action.Should().Be(VerdictAction.Warn);
-        r3.Action.Should().Be(VerdictAction.Warn); // 3rd triggers escalation, not immediate degrade
+        r2.Action.Should().Be(VerdictAction.Limit);
+        r3.Action.Should().Be(VerdictAction.Limit); // 3rd starts the pending deadline
         r3.Reason.Should().Contain("5 minutes"); // Escalation message
     }
 
@@ -406,10 +395,10 @@ public class IntegrityVerdictHandlerTests : IDisposable
     }
 
     /// <summary>
-    /// Verdict "unknown" resets both counters.
+    /// Verdict "unknown" returns a warning.
     /// </summary>
     [Fact]
-    public void HandleVerdict_Unknown_ResetsBothCounters()
+    public void HandleVerdict_Unknown_ReturnsWarning()
     {
         // Arrange
         this.handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
@@ -418,16 +407,9 @@ public class IntegrityVerdictHandlerTests : IDisposable
         this.handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
 
         var timestamp = DateTimeOffset.UtcNow;
-
-        // 2 revoked
         this.handler.HandleVerdict("revoked", true, timestamp);
         this.handler.HandleVerdict("revoked", true, timestamp.AddSeconds(1));
-
-        // Act - unknown
-        var reaction = this.handler.HandleVerdict("unknown", true, timestamp.AddSeconds(2));
-
-        // Assert - should be Warn (unknown resets counters then warns)
-        reaction.Action.Should().Be(VerdictAction.Warn);
+        this.handler.HandleVerdict("unknown", true, timestamp.AddSeconds(2)).Action.Should().Be(VerdictAction.Warn);
     }
 
     /// <summary>
@@ -540,7 +522,8 @@ public class IntegrityVerdictHandlerTests : IDisposable
         this.handler.DisableShadowMode();
         var timestamp = DateTimeOffset.UtcNow;
 
-        this.handler.HandleVerdict("revoked", true, timestamp);
+        for (var i = 0; i < 3; i++) this.handler.HandleVerdict("revoked", true, timestamp.AddMilliseconds(i));
+        this.handler.EvaluateDeadline(DateTimeOffset.UtcNow.AddMinutes(6));
         this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(1));
         this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(2));
         var recovery = this.handler.HandleVerdict("trust", true, timestamp.AddSeconds(3));
@@ -548,5 +531,104 @@ public class IntegrityVerdictHandlerTests : IDisposable
         var recoveryProperty = recovery.GetType().GetProperty("IsAuthoritativeRecovery");
         recoveryProperty.Should().NotBeNull();
         recoveryProperty!.GetValue(recovery).Should().Be(true);
+    }
+
+    [Fact]
+    public void EqualTimestamps_AreOrderedByAcceptanceAndAcceptedDuplicatesCount()
+    {
+        using var ordered = new IntegrityVerdictHandler();
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(10);
+        ordered.HandleVerdict("revoked", true, timestamp).Action.Should().Be(VerdictAction.Warn);
+        ordered.HandleVerdict("revoked", true, timestamp).Action.Should().Be(VerdictAction.Limit);
+        ordered.HandleVerdict("trust", true, timestamp).Action.Should().Be(VerdictAction.None);
+        ordered.HandleVerdict("revoked", true, timestamp).Reason.Should().Contain("1/3");
+    }
+    [Fact]
+    public void NonDefinitivePreservesPendingAndDeadlineIsPureAndOneShot()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var ordered = new IntegrityVerdictHandler(clock: () => now);
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, now);
+        for (var i = 0; i < 5; i++) ordered.HandleVerdict(null, false, now);
+        ordered.EvaluateDeadline(now.AddMinutes(5).AddTicks(-1)).Action.Should().Be(VerdictAction.Limit);
+        ordered.EvaluateDeadline(now.AddMinutes(5)).Action.Should().Be(VerdictAction.Degrade);
+        now = now.AddMinutes(15);
+        ordered.HandleVerdict("revoked", true, now).Reason.Should().Contain("4/3");
+    }
+    [Fact]
+    public void ReentrantCallbackRunsAfterCommitAndFaultRemainsObservable()
+    {
+        IntegrityVerdictHandler? handler = null;
+        var callbackCount = 0;
+        handler = new IntegrityVerdictHandler(onReaction: _ =>
+        {
+            callbackCount++;
+            handler.HandleVerdict("trust", true, DateTimeOffset.UtcNow);
+        });
+        handler.SetServiceStartTime(DateTimeOffset.MinValue);
+        handler.DisableShadowMode();
+        handler.HandleVerdict("revoked", true, DateTimeOffset.UtcNow).Action.Should().Be(VerdictAction.Warn);
+        callbackCount.Should().Be(1);
+        var failure = new InvalidOperationException("callback");
+        using var faulting = new IntegrityVerdictHandler(onReaction: _ => throw failure);
+        faulting.SetServiceStartTime(DateTimeOffset.MinValue);
+        faulting.DisableShadowMode();
+        var act = () => faulting.HandleVerdict("revoked", true, DateTimeOffset.UtcNow);
+        act.Should().ThrowExactly<InvalidOperationException>().Which.Should().BeSameAs(failure);
+    }
+    [Fact]
+    public void TrustAtDeadline_DegradesThenRecoversExactlyOnce()
+    {
+        var acceptance = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var ordered = new IntegrityVerdictHandler(clock: () => acceptance);
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, acceptance);
+        acceptance = acceptance.AddMinutes(5);
+        ordered.HandleVerdict("trust", true, acceptance).Action.Should().Be(VerdictAction.Degrade);
+        ordered.HandleVerdict("trust", true, acceptance).IsAuthoritativeRecovery.Should().BeFalse();
+        ordered.HandleVerdict("trust", true, acceptance).IsAuthoritativeRecovery.Should().BeTrue();
+        ordered.HandleVerdict("trust", true, acceptance).IsAuthoritativeRecovery.Should().BeFalse();
+    }
+    [Fact]
+    public void TrustBeforeDeadlineCancelsPendingEscalationAndFreshSequenceDegrades()
+    {
+        var acceptance = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var ordered = new IntegrityVerdictHandler(this.mockOutboxManager.Object, clock: () => acceptance);
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, acceptance);
+        acceptance = acceptance.AddMinutes(1);
+        ordered.HandleVerdict("trust", true, acceptance).Action.Should().Be(VerdictAction.None);
+        acceptance = acceptance.AddMinutes(4);
+        ordered.EvaluateDeadline(acceptance).Action.Should().Be(VerdictAction.None);
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, acceptance);
+        acceptance = acceptance.AddMinutes(5);
+        ordered.EvaluateDeadline(acceptance).Action.Should().Be(VerdictAction.Degrade);
+        this.mockOutboxManager.Verify(o => o.EnqueueAsync("notifications", It.Is<object>(p => p.ToString()!.Contains("Degradation Pending")), It.Is<string>(k => k.Contains("integrity_degrade_pending")), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+    [Fact]
+    public void AuthoritativeRecovery_IsOneShotUntilLaterDegradationStartsFreshTrustSequence()
+    {
+        var acceptance = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var ordered = new IntegrityVerdictHandler(clock: () => acceptance);
+        for (var cycle = 0; cycle < 2; cycle++)
+        {
+            for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, acceptance);
+            acceptance = acceptance.AddMinutes(5);
+            ordered.EvaluateDeadline(acceptance).Action.Should().Be(VerdictAction.Degrade);
+            for (var i = 0; i < 3; i++) ordered.HandleVerdict("trust", true, acceptance).IsAuthoritativeRecovery.Should().Be(i == 2);
+        }
+    }
+
+    [Fact]
+    public void HandleVerdict_CircuitOpenAtDeadline_DegradesOnceThenShadows()
+    {
+        var acceptance = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var ordered = new IntegrityVerdictHandler(this.mockOutboxManager.Object, clock: () => acceptance);
+        for (var i = 0; i < 3; i++) ordered.HandleVerdict("revoked", true, acceptance);
+        for (var i = 0; i < 5; i++) ordered.HandleVerdict(null, false, acceptance);
+        ordered.IsCircuitOpen.Should().BeTrue();
+        acceptance = acceptance.AddMinutes(5);
+        ordered.HandleVerdict("revoked", true, acceptance).Action.Should().Be(VerdictAction.Degrade);
+        ordered.HandleVerdict("revoked", true, acceptance).Action.Should().Be(VerdictAction.ShadowWarn);
+        ordered.IsCircuitOpen.Should().BeTrue();
+        ordered.EvaluateDeadline(acceptance).Action.Should().Be(VerdictAction.None);
     }
 }

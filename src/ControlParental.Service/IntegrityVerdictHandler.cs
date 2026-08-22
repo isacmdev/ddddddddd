@@ -104,10 +104,17 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     private DateTimeOffset? circuitOpenedAt;
     private DateTimeOffset serviceStartTime;
     private DateTimeOffset? lastVerdictTime;
-    private Timer? escalationTimer;
+    private DateTimeOffset? escalationDueAt;
     private bool pendingDegradeNotified;
+    private bool escalationFired;
+    private bool degraded;
     private bool shadowMode;
     private bool disposed;
+    private long stateEpoch;
+    private readonly object stateGate = new();
+    private readonly Action<VerdictReaction>? onReaction;
+    private readonly Func<DateTimeOffset> clock;
+    private readonly Queue<(string Type, string Title, string Body, DateTimeOffset Timestamp)> notifications = new();
 
     private readonly IOutboxManager? outboxManager;
 
@@ -115,11 +122,17 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     /// Initializes a new instance of the <see cref="IntegrityVerdictHandler"/> class.
     /// </summary>
     /// <param name="outboxManager">Optional outbox manager for admin notifications.</param>
-    public IntegrityVerdictHandler(IOutboxManager? outboxManager = null, bool shadowMode = false)
+    public IntegrityVerdictHandler(
+        IOutboxManager? outboxManager = null,
+        bool shadowMode = false,
+        Action<VerdictReaction>? onReaction = null,
+        Func<DateTimeOffset>? clock = null)
     {
         this.outboxManager = outboxManager;
         this.shadowMode = shadowMode;
         this.serviceStartTime = DateTimeOffset.UtcNow;
+        this.onReaction = onReaction;
+        this.clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
 
     /// <inheritdoc />
@@ -127,32 +140,40 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     {
         get
         {
-            if (this.circuitOpenedAt == null)
+            var now = this.clock();
+            lock (this.stateGate)
             {
-                return false;
+                return this.IsCircuitOpenAtLocked(now);
             }
-
-            if ((DateTimeOffset.UtcNow - this.circuitOpenedAt.Value).TotalMinutes >= CircuitOpenDurationMinutes)
-            {
-                return false;
-            }
-
-            return true;
         }
     }
 
+    private bool IsCircuitOpenAtLocked(DateTimeOffset now)
+        => this.circuitOpenedAt is not null
+            && (now - this.circuitOpenedAt.Value).TotalMinutes < CircuitOpenDurationMinutes;
+
     /// <inheritdoc />
-    public bool IsShadowMode => this.shadowMode;
+    public bool IsShadowMode { get { lock (this.stateGate) return this.shadowMode; } }
 
     /// <inheritdoc />
     public void DisableShadowMode()
     {
-        this.shadowMode = false;
+        lock (this.stateGate) this.shadowMode = false;
         System.Diagnostics.Debug.WriteLine("[IntegrityVerdictHandler] Shadow mode disabled. Verdict handling is now active.");
     }
 
     /// <inheritdoc />
     public VerdictReaction HandleVerdict(string? verdict, bool success, DateTimeOffset timestamp)
+    {
+        VerdictReaction reaction;
+        var acceptanceTime = this.clock();
+        lock (this.stateGate) reaction = this.HandleVerdictCore(verdict, success, timestamp, acceptanceTime);
+        this.FlushNotifications();
+        if (reaction.Action != VerdictAction.None || reaction.IsAuthoritativeRecovery) this.onReaction?.Invoke(reaction);
+        return reaction;
+    }
+
+    private VerdictReaction HandleVerdictCore(string? verdict, bool success, DateTimeOffset timestamp, DateTimeOffset acceptanceTime)
     {
         if (this.disposed)
         {
@@ -165,9 +186,12 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
             return new VerdictReaction(VerdictAction.ShadowWarn, null, "Grace period active, skipping check");
         }
 
+        var deadlineWon = this.CommitDeadlineIfDueLocked(acceptanceTime);
+
         // Mechanism 8: Circuit breaker — if open, skip all verdicts
-        if (this.IsCircuitOpen)
+        if (this.IsCircuitOpenAtLocked(acceptanceTime))
         {
+            if (deadlineWon) return new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached");
             return new VerdictReaction(VerdictAction.ShadowWarn, null, "Circuit breaker open, skipping verdict");
         }
 
@@ -175,20 +199,18 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         if (!success)
         {
             this.consecutiveFailures++;
-            this.consecutiveTrustCount = 0;
-
+            if (deadlineWon) return new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached");
             if (this.consecutiveFailures >= CircuitFailureThreshold)
             {
                 this.circuitOpenedAt = timestamp;
                 this.consecutiveFailures = 0;
-                this.consecutiveRevokedCount = 0;
 
                 // Notify admin that circuit opened
-                _ = this.EnqueueNotificationAsync(
+                this.notifications.Enqueue((
                     "circuit_opened",
                     "Integrity Circuit Breaker Opened",
                     $"Backend failed {CircuitFailureThreshold} consecutive times. Circuit open for {CircuitOpenDurationMinutes} minutes.",
-                    timestamp);
+                    timestamp));
 
                 return new VerdictReaction(VerdictAction.ShadowWarn, null, "Circuit breaker opened due to consecutive failures");
             }
@@ -204,13 +226,27 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         {
             this.consecutiveTrustCount++;
             this.consecutiveRevokedCount = 0;
+            if (!this.degraded)
+            {
+                this.pendingDegradeNotified = false;
+                this.escalationDueAt = null;
+                this.escalationFired = false;
+                this.consecutiveTrustCount = 0;
+            }
+            this.stateEpoch++;
 
-            if (this.consecutiveTrustCount >= RecoveryThreshold)
+            if (this.degraded && this.consecutiveTrustCount >= RecoveryThreshold)
             {
                 // Recovery threshold met — the EnforcementLevelMonitor will automatically
                 // remove the degradation issue when trust is restored
                 System.Diagnostics.Debug.WriteLine(
                     $"[IntegrityVerdictHandler] Trust threshold met ({RecoveryThreshold}). System can recover from degraded state.");
+
+                this.degraded = false;
+                this.consecutiveTrustCount = 0;
+                this.pendingDegradeNotified = false;
+                this.escalationDueAt = null;
+                this.escalationFired = false;
 
                 return new VerdictReaction(VerdictAction.None, null, "Authoritative trust recovery")
                 {
@@ -218,27 +254,27 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
                 };
             }
 
+            if (deadlineWon) return new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached before trust recovery");
+
             return new VerdictReaction(VerdictAction.None, null, "Trust verdict received");
         }
 
         // Unknown verdict — reset counters, warn but don't degrade
         if (verdict == "unknown")
         {
-            this.consecutiveTrustCount = 0;
-            this.consecutiveRevokedCount = 0;
-
+            if (deadlineWon) return new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached");
             return new VerdictReaction(VerdictAction.Warn, EnforcementIssueSeverity.Warning, "Verdict unknown");
         }
 
         // "revoked" verdict — apply staged response
         if (verdict == "revoked")
         {
-            return this.HandleRevokedVerdict(timestamp);
+            this.consecutiveTrustCount = 0;
+            var reaction = this.HandleRevokedVerdict(timestamp, acceptanceTime);
+            return deadlineWon ? new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached") : reaction;
         }
 
         // Unknown verdict string
-        this.consecutiveTrustCount = 0;
-        this.consecutiveRevokedCount = 0;
         return new VerdictReaction(VerdictAction.Warn, EnforcementIssueSeverity.Warning, $"Unknown verdict: {verdict}");
     }
 
@@ -266,7 +302,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         return new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, $"Local integrity failure: {reason}");
     }
 
-    private VerdictReaction HandleRevokedVerdict(DateTimeOffset timestamp)
+    private VerdictReaction HandleRevokedVerdict(DateTimeOffset timestamp, DateTimeOffset acceptanceTime)
     {
         this.consecutiveTrustCount = 0;
         this.consecutiveRevokedCount++;
@@ -284,72 +320,90 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         // Mechanism 6: Staged response — WARN → LIMIT → DEGRADED based on count
         if (this.consecutiveRevokedCount < RevokedThreshold)
         {
-            // Stage 1: WARN (consecutive 1)
-            // Stage 2: WARN (consecutive 2)
-            // Stage 3: Escalation triggers
-            var stage = this.consecutiveRevokedCount switch
-            {
-                1 => "Warn",
-                2 => "Limit",
-                _ => "Escalation",
-            };
-
             return new VerdictReaction(
-                VerdictAction.Warn,
+                this.consecutiveRevokedCount == 1 ? VerdictAction.Warn : VerdictAction.Limit,
                 EnforcementIssueSeverity.Warning,
-                $"Revoked verdict {this.consecutiveRevokedCount}/{RevokedThreshold}: {stage}");
+                $"Revoked verdict {this.consecutiveRevokedCount}/{RevokedThreshold}");
         }
 
         // Mechanism 4: Escalation before DEGRADED — notify admin, wait 5 minutes
         if (!this.pendingDegradeNotified)
         {
-            // Schedule escalation timer
-            this.ScheduleEscalation(timestamp);
+            this.escalationDueAt = acceptanceTime.AddMinutes(EscalationDelayMinutes);
+            this.stateEpoch++;
             // Enqueue admin notification
-            _ = this.EnqueueNotificationAsync(
+            this.notifications.Enqueue((
                 "integrity_degrade_pending",
                 "Integrity Degradation Pending",
                 $"Binary integrity revoked {RevokedThreshold} consecutive times. System will degrade in {EscalationDelayMinutes} minutes unless overridden by admin.",
-                timestamp);
+                timestamp));
 
             this.pendingDegradeNotified = true;
 
             return new VerdictReaction(
-                VerdictAction.Warn,
+                VerdictAction.Limit,
                 EnforcementIssueSeverity.Warning,
                 $"Escalation: degrade in {EscalationDelayMinutes} minutes unless overridden");
         }
 
-        // Already notified — degrade now
-        return new VerdictReaction(
-            VerdictAction.Degrade,
-            EnforcementIssueSeverity.Severe,
-            $"Revoked threshold exceeded ({this.consecutiveRevokedCount}/{RevokedThreshold}), degrading");
-    }
-
-    private void ScheduleEscalation(DateTimeOffset timestamp)
-    {
-        this.escalationTimer?.Dispose();
-        this.escalationTimer = new Timer(
-            _ => this.OnEscalationTimer(),
-            null,
-            TimeSpan.FromMinutes(EscalationDelayMinutes),
-            Timeout.InfiniteTimeSpan);
-
-        System.Diagnostics.Debug.WriteLine(
-            $"[IntegrityVerdictHandler] Escalation timer scheduled for {EscalationDelayMinutes} minutes from {timestamp}");
-    }
-
-    private void OnEscalationTimer()
-    {
-        if (this.disposed)
+        if (!this.escalationFired)
         {
-            return;
+            return new VerdictReaction(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "Escalation pending");
         }
 
-        // If we still haven't received a "trust" verdict, the degradation is now active
-        // This is called after the 5-minute window; the caller (AntiTamperMonitor) handles the actual AddIssue
-        System.Diagnostics.Debug.WriteLine("[IntegrityVerdictHandler] Escalation timer fired. Degradation is now active.");
+        return new VerdictReaction(
+            VerdictAction.Limit, EnforcementIssueSeverity.Warning,
+            $"Revoked threshold held ({this.consecutiveRevokedCount}/{RevokedThreshold})");
+    }
+
+    /// <summary>Evaluates the pending deadline without owning a timer or scheduling work.</summary>
+    public VerdictReaction EvaluateDeadline(DateTimeOffset now)
+    {
+        VerdictReaction? reaction = null;
+        lock (this.stateGate)
+        {
+            if (this.CommitDeadlineIfDueLocked(now))
+            {
+                reaction = new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "Integrity deadline reached");
+            }
+        }
+
+        if (reaction is not null)
+        {
+            this.onReaction?.Invoke(reaction);
+            return reaction;
+        }
+
+        return this.pendingDegradeNotified && !this.escalationFired
+            ? new VerdictReaction(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "Integrity deadline pending")
+            : new VerdictReaction(VerdictAction.None, null, "No integrity deadline transition");
+    }
+
+    private bool CommitDeadlineIfDueLocked(DateTimeOffset acceptanceTime)
+    {
+        if (this.disposed || !this.pendingDegradeNotified || this.escalationFired
+            || this.escalationDueAt is null || acceptanceTime < this.escalationDueAt.Value) return false;
+
+        this.escalationFired = true;
+        this.degraded = true;
+        this.stateEpoch++;
+        return true;
+    }
+
+    private void FlushNotifications()
+    {
+        while (true)
+        {
+            (string Type, string Title, string Body, DateTimeOffset Timestamp) notification;
+            lock (this.stateGate)
+            {
+                if (this.notifications.Count == 0) return;
+                notification = this.notifications.Dequeue();
+            }
+
+            this.EnqueueNotificationAsync(notification.Type, notification.Title, notification.Body, notification.Timestamp)
+                .GetAwaiter().GetResult();
+        }
     }
 
     private async Task EnqueueNotificationAsync(
@@ -402,6 +456,10 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         this.consecutiveFailures = 0;
         this.circuitOpenedAt = null;
         this.pendingDegradeNotified = false;
+        this.escalationDueAt = null;
+        this.escalationFired = false;
+        this.degraded = false;
+        this.stateEpoch = 0;
         this.serviceStartTime = DateTimeOffset.UtcNow;
     }
 
@@ -426,8 +484,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         if (!this.disposed)
         {
             this.disposed = true;
-            this.escalationTimer?.Dispose();
-            this.escalationTimer = null;
+            this.notifications.Clear();
         }
 
         GC.SuppressFinalize(this);

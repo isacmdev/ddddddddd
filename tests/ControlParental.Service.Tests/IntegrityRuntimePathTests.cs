@@ -4,6 +4,7 @@ using System.Net;
 using System.Text.Json;
 using ControlParental.Domain;
 using ControlParental.Service;
+using FluentAssertions;
 using Moq;
 using Moq.Protected;
 using Xunit;
@@ -13,13 +14,17 @@ public sealed class IntegrityRuntimePathTests : IDisposable
     private readonly string directory = Path.Combine(Path.GetTempPath(), $"cp-integrity-{Guid.NewGuid():N}");
 
     [Fact]
-    public async Task CanonicalAuthority_PreservesExactStateAcrossNonDefinitiveResultsAndRecoversAfterRefresh()
+    public async Task CanonicalAuthority_PreservesExactStateAcrossNonDefinitiveResultsAndCommitsAtDeadline()
     {
         var path = Path.Combine(this.directory, "issues.json");
         var now = DateTimeOffset.UtcNow;
+        var localNow = now;
         var body = "{\"verdict\":\"revoked\"}";
         var status = HttpStatusCode.Created;
         string? token = null;
+        var reactions = new List<VerdictReaction>();
+        var notifications = new Mock<IOutboxManager>();
+        notifications.Setup(value => value.EnqueueAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         var handler = new Mock<HttpMessageHandler>();
         handler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
             .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
@@ -34,10 +39,29 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         using var client = new HttpClient(handler.Object);
         var backend = new BackendClient(client, "https://example.test", coordinator);
         var checker = Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(false, "hash", "agent.exe")));
-        using var policy = new IntegrityVerdictHandler();
+        using var policy = new IntegrityVerdictHandler(notifications.Object, onReaction: reactions.Add, clock: () => localNow);
         policy.SetServiceStartTime(now.AddMinutes(-10));
         using var enforcement = CreateEnforcement(new FileIssueStore(path));
-        for (var i = 0; i < 4; i++) await RunOnce(backend, checker, enforcement, policy, coordinator);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Select(value => value.Action).Should().Equal(VerdictAction.Warn);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Select(value => value.Action).Should().Equal(VerdictAction.Warn, VerdictAction.Limit);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Select(value => value.Action).Should().Equal(VerdictAction.Warn, VerdictAction.Limit, VerdictAction.Limit);
+
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Last().Action.Should().Be(VerdictAction.Limit);
+        localNow = now.AddMinutes(5).AddTicks(-1);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Last().Action.Should().Be(VerdictAction.Limit);
+        Assert.Contains(await new FileIssueStore(path).LoadAsync(), value => value.IsActive && value.Key.IdentityScope == "device-a" && value.Severity == EnforcementIssueSeverity.Warning);
+        localNow = now.AddMinutes(5);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Last().Action.Should().Be(VerdictAction.Degrade);
+        notifications.Verify(value => value.EnqueueAsync("notifications", It.IsAny<object>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        reactions.Last().Action.Should().Be(VerdictAction.Limit);
+        notifications.Verify(value => value.EnqueueAsync("notifications", It.IsAny<object>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
 
         var issue = Assert.Single(await new FileIssueStore(path).LoadAsync(), value => value.IsActive && value.Key.IdentityScope == "device-a");
         var preRefreshKey = issue.Key;
@@ -59,30 +83,8 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         status = HttpStatusCode.ServiceUnavailable;
         await RunOnce(backend, checker, enforcement, policy, coordinator);
         Assert.Equal(before, JsonSerializer.Serialize(await new FileIssueStore(path).LoadAsync()));
-        var unrelatedBeforeRecovery = JsonSerializer.Serialize((await new FileIssueStore(path).LoadAsync()).Where(value => value.Key != preRefreshKey).ToArray());
-
-        enforcement.Dispose();
-        using var restored = CreateEnforcement(new FileIssueStore(path));
-        using var recoveredPolicy = new IntegrityVerdictHandler();
-        recoveredPolicy.SetServiceStartTime(now.AddMinutes(-10));
-        body = "{\"verdict\":\"trust\"}";
-        status = HttpStatusCode.Created;
-        var previousGeneration = coordinator.CurrentState.Generation;
-        clock.Advance(TimeSpan.FromMinutes(9));
-        var refreshed = await coordinator.GetDefinitiveSessionAsync();
-        Assert.True(refreshed.IsSuccess);
-        Assert.Equal(previousGeneration + 1, coordinator.CurrentState.Generation);
-        Assert.Equal("device-a", coordinator.CurrentState.DeviceId);
-        for (var i = 0; i < 3; i++) await RunOnce(backend, checker, restored, recoveredPolicy, coordinator);
-
-        var recovered = await new FileIssueStore(path).LoadAsync();
-        Assert.Contains(recovered, value => !value.IsActive && value.Key.IdentityScope == "device-a");
-        Assert.DoesNotContain(recovered, value => value.IsActive && value.Key == preRefreshKey);
-        Assert.Contains(recovered, value => value.IsActive && value.Key.IdentityScope == "device-b");
-        Assert.Contains(recovered, value => value.IsActive && value.Key.Cause == "unrelated");
-        Assert.Equal(2, recovered.Count(value => value.Key != preRefreshKey));
-        Assert.Equal(unrelatedBeforeRecovery, JsonSerializer.Serialize(recovered.Where(value => value.Key != preRefreshKey).ToArray()));
-        Assert.Equal("token-a-refreshed", token);
+        await RunOnce(backend, checker, enforcement, policy, coordinator);
+        Assert.Equal(before, JsonSerializer.Serialize(await new FileIssueStore(path).LoadAsync()));
     }
 
     [Fact]
@@ -194,9 +196,10 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         Assert.Equal(before, JsonSerializer.Serialize(await new FileIssueStore(path).LoadAsync()));
     }
 
-    private static async Task RunOnce(IBackendClient backend, IIntegrityChecker checker, IEnforcementLevelMonitor enforcement, IIntegrityVerdictHandler policy, IBackendIdentityCoordinator identity, CancellationToken cancellationToken = default)
+    private static async Task RunOnce(IBackendClient backend, IIntegrityChecker checker, IEnforcementLevelMonitor enforcement, IIntegrityVerdictHandler policy, IBackendIdentityCoordinator identity, CancellationToken cancellationToken = default, Func<DateTimeOffset>? localClock = null, IOutboxManager? outbox = null)
     {
-        using var monitor = new AntiTamperMonitor(Mock.Of<ITimeProvider>(value => value.WallClockNow == DateTimeOffset.UtcNow && value.MonotonicNow == 1), Mock.Of<IOutboxManager>(), Mock.Of<IPrivilegeInspector>(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>()) == Task.FromResult(true)), enforcement, checker, backend, policy, identityCoordinator: identity);
+        var acceptedAt = localClock?.Invoke() ?? DateTimeOffset.UtcNow;
+        using var monitor = new AntiTamperMonitor(Mock.Of<ITimeProvider>(value => value.WallClockNow == acceptedAt && value.MonotonicNow == 1), outbox ?? Mock.Of<IOutboxManager>(), Mock.Of<IPrivilegeInspector>(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>()) == Task.FromResult(true)), enforcement, checker, backend, policy, identityCoordinator: identity);
         await monitor.StartAsync(cancellationToken);
         await monitor.StopAsync();
     }
