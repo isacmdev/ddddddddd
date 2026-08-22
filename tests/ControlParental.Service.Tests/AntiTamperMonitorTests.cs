@@ -397,6 +397,163 @@ public class AntiTamperMonitorTests : IDisposable
     [Fact]
     public async Task ConcurrentStop_SharesDrainUntilAdmittedWorkReleases() { this.ConfigureHealthyBackend(); var e = NewSignal(); var r = NewSignal(); var calls = 0; this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, _) => { if (Interlocked.Increment(ref calls) == 1) return new(true, "trust"); e.SetResult(); await r.Task; return new(true, "trust"); }); await this.monitor.StartAsync(); var work = this.monitor.TriggerIntegrityCheckAsync(); await e.Task; var a = this.monitor.StopAsync(); var b = this.monitor.StopAsync(); a.IsCompleted.Should().BeFalse(); b.IsCompleted.Should().BeFalse(); r.SetResult(); await Task.WhenAll(work, a, b); }
 
+    [Theory]
+    [InlineData("revoked")]
+    [InlineData("trust")]
+    [InlineData("unknown")]
+    public async Task LateNonCancellableNormalCompletion_IsIgnoredAfterStop(string verdict)
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var calls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, _) => { if (Interlocked.Increment(ref calls) == 1) return new(true, "trust"); entered.SetResult(); await release.Task; return new(true, verdict); });
+        await this.monitor.StartAsync(); this.mockVerdictHandler.Invocations.Clear(); var work = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task; var stop = this.monitor.StopAsync(); stop.IsCompleted.Should().BeFalse(); this.mockVerdictHandler.Invocations.Should().BeEmpty(); release.SetResult(); await work; await stop; this.mockVerdictHandler.Invocations.Should().BeEmpty(); this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); this.mockOutboxManager.Invocations.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task LateNonCancellableFailure_IsObservableAndHasNoEffects()
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var failure = new InvalidOperationException("late integrity failure"); var calls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, _) => { if (Interlocked.Increment(ref calls) == 1) return new(true, "trust"); entered.SetResult(); await release.Task; throw failure; });
+        await this.monitor.StartAsync(); this.mockVerdictHandler.Invocations.Clear(); var work = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task; var stop = this.monitor.StopAsync(); stop.IsCompleted.Should().BeFalse(); release.SetResult(); var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => work); observed.Should().BeSameAs(failure); await Assert.ThrowsAsync<InvalidOperationException>(() => stop); this.mockVerdictHandler.Invocations.Should().BeEmpty(); this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); this.mockOutboxManager.Invocations.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task PostInitialLoopFault_IsObservableAndRestartUsesFreshGeneration()
+    {
+        this.ConfigureHealthyBackend(); var fault = NewSignal(); var entered = NewSignal(); var failure = new InvalidOperationException("tick fault"); var firstRun = true; using var monitor = this.CreateMonitor(_ => firstRun ? FaultingTick(entered, fault, failure) : new ValueTask<bool>(false));
+        await monitor.StartAsync(); await entered.Task; var first = typeof(AntiTamperMonitor).GetField("generation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(monitor); fault.SetResult(); var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.LifecycleTask); observed.Should().BeSameAs(failure); await monitor.StopAsync(); firstRun = false; await monitor.StartAsync(); var second = typeof(AntiTamperMonitor).GetField("generation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(monitor); second.Should().NotBeSameAs(first); await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task ExternalCancellation_IsReturnedToCallerAndOwnerCanDrain()
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var calls = 0; using var caller = new CancellationTokenSource();
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, _) => { if (Interlocked.Increment(ref calls) == 1) return new(true, "trust"); entered.SetResult(); await release.Task; return new(true, "trust"); });
+        await this.monitor.StartAsync(); var generation = this.GetGeneration(); var work = this.monitor.TriggerIntegrityCheckAsync(caller.Token); await entered.Task; caller.Cancel(); work.IsCompleted.Should().BeFalse(); var stop = this.monitor.StopAsync(); stop.IsCompleted.Should().BeFalse(); release.SetResult(); var observed = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => work); work.Status.Should().Be(TaskStatus.Canceled); work.IsCanceled.Should().BeTrue(); observed.CancellationToken.CanBeCanceled.Should().BeTrue(); observed.CancellationToken.Should().Be(caller.Token); await stop; stop.IsCompletedSuccessfully.Should().BeTrue(); this.AssertResourcesDisposed(generation); this.GetGeneration().Should().BeNull();
+    }
+
+    [Fact]
+    public async Task OwnerCancellation_ForwardsOperationTokenAndDrains()
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); CancellationToken operationToken = default; var calls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, token) => { operationToken = token; if (Interlocked.Increment(ref calls) == 1) return new(true, "trust"); entered.SetResult(); await release.Task; throw new OperationCanceledException(); });
+        await this.monitor.StartAsync(); var generation = this.GetGeneration(); var work = this.monitor.TriggerIntegrityCheckAsync(true); await entered.Task; var stop = this.monitor.StopAsync(); stop.IsCompleted.Should().BeFalse(); release.SetResult(); var observed = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => work); observed.CancellationToken.CanBeCanceled.Should().BeTrue(); observed.CancellationToken.Should().Be(operationToken); await stop; stop.IsCompletedSuccessfully.Should().BeTrue(); this.AssertResourcesDisposed(generation); this.GetGeneration().Should().BeNull();
+    }
+
+    [Fact]
+    public async Task QueuedCallerCancellation_DoesNotReleaseUnacquiredGate()
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var calls = 0; var startup = true; using var caller = new CancellationTokenSource();
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>(async (_, _) => { if (startup) { startup = false; return new(true, "trust"); } Interlocked.Increment(ref calls); entered.SetResult(); await release.Task; return new(true, "trust"); });
+        await this.monitor.StartAsync(); var generation = this.GetGeneration(); var first = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task; var before = this.CollaboratorSnapshot(); var queued = this.monitor.TriggerIntegrityCheckAsync(caller.Token); caller.Cancel(); calls.Should().Be(1); var canceled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued); queued.IsCanceled.Should().BeTrue(); canceled.CancellationToken.Should().Be(caller.Token); release.SetResult(); await first; await this.monitor.StopAsync(); this.AssertResourcesDisposed(generation); before[3]++; this.CollaboratorSnapshot().Should().Equal(before); this.monitor.Dispose(); this.AssertResourcesDisposed(generation);
+    }
+
+    [Fact]
+    public async Task LatePrivilegeCompletion_AfterStopHasNoTamperOrOutboxEffects()
+    {
+        var entered = NewSignal(); var release = NewSignal(); var calls = 0;
+        this.ConfigureHealthyBackend();
+        this.mockPrivilegeInspector.Setup(p => p.IsChildStandardAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async _ =>
+            {
+                if (Interlocked.Increment(ref calls) == 1) return true;
+                entered.SetResult(); await release.Task; return false;
+            });
+        await this.monitor.StartAsync();
+        this.detectedEvents.Clear(); this.mockOutboxManager.Invocations.Clear();
+        var generation = this.GetGeneration(); var work = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task;
+        var before = this.CollaboratorSnapshot();
+        var stop = this.monitor.StopAsync(); stop.IsCompleted.Should().BeFalse();
+        release.SetResult(); await work; await stop;
+        this.detectedEvents.Should().BeEmpty();
+        this.mockOutboxManager.Invocations.Should().BeEmpty();
+        this.CollaboratorSnapshot().Should().Equal(before); this.AssertResourcesDisposed(generation);
+    }
+
+    [Fact]
+    public async Task FaultedGeneration_RejectsStaleManualAndTimezoneCallbacksAfterRestart()
+    {
+        this.ConfigureHealthyBackend(); var fault = NewSignal(); var entered = NewSignal();
+        var failure = new InvalidOperationException("stale generation fault"); var firstRun = true;
+        var localEvents = new ConcurrentQueue<TamperEvent>(); using var monitor = this.CreateMonitor(_ => firstRun ? FaultingTick(entered, fault, failure) : new ValueTask<bool>(false), localEvents);
+        await monitor.StartAsync(); await entered.Task;
+        var oldGeneration = this.GetGeneration(monitor)!;
+        fault.SetResult(); var observed = await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.LifecycleTask); observed.Should().BeSameAs(failure); await monitor.StopAsync();
+        firstRun = false; await monitor.StartAsync(); var newGeneration = this.GetGeneration(monitor)!;
+        var before = this.CollaboratorSnapshot(localEvents); this.InvokeGeneration(monitor, "AdmitPeriodicCheck", oldGeneration); this.InvokeGeneration(monitor, "AdmitTimezoneCheck", oldGeneration);
+        newGeneration.Should().BeSameAs(this.GetGeneration(monitor)); this.CollaboratorSnapshot(localEvents).Should().Equal(before); localEvents.Should().BeEmpty(); await monitor.StopAsync();
+        this.AssertResourcesDisposed(newGeneration);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LatePolicyStage_AfterStopDoesNotStartDurableMutation(bool recovery)
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var calls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>()))
+            .Returns<IntegrityReport, CancellationToken>(async (_, _) =>
+            {
+                if (Interlocked.Increment(ref calls) == 1) return new(true, "trust");
+                entered.SetResult(); await release.Task; return new(true, recovery ? "trust" : "revoked");
+            });
+        this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<DateTimeOffset>()))
+            .Returns((string? verdict, bool _, DateTimeOffset _) => recovery
+                ? new VerdictReaction(VerdictAction.None, null, null)
+                : new VerdictReaction(VerdictAction.Degrade, EnforcementIssueSeverity.Severe, "late policy"));
+        await this.monitor.StartAsync(); var generation = this.GetGeneration(); this.mockEnforcementLevelMonitor.Invocations.Clear();
+        var work = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task; var stop = this.monitor.StopAsync();
+        release.SetResult(); await work; await stop;
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); this.AssertResourcesDisposed(generation);
+    }
+
+    [Fact]
+    public async Task ActiveGeneration_UsesCanonicalResolveStageExactlyOnce()
+    {
+        this.ConfigureHealthyBackend(); var identity = new Mock<IBackendIdentityCoordinator>(); var state = BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 7, "device-7"); identity.SetupGet(i => i.CurrentState).Returns(state); var verdictCalls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, "trust"));
+        this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns(() => Interlocked.Increment(ref verdictCalls) == 1 ? new(VerdictAction.None, null, null) : new(VerdictAction.None, null, null) { IsAuthoritativeRecovery = true });
+        using var monitor = new AntiTamperMonitor(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, identityCoordinator: identity.Object);
+        await monitor.StartAsync(); this.mockEnforcementLevelMonitor.Invocations.Clear(); var before = this.CollaboratorSnapshot();
+        await monitor.TriggerIntegrityCheckAsync();
+        this.mockEnforcementLevelMonitor.Invocations.Count(i => i.Method.Name == nameof(IEnforcementLevelMonitor.ResolveIssueAsync)).Should().Be(1);
+        var invocation = this.mockEnforcementLevelMonitor.Invocations.Single(i => i.Method.Name == nameof(IEnforcementLevelMonitor.ResolveIssueAsync)); invocation.Arguments[0].Should().Be(new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", "device-7")); invocation.Arguments[1].Should().Be("authoritative backend trust verdict");
+        this.CollaboratorSnapshot()[4].Should().Be(before[4] + 1); await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task StopBeforeResolveAdmission_SuppressesResolveAndPreservesSnapshot()
+    {
+        this.ConfigureHealthyBackend(); var identity = new Mock<IBackendIdentityCoordinator>(); identity.SetupGet(i => i.CurrentState).Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 7, "device-7")); Task? stop = null; var verdictCalls = 0; int[]? atStop = null;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, "trust"));
+        using var monitor = new AntiTamperMonitor(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, identityCoordinator: identity.Object);
+        this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns(() => { if (Interlocked.Increment(ref verdictCalls) == 2) { atStop = this.CollaboratorSnapshot(); stop = monitor.StopAsync(); } return new(VerdictAction.None, null, null) { IsAuthoritativeRecovery = true }; });
+        await monitor.StartAsync(); this.mockEnforcementLevelMonitor.Invocations.Clear(); await monitor.TriggerIntegrityCheckAsync(); await stop!;
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); this.CollaboratorSnapshot().Should().Equal(atStop!); this.GetGeneration().Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AdmittedMutationTask_IsOwnedAndDrained(bool recovery)
+    {
+        this.ConfigureHealthyBackend(); var entered = NewSignal(); var release = NewSignal(); var identity = new Mock<IBackendIdentityCoordinator>(); identity.SetupGet(i => i.CurrentState).Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 7, "device-7")); var verdictCalls = 0;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, "trust"));
+        this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns(() => Interlocked.Increment(ref verdictCalls) == 1 ? new(VerdictAction.None, null, null) : recovery ? new(VerdictAction.None, null, null) { IsAuthoritativeRecovery = true } : new(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "active mutation"));
+        if (recovery) this.mockEnforcementLevelMonitor.Setup(m => m.ResolveIssueAsync(It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns<IssueKey, string, CancellationToken>(async (_, _, _) => { entered.SetResult(); await release.Task; });
+        else this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns<IssueKey, EnforcementIssueSeverity, string, CancellationToken>(async (_, _, _, _) => { entered.SetResult(); await release.Task; });
+         using var monitor = new AntiTamperMonitor(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, identityCoordinator: identity.Object); await monitor.StartAsync(); var generation = this.GetGeneration(monitor); var work = monitor.TriggerIntegrityCheckAsync(); await entered.Task; var atEntry = this.CollaboratorSnapshot(); var stop = monitor.StopAsync(); var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var publicPendingAtStop = false; stop.ContinueWith(_ => { publicPendingAtStop = !work.IsCompleted; observed.SetResult(); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default); stop.IsCompleted.Should().BeFalse(); release.SetResult(); await work; await observed.Task; await stop; publicPendingAtStop.Should().BeFalse(); this.CollaboratorSnapshot().Should().Equal(atEntry); this.mockEnforcementLevelMonitor.Invocations.Count(i => i.Method.Name == (recovery ? nameof(IEnforcementLevelMonitor.ResolveIssueAsync) : nameof(IEnforcementLevelMonitor.AddIssueAsync))).Should().Be(1); this.AssertResourcesDisposed(generation); await monitor.StopAsync(); monitor.Dispose(); this.AssertResourcesDisposed(generation);
+    }
+
+    [Fact]
+    public async Task SynchronousHandler_ReentrantStopReturnsCompletedBeforeConsumption()
+    {
+        this.ConfigureHealthyBackend(); var verdictCalls = 0; AntiTamperMonitor? monitor = null; Task? stop = null;
+        this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, "trust"));
+        var owned = this.CreateMonitor(_ => new ValueTask<bool>(false)); monitor = owned;
+        this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns(() => { if (Interlocked.Increment(ref verdictCalls) == 2) { GetCallbackMarker(monitor!).Should().BeSameAs(this.GetGeneration(monitor)); stop = monitor.StopAsync(); stop.IsCompletedSuccessfully.Should().BeTrue(); stop.GetAwaiter().GetResult(); } return new(VerdictAction.None, null, null); });
+         await monitor.StartAsync(); var generation = this.GetGeneration(monitor); await monitor.TriggerIntegrityCheckAsync(); await stop!; monitor.Dispose(); this.AssertResourcesDisposed(generation); this.GetGeneration(monitor).Should().BeNull();
+    }
+
     // ── VerifyClockAgainstServerTimeAsync Tests ─────────────────────
 
     [Fact]
@@ -483,7 +640,7 @@ public class AntiTamperMonitorTests : IDisposable
     public async Task Restart_DoesNotLetOldDrainDisposeNewTimezoneTimer()
     {
         var entered = NewSignal(); var release = NewSignal(); var calls = 0; var names = new[] { "Cancellation", "Gate", "TickTimer", "TimezoneTimer", "InitialCheck", "InitialOperation", "Loop", "OwnedTasks" }; this.ConfigureHealthyBackend(); this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).Returns<IntegrityReport, CancellationToken>((_, _) => Interlocked.Increment(ref calls) == 1 ? Task.FromResult(new IntegrityReportResult(true, "trust")) : WaitForReleaseAsync(entered, release)); await this.monitor.StartAsync(); var oldGeneration = this.GetGeneration(); var oldResources = names.Select(name => this.GetResource(oldGeneration, name)).ToList(); var trigger = this.monitor.TriggerIntegrityCheckAsync(); await entered.Task; var stop = this.monitor.StopAsync(); var oldDrain = this.GetResource(oldGeneration, "Drain"); var restart = this.monitor.StartAsync(); release.SetResult(); await Task.WhenAll(trigger, stop, restart); var newGeneration = this.GetGeneration();
-        newGeneration.Should().NotBeSameAs(oldGeneration); oldResources.Should().OnlyHaveUniqueItems(); names.Select(name => this.GetResource(newGeneration, name)).Should().NotContain(oldResources); this.AssertResourcesDisposed(oldGeneration); this.InvokeGeneration("AdmitPeriodicCheck", oldGeneration); this.InvokeGeneration("AdmitTimezoneCheck", oldGeneration); newGeneration.Should().BeSameAs(this.GetGeneration()); var newStop = this.monitor.StopAsync(); var newDrain = this.GetResource(newGeneration, "Drain"); await newStop; new[] { oldDrain, newDrain }.Should().OnlyHaveUniqueItems(); this.AssertResourcesDisposed(newGeneration); await this.monitor.StopAsync(); this.monitor.Dispose(); this.AssertResourcesDisposed(oldGeneration); this.AssertResourcesDisposed(newGeneration);
+        newGeneration.Should().NotBeSameAs(oldGeneration); oldResources.Should().OnlyHaveUniqueItems(); names.Select(name => this.GetResource(newGeneration, name)).Should().NotContain(oldResources); this.AssertResourcesDisposed(oldGeneration); this.InvokeGeneration(this.monitor, "AdmitPeriodicCheck", oldGeneration); this.InvokeGeneration(this.monitor, "AdmitTimezoneCheck", oldGeneration); newGeneration.Should().BeSameAs(this.GetGeneration()); var newStop = this.monitor.StopAsync(); var newDrain = this.GetResource(newGeneration, "Drain"); await newStop; new[] { oldDrain, newDrain }.Should().OnlyHaveUniqueItems(); this.AssertResourcesDisposed(newGeneration); await this.monitor.StopAsync(); this.monitor.Dispose(); this.AssertResourcesDisposed(oldGeneration); this.AssertResourcesDisposed(newGeneration);
     }
 
     [Fact]
@@ -496,22 +653,32 @@ public class AntiTamperMonitorTests : IDisposable
 
     private void ConfigureHealthyBackend() { this.mockPrivilegeInspector.Setup(p => p.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true); this.mockIntegrityChecker.Setup(c => c.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe")); this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.Is<string?>(_ => true), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns((VerdictReaction)new(VerdictAction.None, null, null)); }
 
-    private object? GetGeneration() => typeof(AntiTamperMonitor).GetField("generation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(this.monitor);
+    private object? GetGeneration() => this.GetGeneration(this.monitor);
+
+    private object? GetGeneration(AntiTamperMonitor monitor) => typeof(AntiTamperMonitor).GetField("generation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(monitor);
 
     private static object? GetCallbackMarker(AntiTamperMonitor monitor) { var marker = typeof(AntiTamperMonitor).GetField("callbackGeneration", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(monitor)!; return marker.GetType().GetProperty("Value")!.GetValue(marker); }
 
     private object GetResource(object? generation, string name) => generation!.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(generation)!;
 
-    private void AssertResourcesDisposed(object? generation) { this.GetResourceCount(generation, "CancellationDisposals").Should().Be(1); this.GetResourceCount(generation, "GateDisposals").Should().Be(1); this.GetResourceCount(generation, "TickTimerDisposals").Should().Be(1); this.GetResourceCount(generation, "TimezoneTimerDisposals").Should().Be(1); ((Task)this.GetResource(generation, "Loop")).IsCompleted.Should().BeTrue(); ((Task)this.GetResource(generation, "InitialOperation")).IsCompleted.Should().BeTrue(); ((TaskCompletionSource)this.GetResource(generation, "InitialCheck")).Task.IsCompleted.Should().BeTrue(); ((ICollection<Task>)this.GetResource(generation, "OwnedTasks")).Should().BeEmpty(); ((Task)this.GetResource(generation, "Drain")).IsCompleted.Should().BeTrue(); }
+    private void AssertResourcesDisposed(object? generation) { this.GetResourceCount(generation, "CancellationDisposals").Should().Be(1); this.GetResourceCount(generation, "GateDisposals").Should().Be(1); if (this.GetResource(generation, "TickTimer") is not null) this.GetResourceCount(generation, "TickTimerDisposals").Should().Be(1); this.GetResourceCount(generation, "TimezoneTimerDisposals").Should().Be(1); ((Task)this.GetResource(generation, "Loop")).IsCompleted.Should().BeTrue(); ((Task)this.GetResource(generation, "InitialOperation")).IsCompleted.Should().BeTrue(); ((TaskCompletionSource)this.GetResource(generation, "InitialCheck")).Task.IsCompleted.Should().BeTrue(); ((ICollection<Task>)this.GetResource(generation, "OwnedTasks")).Should().BeEmpty(); ((Task)this.GetResource(generation, "Drain")).IsCompleted.Should().BeTrue(); }
 
     private int GetResourceCount(object? generation, string name) { generation.Should().NotBeNull(); return (int)generation!.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)!.GetValue(generation)!; }
 
+    private int[] CollaboratorSnapshot() => this.CollaboratorSnapshot(this.detectedEvents);
+
+    private int[] CollaboratorSnapshot(ConcurrentQueue<TamperEvent> events) => new[] { this.mockBackendClient.Invocations.Count, this.mockPrivilegeInspector.Invocations.Count, this.mockIntegrityChecker.Invocations.Count, this.mockVerdictHandler.Invocations.Count, this.mockEnforcementLevelMonitor.Invocations.Count, this.mockOutboxManager.Invocations.Count, events.Count };
+
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private void InvokeGeneration(string method, object generation) => typeof(AntiTamperMonitor).GetMethod(method, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(this.monitor, new[] { generation });
+    private static async ValueTask<bool> ThrowAfterSignal(TaskCompletionSource signal, Exception failure) { await signal.Task; throw failure; }
 
-    private AntiTamperMonitor CreateMonitor(Func<CancellationToken, ValueTask<bool>> tickSource)
-        => new(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, tickSource: tickSource);
+    private static async ValueTask<bool> FaultingTick(TaskCompletionSource entered, TaskCompletionSource fault, Exception failure) { entered.SetResult(); await fault.Task; throw failure; }
+
+    private void InvokeGeneration(AntiTamperMonitor monitor, string method, object generation) => typeof(AntiTamperMonitor).GetMethod(method, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(monitor, new[] { generation });
+
+    private AntiTamperMonitor CreateMonitor(Func<CancellationToken, ValueTask<bool>> tickSource, ConcurrentQueue<TamperEvent>? events = null)
+        => new(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, onTamperDetected: events is null ? null : events.Enqueue, tickSource: tickSource);
 
     private static async Task<IntegrityReportResult> WaitForReleaseAsync(TaskCompletionSource entered, TaskCompletionSource release) { entered.TrySetResult(); await release.Task; return new IntegrityReportResult(true, "trust"); }
 

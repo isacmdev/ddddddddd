@@ -39,6 +39,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         internal readonly CancellationTokenSource Cancellation;
         internal readonly SemaphoreSlim Gate = new(1, 1);
         internal readonly TaskCompletionSource InitialCheck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource Lifecycle = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal Task? InitialOperation;
         internal readonly HashSet<Task> OwnedTasks = new();
         internal readonly Func<CancellationToken, ValueTask<bool>>? TickSource;
@@ -133,6 +134,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
+    internal Task LifecycleTask => this.generation?.Lifecycle.Task ?? Task.CompletedTask;
+
     /// <inheritdoc />
     public event EventHandler<TamperEventArgs>? TamperDetected;
 
@@ -175,7 +178,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     /// <inheritdoc />
     public async Task StopAsync()
     {
-        Task task;
+        var callbackOwner = this.callbackGeneration.Value;
+        Task task; TaskCompletionSource? startDrain = null;
         lock (this.lockObject)
         {
             var current = this.generation;
@@ -184,16 +188,34 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             {
                 current.AdmissionOpen = false; current.Cancellation.Cancel();
                 current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-                task = this.BeginDrainLocked(current);
+                task = this.BeginDrainLocked(current, out startDrain);
             }
         }
-        if (!ReferenceEquals(this.callbackGeneration.Value, this.generation)) await task.ConfigureAwait(false);
+        startDrain?.TrySetResult();
+        if (!ReferenceEquals(callbackOwner, this.generation)) await task.ConfigureAwait(false);
 
         System.Diagnostics.Debug.WriteLine("[AntiTamperMonitor] Stopped.");
     }
 
-    private Task BeginDrainLocked(Generation current) => current.Drain ??= this.DrainGenerationAsync(current);
+    private Task BeginDrainLocked(Generation current, out TaskCompletionSource? start)
+    {
+        if (current.Drain is not null) { start = null; return current.Drain; }
+        start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        current.Drain = this.DrainAfterAdmissionAsync(current, start.Task);
+        return current.Drain;
+    }
+    private async Task DrainAfterAdmissionAsync(Generation current, Task start)
+    {
+        await start.ConfigureAwait(false);
+        await this.DrainGenerationAsync(current).ConfigureAwait(false);
+    }
     internal Task TriggerIntegrityCheckAsync(bool cancelWithOwner = false)
+        => this.TriggerIntegrityCheckAsync(cancelWithOwner, default);
+
+    internal Task TriggerIntegrityCheckAsync(CancellationToken cancellationToken)
+        => this.TriggerIntegrityCheckAsync(false, cancellationToken);
+
+    private Task TriggerIntegrityCheckAsync(bool cancelWithOwner, CancellationToken cancellationToken)
     {
         Admission? admission = null;
         lock (this.lockObject)
@@ -201,13 +223,46 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             if (this.disposed) return Task.CompletedTask;
             var current = this.generation;
             if (current is null || !current.AdmissionOpen) return Task.CompletedTask;
-            admission = this.AdmitCheckLocked(current, cancelWithOwner);
+            admission = this.AdmitCheckLocked(current, cancelWithOwner, cancellationToken);
         }
         admission.Gate.TrySetResult(); return admission.Task;
     }
 
-    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner) => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner));
-    private Admission AdmitLocked(Generation current, Func<Task> work) { var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var task = RunAfterGateAsync(gate.Task, work); this.AdmitTask(current, task); return new(task, gate); }
+    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner, CancellationToken cancellationToken = default) => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner, cancellationToken));
+    private Admission AdmitLocked(Generation current, Func<Task> work)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, work);
+        _ = CompleteAdmissionAsync(execution, completion, owned, current.Cancellation.Token);
+        this.AdmitTask(current, owned.Task); return new(completion.Task, gate);
+    }
+    private static async Task CompleteAdmissionAsync(Task execution, TaskCompletionSource completion, TaskCompletionSource owned, CancellationToken ownerToken)
+    {
+        try { await execution.ConfigureAwait(false); completion.TrySetResult(); owned.TrySetResult(); }
+        catch (OperationCanceledException exception) { var token = exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : ownerToken; completion.TrySetCanceled(token); owned.TrySetCanceled(token); }
+        catch (Exception exception) { completion.TrySetException(exception); owned.TrySetException(exception); }
+    }
+    private Task RunAdmittedStageAsync(Generation current, Func<Task> work)
+    {
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen)
+            {
+                admission = this.AdmitLocked(current, work);
+            }
+        }
+
+        if (admission is null) return Task.CompletedTask;
+        admission.Gate.TrySetResult();
+        return admission.Task;
+    }
+    private Task RunAdmittedSynchronousStageAsync(Generation current, Action work)
+        => this.RunAdmittedStageAsync(current, () =>
+        {
+            var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = current;
+            try { work(); } finally { this.callbackGeneration.Value = previous; }
+            return Task.CompletedTask;
+        });
     private static async Task RunAfterGateAsync(Task gate, Func<Task> work) { await gate.ConfigureAwait(false); await work().ConfigureAwait(false); }
     private void AdmitTimezoneCheck(Generation current)
     {
@@ -216,18 +271,20 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private void AdmitTask(Generation current, Task task)
     {
         current.OwnedTasks.Add(task);
-        _ = task.ContinueWith(completed => { _ = completed.Exception; lock (this.lockObject) current.OwnedTasks.Remove(completed); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = task.ContinueWith(completed => { var fault = completed.Exception?.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException); if (fault is not null) current.Lifecycle.TrySetException(fault); lock (this.lockObject) current.OwnedTasks.Remove(completed); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
-    private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner)
+    private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner, CancellationToken callerToken = default)
     {
-        var ownerToken = current.Cancellation.Token; var gate = current.Gate;
-        await gate.WaitAsync(cancelWithOwner ? ownerToken : CancellationToken.None).ConfigureAwait(false);
-        try { await this.PerformIntegrityCheckAsync(current, cancelWithOwner ? ownerToken : CancellationToken.None, cancelWithOwner).ConfigureAwait(false); }
-        finally { gate.Release(); }
+        var ownerToken = current.Cancellation.Token; var gate = current.Gate; using var linked = callerToken.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(ownerToken, callerToken) : null; var token = linked?.Token ?? (cancelWithOwner ? ownerToken : CancellationToken.None);
+        var acquired = false; try { await gate.WaitAsync(token).ConfigureAwait(false); acquired = true; await this.PerformIntegrityCheckAsync(current, token, true).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested) { throw new OperationCanceledException(callerToken); }
+        catch (OperationCanceledException) { throw; }
+        finally { if (acquired) gate.Release(); }
     }
     private async Task DrainGenerationAsync(Generation current)
     {
         var failure = await CaptureFailureAsync(current.Loop, current.Cancellation.IsCancellationRequested).ConfigureAwait(false);
+        if (current.Loop?.IsFaulted == true && current.Lifecycle.Task.IsFaulted) failure = null;
         while (true) { Task[] owned; lock (this.lockObject) owned = current.OwnedTasks.ToArray(); if (owned.Length == 0) break; failure ??= await CaptureFailureAsync(Task.WhenAll(owned), true).ConfigureAwait(false); }
 
         lock (this.lockObject) { if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
@@ -249,8 +306,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             await current.InitialOperation!.ConfigureAwait(false); cancellationToken.ThrowIfCancellationRequested(); current.InitialCheck.TrySetResult();
             if (current.TickSource is not null) while (await current.TickSource(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
             else while (await current.TickTimer!.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
+            current.Lifecycle.TrySetResult();
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { current.InitialCheck.TrySetCanceled(cancellationToken); } catch (Exception exception) { current.InitialCheck.TrySetException(exception); throw; }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { current.InitialCheck.TrySetCanceled(cancellationToken); current.Lifecycle.TrySetCanceled(cancellationToken); } catch (Exception exception) { current.InitialCheck.TrySetException(exception); current.Lifecycle.TrySetException(exception); throw; }
     }
     private void AdmitPeriodicCheck(Generation current)
     {
@@ -338,14 +396,15 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
         try
         {
-            await this.CheckClockIntegrityAsync(current, cancellationToken);
-            this.CheckTimezone(current);
+            await this.CheckClockIntegrityAsync(current, cancellationToken); if (!this.IsGenerationActive(current)) return;
+            await this.RunAdmittedStageAsync(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }).ConfigureAwait(false);
+            if (!this.IsGenerationActive(current)) return;
 
             // Check if child became admin
-            await this.CheckPrivilegeStatusAsync(cancellationToken);
+            await this.CheckPrivilegeStatusAsync(current, cancellationToken, propagateFailure); if (!this.IsGenerationActive(current)) return;
 
             // T23: Check binary integrity (Authenticode + SHA256)
-            await this.PerformBinaryIntegrityCheckAsync(cancellationToken, propagateFailure);
+            await this.PerformBinaryIntegrityCheckAsync(current, cancellationToken, propagateFailure);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -383,7 +442,14 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             this.lastWallClockTime = currentWallClock;
         }
 
-        if (direction != 0) this.FireClockJump(jump, direction, current);
+        if (direction != 0)
+        {
+            await this.RunAdmittedStageAsync(current, () =>
+            {
+                this.FireClockJump(jump, direction, current);
+                return Task.CompletedTask;
+            }).ConfigureAwait(false);
+        }
 
         await Task.CompletedTask;
     }
@@ -424,7 +490,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private async Task CheckPrivilegeStatusAsync(CancellationToken cancellationToken)
+    private async Task CheckPrivilegeStatusAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
         if (this.disposed)
         {
@@ -447,20 +513,25 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
                 if (!alreadyDetected)
                 {
-                    this.RecordTamperEvent(
-                        TamperEventType.ChildIsAdminDetected,
-                        "Child account detected with administrator privileges",
-                        TamperSeverity.Critical);
+                    await this.RunAdmittedSynchronousStageAsync(current, () =>
+                    {
+                        this.RecordTamperEvent(
+                            TamperEventType.ChildIsAdminDetected,
+                            "Child account detected with administrator privileges",
+                            TamperSeverity.Critical,
+                            current);
+                    }).ConfigureAwait(false);
                 }
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            if (propagateFailure) throw;
             System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Privilege check failed: {ex.Message}");
         }
     }
 
-    private async Task PerformBinaryIntegrityCheckAsync(CancellationToken cancellationToken, bool propagateFailure = false)
+    private async Task PerformBinaryIntegrityCheckAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
         if (this.disposed)
         {
@@ -470,6 +541,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         try
         {
             var result = await this.integrityChecker.CheckLocalIntegrityAsync(cancellationToken);
+            if (!this.IsGenerationActive(current)) return;
 
             // Build IntegrityReport with binary integrity data
             var report = new IntegrityReport
@@ -488,6 +560,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             // R3: Report to backend
             var identity = this.identityCoordinator?.CurrentState;
             var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken) ?? new(false, null);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!this.IsGenerationActive(current)) return;
             if (identity is not null && identity != this.identityCoordinator!.CurrentState)
             {
                 return;
@@ -496,17 +570,22 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             // Local evidence is report-only. It cannot change durable enforcement.
             if (!result.IsSignatureValid)
             {
+                if (!this.IsGenerationActive(current)) return;
                 var timestamp = this.timeProvider.WallClockNow;
-                _ = this.verdictHandler.HandleLocalFailure(
-                    $"Signature invalid for {result.ExecutablePath}",
-                    timestamp);
+                    await this.RunAdmittedSynchronousStageAsync(current, () =>
+                    {
+                        this.verdictHandler.HandleLocalFailure($"Signature invalid for {result.ExecutablePath}", timestamp);
+                    }).ConfigureAwait(false);
             }
 
             // T23: Handle server verdict via verdict handler
-            var verdictReaction = this.verdictHandler.HandleVerdict(
-                reportResult.Verdict,
-                reportResult.Success,
-                this.timeProvider.WallClockNow) ?? new(VerdictAction.None, null, null);
+            if (!this.IsGenerationActive(current)) return;
+            VerdictReaction? verdictReaction = null;
+            await this.RunAdmittedSynchronousStageAsync(current, () =>
+            {
+                verdictReaction = this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow);
+            }).ConfigureAwait(false);
+            verdictReaction ??= new(VerdictAction.None, null, null);
 
             if (reportResult.Success
                 && reportResult.Verdict is "trust" or "revoked")
@@ -515,7 +594,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                     verdictReaction,
                     $"server verdict: {reportResult.Verdict}",
                     cancellationToken,
-                    identity);
+                    identity,
+                    current);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -529,7 +609,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         VerdictReaction reaction,
         string context,
         CancellationToken cancellationToken,
-        BackendIdentityState? identity)
+        BackendIdentityState? identity,
+        Generation current)
     {
         var integrityIssueKey = new IssueKey(
             0,
@@ -538,10 +619,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             identity?.DeviceId);
         if (reaction.IsAuthoritativeRecovery)
         {
-            await this.enforcementLevelMonitor.ResolveIssueAsync(
-                integrityIssueKey,
-                "authoritative backend trust verdict",
-                cancellationToken);
+            if (!this.IsGenerationActive(current)) return;
+            await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.ResolveIssueAsync(
+                integrityIssueKey, "authoritative backend trust verdict", cancellationToken)).ConfigureAwait(false);
             return;
         }
 
@@ -559,21 +639,19 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             case VerdictAction.Limit:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity limit ({context}): {reaction.Reason}");
-                await this.enforcementLevelMonitor.AddIssueAsync(
-                    integrityIssueKey,
-                    reaction.Severity ?? EnforcementIssueSeverity.Warning,
-                    reaction.Reason ?? "Integrity limit reached",
-                    cancellationToken);
+                if (!this.IsGenerationActive(current)) return;
+                await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey, reaction.Severity ?? EnforcementIssueSeverity.Warning,
+                    reaction.Reason ?? "Integrity limit reached", cancellationToken)).ConfigureAwait(false);
                 break;
 
             case VerdictAction.Degrade:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity degrade ({context}): {reaction.Reason}");
-                await this.enforcementLevelMonitor.AddIssueAsync(
-                    integrityIssueKey,
-                    reaction.Severity ?? EnforcementIssueSeverity.Severe,
-                    reaction.Reason ?? "Integrity degradation triggered",
-                    cancellationToken);
+                if (!this.IsGenerationActive(current)) return;
+                await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey, reaction.Severity ?? EnforcementIssueSeverity.Severe,
+                    reaction.Reason ?? "Integrity degradation triggered", cancellationToken)).ConfigureAwait(false);
                 break;
 
             case VerdictAction.ShadowWarn:
@@ -692,7 +770,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
     public void Dispose()
     {
-        Task drain;
+        var callbackOwner = this.callbackGeneration.Value;
+        Task drain; TaskCompletionSource? startDrain = null;
         lock (this.lockObject)
         {
             this.disposed = true;
@@ -706,11 +785,12 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 current.AdmissionOpen = false;
                 current.Cancellation.Cancel();
                 current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-                drain = this.BeginDrainLocked(current);
+                drain = this.BeginDrainLocked(current, out startDrain);
             }
         }
+        startDrain?.TrySetResult();
 
-        if (!ReferenceEquals(this.callbackGeneration.Value, this.generation)) drain.GetAwaiter().GetResult();
+        if (!ReferenceEquals(callbackOwner, this.generation)) drain.GetAwaiter().GetResult();
         GC.SuppressFinalize(this);
     }
 
