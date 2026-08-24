@@ -40,6 +40,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         internal readonly SemaphoreSlim Gate = new(1, 1);
         internal readonly TaskCompletionSource InitialCheck = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly TaskCompletionSource Lifecycle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<Exception> EffectFault = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal Task? InitialOperation;
         internal readonly HashSet<Task> OwnedTasks = new();
         internal readonly Func<CancellationToken, ValueTask<bool>>? TickSource;
@@ -217,6 +218,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
     private Task TriggerIntegrityCheckAsync(bool cancelWithOwner, CancellationToken cancellationToken)
     {
+        if (cancellationToken.IsCancellationRequested) return Task.FromCanceled(cancellationToken);
         Admission? admission = null;
         lock (this.lockObject)
         {
@@ -228,15 +230,21 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         admission.Gate.TrySetResult(); return admission.Task;
     }
 
-    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner, CancellationToken cancellationToken = default) => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner, cancellationToken));
+    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner, CancellationToken cancellationToken = default)
+        => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner, cancellationToken), cancellationToken);
     private Admission AdmitLocked(Generation current, Func<Task> work)
     {
-        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, work);
-        _ = CompleteAdmissionAsync(execution, completion, owned, current.Cancellation.Token);
+        return this.AdmitLocked(current, work, default);
+    }
+    private Admission AdmitLocked(Generation current, Func<Task> work, CancellationToken callerToken)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, acquired, callerToken, work);
+        _ = CompleteAdmissionAsync(execution, completion, owned, current.Cancellation.Token, callerToken);
         this.AdmitTask(current, owned.Task); return new(completion.Task, gate);
     }
-    private static async Task CompleteAdmissionAsync(Task execution, TaskCompletionSource completion, TaskCompletionSource owned, CancellationToken ownerToken)
+    private static async Task CompleteAdmissionAsync(Task execution, TaskCompletionSource completion, TaskCompletionSource owned, CancellationToken ownerToken, CancellationToken callerToken)
     {
+        using var registration = callerToken.Register(() => completion.TrySetCanceled(callerToken));
         try { await execution.ConfigureAwait(false); completion.TrySetResult(); owned.TrySetResult(); }
         catch (OperationCanceledException exception) { var token = exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : ownerToken; completion.TrySetCanceled(token); owned.TrySetCanceled(token); }
         catch (Exception exception) { completion.TrySetException(exception); owned.TrySetException(exception); }
@@ -263,7 +271,13 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             try { work(); } finally { this.callbackGeneration.Value = previous; }
             return Task.CompletedTask;
         });
-    private static async Task RunAfterGateAsync(Task gate, Func<Task> work) { await gate.ConfigureAwait(false); await work().ConfigureAwait(false); }
+    private static async Task RunAfterGateAsync(Task gate, TaskCompletionSource acquired, CancellationToken callerToken, Func<Task> work)
+    {
+        await gate.ConfigureAwait(false);
+        if (callerToken.IsCancellationRequested) throw new OperationCanceledException(callerToken);
+        acquired.TrySetResult();
+        await work().ConfigureAwait(false);
+    }
     private void AdmitTimezoneCheck(Generation current)
     {
         Admission? admission = null; lock (this.lockObject) if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen) admission = this.AdmitLocked(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }); admission?.Gate.TrySetResult();
@@ -275,8 +289,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     }
     private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner, CancellationToken callerToken = default)
     {
-        var ownerToken = current.Cancellation.Token; var gate = current.Gate; using var linked = callerToken.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(ownerToken, callerToken) : null; var token = linked?.Token ?? (cancelWithOwner ? ownerToken : CancellationToken.None);
-        var acquired = false; try { await gate.WaitAsync(token).ConfigureAwait(false); acquired = true; await this.PerformIntegrityCheckAsync(current, token, true).ConfigureAwait(false); }
+        var ownerToken = current.Cancellation.Token; var gate = current.Gate; using var gateCancellation = CancellationTokenSource.CreateLinkedTokenSource(ownerToken, callerToken); var acquired = false;
+        try { await gate.WaitAsync(gateCancellation.Token).ConfigureAwait(false); acquired = true; var workToken = cancelWithOwner ? ownerToken : CancellationToken.None; await this.PerformIntegrityCheckAsync(current, workToken, true).ConfigureAwait(false); }
         catch (OperationCanceledException) when (callerToken.IsCancellationRequested) { throw new OperationCanceledException(callerToken); }
         catch (OperationCanceledException) { throw; }
         finally { if (acquired) gate.Release(); }
@@ -286,6 +300,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         var failure = await CaptureFailureAsync(current.Loop, current.Cancellation.IsCancellationRequested).ConfigureAwait(false);
         if (current.Loop?.IsFaulted == true && current.Lifecycle.Task.IsFaulted) failure = null;
         while (true) { Task[] owned; lock (this.lockObject) owned = current.OwnedTasks.ToArray(); if (owned.Length == 0) break; failure ??= await CaptureFailureAsync(Task.WhenAll(owned), true).ConfigureAwait(false); }
+        if (failure is null && current.EffectFault.Task.Status == TaskStatus.RanToCompletion) failure = current.EffectFault.Task.Result;
 
         lock (this.lockObject) { if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
 
@@ -582,13 +597,22 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
             // T23: Handle server verdict via verdict handler
             if (!this.IsGenerationActive(current)) return;
+            VerdictDecision? decision = null;
             VerdictReaction? verdictReaction = null;
-            await this.RunAdmittedSynchronousStageAsync(current, () =>
+            if (this.verdictHandler is IntegrityVerdictHandler pureHandler)
             {
-                verdictReaction = this.verdictHandler is IntegrityVerdictHandler pureHandler
-                    ? pureHandler.HandleVerdictDecision(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow, identity?.DeviceId).Reaction
-                    : this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow);
-            }).ConfigureAwait(false);
+                var decisionTimestamp = this.timeProvider.WallClockNow;
+                lock (this.lockObject)
+                {
+                    if (!this.IsCurrentDecisionLocked(current, identity)) return;
+                    decision = pureHandler.HandleVerdictDecision(reportResult.Verdict, reportResult.Success, decisionTimestamp, identity?.DeviceId);
+                }
+                try { await this.ExecuteDecisionChainAsync(current, decision!, identity).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is not OperationCanceledException) { current.EffectFault.TrySetResult(exception); throw; }
+                return;
+            }
+
+            await this.RunAdmittedSynchronousStageAsync(current, () => verdictReaction = this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow)).ConfigureAwait(false);
             verdictReaction ??= new(VerdictAction.None, null, null);
 
             if (reportResult.Success
@@ -606,6 +630,35 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         {
             if (propagateFailure) throw;
             System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Binary integrity check failed: {ex.Message}");
+        }
+    }
+
+    private bool IsCurrentDecisionLocked(Generation owner, BackendIdentityState? identity)
+        => !this.disposed && ReferenceEquals(this.generation, owner) && owner.AdmissionOpen
+            && (this.identityCoordinator is null || Equals(identity, this.identityCoordinator.CurrentState));
+
+    private async Task ExecuteDecisionChainAsync(Generation owner, VerdictDecision decision, BackendIdentityState? identity)
+    {
+        var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", identity?.DeviceId);
+        var reaction = decision.Reaction;
+        if (reaction.IsAuthoritativeRecovery)
+        {
+            await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
+        }
+        else if (reaction.Action is VerdictAction.Limit or VerdictAction.Degrade)
+        {
+            await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", CancellationToken.None).ConfigureAwait(false);
+        }
+
+        if (decision.Notification is not null && decision.NotificationIdempotencyKey is not null)
+        {
+            await this.outboxManager.EnqueueIntegrityNotificationAsync(
+                decision.Notification.Type,
+                decision.Notification.Title,
+                decision.Notification.Body,
+                decision.Notification.Timestamp,
+                decision.NotificationIdempotencyKey,
+                CancellationToken.None).ConfigureAwait(false);
         }
     }
 

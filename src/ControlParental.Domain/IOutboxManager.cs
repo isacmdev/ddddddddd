@@ -68,6 +68,15 @@ public interface IOutboxManager
         DateTimeOffset timestamp,
         CancellationToken cancellationToken = default);
 
+    /// <summary>Enqueues an integrity notification with an explicit immutable key.</summary>
+    Task EnqueueIntegrityNotificationAsync(
+        string notificationType,
+        string title,
+        string body,
+        DateTimeOffset timestamp,
+        string idempotencyKey,
+        CancellationToken cancellationToken);
+
     /// <summary>Atomically claims a bounded page of eligible entries.</summary>
     Task<IReadOnlyList<OutboxEntry>> ClaimAsync(
         int limit,

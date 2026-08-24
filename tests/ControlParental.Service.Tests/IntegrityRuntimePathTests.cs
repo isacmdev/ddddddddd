@@ -22,8 +22,10 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         var body = "{\"verdict\":\"revoked\"}";
         var status = HttpStatusCode.Created;
         string? token = null;
+        string? notificationKey = null;
         var notifications = new Mock<IOutboxManager>();
         notifications.Setup(value => value.EnqueueAsync(It.IsAny<string>(), It.IsAny<object>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        notifications.Setup(value => value.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Callback<string, string, string, DateTimeOffset, string, CancellationToken>((_, _, _, _, key, _) => notificationKey = key).Returns(Task.CompletedTask);
         var handler = new Mock<HttpMessageHandler>();
         handler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
             .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
@@ -69,6 +71,8 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
         Assert.Contains(await new FileIssueStore(path).LoadAsync(), value => value.IsActive && value.Key.IdentityScope == "device-a" && value.Severity == EnforcementIssueSeverity.Severe);
         await RunOnce(backend, checker, enforcement, policy, coordinator, localClock: () => localNow, outbox: notifications.Object);
+        notifications.Verify(value => value.EnqueueIntegrityNotificationAsync("integrity_degrade_pending", "Integrity Degradation Pending", It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "integrity/device-a/integrity-binary/6/6/notification", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal("integrity/device-a/integrity-binary/6/6/notification", notificationKey);
         notifications.VerifyNoOtherCalls();
 
         var issue = Assert.Single(await new FileIssueStore(path).LoadAsync(), value => value.IsActive && value.Key.IdentityScope == "device-a");

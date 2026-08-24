@@ -141,7 +141,42 @@ public sealed class OutboxManagerTests : OutboxManagerTestFixture
         Assert.Contains("integrity_warning", entry.PayloadJson);
         Assert.Contains("Test Title", entry.PayloadJson);
         Assert.Contains("Test Body", entry.PayloadJson);
-        Assert.StartsWith("integrity_", entry.DedupKey);
+        Assert.Equal($"integrity_integrity_warning_{timestamp.ToUnixTimeMilliseconds()}", entry.DedupKey);
+    }
+
+    [Fact]
+    public async Task EnqueueIntegrityNotificationAsync_ExplicitKeyIsPersistedVerbatim()
+    {
+        var key = "integrity/device-a/integrity-binary/8/13/notification";
+
+        await this.manager.EnqueueIntegrityNotificationAsync(
+            "integrity_degrade_pending",
+            "Test Title",
+            "Test Body",
+            FixedNow,
+            key,
+            CancellationToken.None);
+
+        var entry = (await this.manager.GetPendingEntriesAsync()).Single();
+        Assert.Equal(key, entry.DedupKey);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task EnqueueIntegrityNotificationAsync_ExplicitKeyRejectsNullOrEmptyBeforePersistence(string? key)
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() => this.manager.EnqueueIntegrityNotificationAsync(
+            "integrity_warning", "Test Title", "Test Body", FixedNow, key!, CancellationToken.None));
+        Assert.Empty(await this.manager.GetPendingEntriesAsync());
+    }
+
+    [Fact]
+    public async Task EnqueueIntegrityNotificationAsync_LegacyFiveArgumentDefaultBindsLegacyOverload()
+    {
+        await this.manager.EnqueueIntegrityNotificationAsync("integrity_warning", "Test Title", "Test Body", FixedNow, default);
+        var entry = Assert.Single(await this.manager.GetPendingEntriesAsync());
+        Assert.Equal($"integrity_integrity_warning_{FixedNow.ToUnixTimeMilliseconds()}", entry.DedupKey);
     }
 
     [Fact]

@@ -227,7 +227,28 @@ public sealed class OutboxManager : IOutboxManager
         string body,
         DateTimeOffset timestamp,
         CancellationToken cancellationToken = default)
+        => await this.EnqueueIntegrityNotificationAsync(
+            notificationType,
+            title,
+            body,
+            timestamp,
+            $"integrity_{notificationType}_{timestamp.ToUnixTimeMilliseconds()}",
+            cancellationToken);
+
+    /// <inheritdoc />
+    public async Task EnqueueIntegrityNotificationAsync(
+        string notificationType,
+        string title,
+        string body,
+        DateTimeOffset timestamp,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
     {
+        if (string.IsNullOrEmpty(idempotencyKey))
+        {
+            throw new ArgumentException("An explicit idempotency key is required.", nameof(idempotencyKey));
+        }
+
         var payload = new
         {
             NotificationType = notificationType,
@@ -239,7 +260,7 @@ public sealed class OutboxManager : IOutboxManager
         await this.EnqueueAsync(
             "notifications",
             payload,
-            $"integrity_{notificationType}_{timestamp.ToUnixTimeMilliseconds()}",
+            idempotencyKey,
             cancellationToken);
     }
 
