@@ -574,7 +574,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 var timestamp = this.timeProvider.WallClockNow;
                     await this.RunAdmittedSynchronousStageAsync(current, () =>
                     {
-                        this.verdictHandler.HandleLocalFailure($"Signature invalid for {result.ExecutablePath}", timestamp);
+                        _ = this.verdictHandler is IntegrityVerdictHandler pureHandler
+                            ? pureHandler.HandleLocalFailureDecision($"Signature invalid for {result.ExecutablePath}", timestamp, identity?.DeviceId).Reaction
+                            : this.verdictHandler.HandleLocalFailure($"Signature invalid for {result.ExecutablePath}", timestamp);
                     }).ConfigureAwait(false);
             }
 
@@ -583,7 +585,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             VerdictReaction? verdictReaction = null;
             await this.RunAdmittedSynchronousStageAsync(current, () =>
             {
-                verdictReaction = this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow);
+                verdictReaction = this.verdictHandler is IntegrityVerdictHandler pureHandler
+                    ? pureHandler.HandleVerdictDecision(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow, identity?.DeviceId).Reaction
+                    : this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow);
             }).ConfigureAwait(false);
             verdictReaction ??= new(VerdictAction.None, null, null);
 
