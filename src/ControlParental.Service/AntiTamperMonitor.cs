@@ -48,8 +48,14 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         internal Timer? TimezoneTimer; internal PeriodicTimer? TickTimer; internal Task? Loop; internal Task? Drain;
         internal int CancellationDisposals; internal int GateDisposals; internal int TickTimerDisposals; internal int TimezoneTimerDisposals;
         internal bool AdmissionOpen = true; internal string Timezone = TimeZoneInfo.Local.Id;
+        internal EffectProgress? ReactionProgress;
+        internal EffectProgress? NotificationProgress;
+        internal PendingRetry? PendingRetry;
         internal Generation(CancellationToken cancellationToken, Func<CancellationToken, ValueTask<bool>>? tickSource) { this.TickSource = tickSource; this.Cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); }
     }
+    private sealed record EffectProgress(DecisionShape Shape, string Key);
+    private sealed record DecisionShape(string Scope, long Epoch, long Sequence, string ReactionKey, string ReactionKind, bool HasNotification, string? NotificationKey, string? NotificationKind);
+    private sealed record PendingRetry(bool ReactionDomain, DecisionShape Shape);
     private sealed record Admission(Task Task, TaskCompletionSource Gate);
 
     // Thresholds
@@ -642,25 +648,121 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     {
         var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", identity?.DeviceId);
         var reaction = decision.Reaction;
-        if (reaction.IsAuthoritativeRecovery)
+        var shape = this.GetDecisionShape(decision);
+        this.ValidateAdmission(owner, shape);
+        if (reaction.IsAuthoritativeRecovery && this.ShouldExecute(owner, shape, decision.ReactionIdempotencyKey, true))
         {
-            await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
+                owner.ReactionProgress = new(shape, decision.ReactionIdempotencyKey);
+            }
+            catch
+            {
+                owner.PendingRetry = new(true, shape);
+                throw;
+            }
         }
-        else if (reaction.Action is VerdictAction.Limit or VerdictAction.Degrade)
+        else if (reaction.Action is VerdictAction.Limit or VerdictAction.Degrade
+            && this.ShouldExecute(owner, shape, decision.ReactionIdempotencyKey, true))
         {
-            await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", CancellationToken.None).ConfigureAwait(false);
+                owner.ReactionProgress = new(shape, decision.ReactionIdempotencyKey);
+            }
+            catch
+            {
+                owner.PendingRetry = new(true, shape);
+                throw;
+            }
         }
 
-        if (decision.Notification is not null && decision.NotificationIdempotencyKey is not null)
+        if (decision.Notification is not null && decision.NotificationIdempotencyKey is not null
+            && this.ShouldExecute(owner, shape, decision.NotificationIdempotencyKey, false))
         {
-            await this.outboxManager.EnqueueIntegrityNotificationAsync(
-                decision.Notification.Type,
-                decision.Notification.Title,
-                decision.Notification.Body,
-                decision.Notification.Timestamp,
-                decision.NotificationIdempotencyKey,
-                CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await this.outboxManager.EnqueueIntegrityNotificationAsync(
+                    decision.Notification.Type,
+                    decision.Notification.Title,
+                    decision.Notification.Body,
+                    decision.Notification.Timestamp,
+                    decision.NotificationIdempotencyKey,
+                    CancellationToken.None).ConfigureAwait(false);
+                owner.NotificationProgress = new(shape, decision.NotificationIdempotencyKey);
+                if (owner.PendingRetry is { ReactionDomain: false }) owner.PendingRetry = null;
+            }
+            catch
+            {
+                owner.PendingRetry = new(false, shape);
+                throw;
+            }
         }
+
+        if (owner.PendingRetry is not null && owner.PendingRetry.Shape == shape) owner.PendingRetry = null;
+    }
+
+    internal Task ExecuteDecisionAsync(VerdictDecision decision)
+    {
+        Generation? owner;
+        lock (this.lockObject)
+        {
+            owner = !this.disposed && this.generation is { AdmissionOpen: true } current ? current : null;
+            if (owner is null) return Task.CompletedTask;
+        }
+
+        return this.RunAdmittedStageAsync(owner, async () =>
+        {
+            await owner.Gate.WaitAsync().ConfigureAwait(false);
+            try { await this.ExecuteDecisionChainAsync(owner, decision, null).ConfigureAwait(false); }
+            catch (Exception exception) when (exception is not OperationCanceledException) { owner.EffectFault.TrySetResult(exception); throw; }
+            finally { owner.Gate.Release(); }
+        });
+    }
+
+    private DecisionShape GetDecisionShape(VerdictDecision decision)
+        => new(
+            decision.IdentityScope,
+            decision.Epoch,
+            decision.Sequence,
+            decision.ReactionIdempotencyKey,
+            decision.Reaction.IsAuthoritativeRecovery ? "recovery" : decision.Reaction.Action.ToString(),
+            decision.Notification is not null,
+            decision.NotificationIdempotencyKey,
+            decision.Notification?.Type);
+
+    private void ValidateAdmission(Generation owner, DecisionShape shape)
+    {
+        var pending = owner.PendingRetry;
+        if (pending is not null && pending.Shape != shape)
+        {
+            throw new InvalidOperationException("A failed integrity effect must be retried before another decision can execute.");
+        }
+
+        foreach (var progress in new[] { owner.ReactionProgress, owner.NotificationProgress })
+        {
+            if (progress is null) continue;
+            if (!string.Equals(progress.Shape.Scope, shape.Scope, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("A generation cannot contain multiple identity scopes.");
+            }
+
+            if (progress.Shape.Epoch == shape.Epoch && progress.Shape.Sequence == shape.Sequence && progress.Shape != shape)
+            {
+                throw new InvalidOperationException("Conflicting effect identity at the same decision position.");
+            }
+        }
+    }
+
+    private bool ShouldExecute(Generation owner, DecisionShape shape, string key, bool reactionDomain)
+    {
+        var progress = reactionDomain ? owner.ReactionProgress : owner.NotificationProgress;
+        if (progress is null) return true;
+        if (shape.Epoch > progress.Shape.Epoch || shape.Epoch == progress.Shape.Epoch && shape.Sequence > progress.Shape.Sequence) return true;
+        if (shape.Epoch < progress.Shape.Epoch || shape.Epoch == progress.Shape.Epoch && shape.Sequence < progress.Shape.Sequence) return false;
+        if (string.Equals(progress.Key, key, StringComparison.Ordinal)) return false;
+        throw new InvalidOperationException("Conflicting effect identity at the same decision position.");
     }
 
     private async Task ProcessVerdictReactionAsync(

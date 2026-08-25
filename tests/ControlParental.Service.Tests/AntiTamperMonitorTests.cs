@@ -9,6 +9,8 @@ using System.Threading.Channels;
 using ControlParental.Domain;
 using ControlParental.Service;
 using FluentAssertions;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Moq;
 using Xunit;
 
@@ -896,16 +898,195 @@ public class AntiTamperMonitorTests : IDisposable
         await stop;
     }
 
+    [Fact]
+    public async Task SameDecision_IsConsumedOncePerEffectDomainAfterGateRecheck()
+    {
+        var decision = Decision(4, 4, "reaction-key", "notification-key");
+        var reactions = 0;
+        var notifications = 0;
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(() => { Interlocked.Increment(ref reactions); return Task.CompletedTask; });
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(() => { Interlocked.Increment(ref notifications); return Task.CompletedTask; });
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => monitor.ExecuteDecisionAsync(decision)));
+        reactions.Should().Be(1);
+        notifications.Should().Be(1);
+        await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task ReactionFailure_LeavesBothDomainsUncommittedAndRetrySucceeds()
+    {
+        var decision = Decision(5, 5, "reaction-retry", "notification-retry");
+        var failure = new InvalidOperationException("reaction retry");
+        var attempts = 0;
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(() => Interlocked.Increment(ref attempts) == 1 ? Task.FromException(failure) : Task.CompletedTask);
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        var first = await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(decision));
+        first.Should().BeSameAs(failure);
+        await monitor.ExecuteDecisionAsync(decision);
+        attempts.Should().Be(2);
+        this.mockOutboxManager.Verify(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "notification-retry", It.IsAny<CancellationToken>()), Times.Once);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task NotificationFailure_CommitsReactionAndRetriesOnlyNotificationWithSameKey()
+    {
+        var decision = Decision(6, 6, "reaction-notification", "notification-exact");
+        var notificationAttempts = 0;
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(() => Interlocked.Increment(ref notificationAttempts) == 1 ? Task.FromException(new InvalidOperationException("notification retry")) : Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(decision));
+        await monitor.ExecuteDecisionAsync(decision);
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        this.mockOutboxManager.Verify(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "notification-exact", It.IsAny<CancellationToken>()), Times.Exactly(2));
+        notificationAttempts.Should().Be(2);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task NewerDomainsAndReactionOnlyDecisionsAreNotSuppressed()
+    {
+        var newer = Decision(8, 8, "new-reaction", "new-notification");
+        var reactionOnly = Decision(9, 9, "reaction-only", null);
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        await monitor.ExecuteDecisionAsync(new VerdictDecision(7, 7, new(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "old"), null, DateTimeOffset.UtcNow, "scope", "old-reaction", null));
+        await monitor.ExecuteDecisionAsync(newer);
+        await monitor.ExecuteDecisionAsync(reactionOnly);
+        this.mockEnforcementLevelMonitor.Invocations.Count(i => i.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(3);
+        this.mockOutboxManager.Verify(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "new-notification", It.IsAny<CancellationToken>()), Times.Once);
+        await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task FailedOlderDecision_BlocksQueuedNewerDecisionUntilExactRetry()
+    {
+        var decision = Decision(10, 10, "generation-reaction", null);
+        var entered = NewSignal();
+        var release = NewSignal();
+        var attempts = 0;
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns<IssueKey, EnforcementIssueSeverity, string, CancellationToken>(async (_, _, _, _) => { if (Interlocked.Increment(ref attempts) == 1) { entered.SetResult(); await release.Task; throw new InvalidOperationException("old chain"); } });
+        var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        var old = monitor.ExecuteDecisionAsync(decision);
+        await entered.Task;
+        var newer = monitor.ExecuteDecisionAsync(Decision(11, 11, "new-generation-reaction", null));
+        newer.IsCompleted.Should().BeFalse();
+        release.SetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => old);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => newer);
+        attempts.Should().Be(1);
+        await monitor.ExecuteDecisionAsync(decision);
+        attempts.Should().Be(2);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+        await monitor.StartAsync();
+        await monitor.ExecuteDecisionAsync(Decision(11, 11, "new-generation-reaction", null));
+        attempts.Should().Be(3);
+        await monitor.StopAsync();
+        monitor.Dispose();
+    }
+
+    [Fact]
+    public async Task EqualPosition_NullNotificationThenNotificationIsRejectedBeforeEffects()
+    {
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        await monitor.ExecuteDecisionAsync(Decision(12, 12, "same-reaction", null));
+        var conflicting = Decision(12, 12, "same-reaction", "new-notification");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(conflicting));
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        this.mockOutboxManager.Verify(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task EqualPosition_ScopeMismatchIsRejectedBeforeEffects()
+    {
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor();
+        await monitor.StartAsync();
+        await monitor.ExecuteDecisionAsync(Decision(13, 13, "scope-a", null));
+        var conflicting = new VerdictDecision(13, 13, new(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "test"), null, DateTimeOffset.UnixEpoch, "scope-b", "scope-b-key", null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(conflicting));
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task PersistThenThrow_RetriesExactOutboxKeyOnceAndUnblocksNewerDecision()
+    {
+        var databaseName = $"slice-b-{Guid.NewGuid():N}";
+        await using var connection = new SqliteConnection($"Data Source=file:{databaseName}?mode=memory&cache=shared");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<ControlParentalDbContext>().UseSqlite(connection).Options;
+        await using var db = new ControlParentalDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var manager = new OutboxManager(new TrackingDbContextFactory(options), this.mockTimeProvider.Object);
+        var outbox = new Mock<IOutboxManager>();
+        var persisted = NewSignal(); var release = NewSignal(); var attempts = 0;
+        var failure = new InvalidOperationException("persisted then throw");
+        outbox.Setup(value => value.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns<string, string, string, DateTimeOffset, string, CancellationToken>(async (type, title, body, timestamp, key, token) =>
+            {
+                await manager.EnqueueIntegrityNotificationAsync(type, title, body, timestamp, key, token);
+                if (Interlocked.Increment(ref attempts) == 1) { persisted.SetResult(); await release.Task; throw failure; }
+            });
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor(outbox: outbox.Object);
+        await monitor.StartAsync();
+        var first = Decision(14, 14, "reaction-persisted", "notification-persisted");
+        var newer = Decision(15, 15, "newer-reaction", null);
+        var firstWork = monitor.ExecuteDecisionAsync(first);
+        await persisted.Task;
+        var newerWork = monitor.ExecuteDecisionAsync(newer);
+        release.SetResult();
+        (await Assert.ThrowsAsync<InvalidOperationException>(() => firstWork)).Should().BeSameAs(failure);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => newerWork);
+        this.mockEnforcementLevelMonitor.Verify(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        var row = Assert.Single(await manager.GetPendingEntriesAsync());
+        row.DedupKey.Should().Be("notification-persisted");
+        await monitor.ExecuteDecisionAsync(first);
+        (await manager.GetPendingEntriesAsync()).Should().ContainSingle(value => value.DedupKey == "notification-persisted");
+        await monitor.ExecuteDecisionAsync(newer);
+        this.mockEnforcementLevelMonitor.Verify(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        outbox.Verify(value => value.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "notification-persisted", It.IsAny<CancellationToken>()), Times.Exactly(2));
+        attempts.Should().Be(2);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    private static VerdictDecision Decision(long epoch, long sequence, string reactionKey, string? notificationKey)
+        => new(sequence, epoch, new(VerdictAction.Limit, EnforcementIssueSeverity.Warning, "test"), notificationKey is null ? null : new("integrity_degrade_pending", "title", "body", DateTimeOffset.UnixEpoch), DateTimeOffset.UnixEpoch, "scope", reactionKey, notificationKey);
+
     private void ConfigureHealthyBackend() { this.mockPrivilegeInspector.Setup(p => p.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true); this.mockIntegrityChecker.Setup(c => c.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe")); this.mockVerdictHandler.Setup(v => v.HandleVerdict(It.Is<string?>(_ => true), It.IsAny<bool>(), It.IsAny<DateTimeOffset>())).Returns((VerdictReaction)new(VerdictAction.None, null, null)); }
 
     private void ConfigurePureBackend(string verdict) { this.mockPrivilegeInspector.Setup(p => p.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true); this.mockIntegrityChecker.Setup(c => c.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe")); this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, verdict)); }
 
     private void ConfigurePureBackendAfterStartup(string verdict) { this.ConfigurePureBackend(verdict); var calls = 0; this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(() => Interlocked.Increment(ref calls) == 1 ? new IntegrityReportResult(true, "trust") : new IntegrityReportResult(true, verdict)); }
 
-    private AntiTamperMonitor CreatePureMonitor(IBackendIdentityCoordinator? identity = null)
+    private AntiTamperMonitor CreatePureMonitor(IBackendIdentityCoordinator? identity = null, IOutboxManager? outbox = null)
     {
         var handler = new IntegrityVerdictHandler(clock: () => DateTimeOffset.UtcNow); handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
-        return new(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, handler, identityCoordinator: identity, tickSource: _ => new ValueTask<bool>(false));
+        return new(this.mockTimeProvider.Object, outbox ?? this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, handler, identityCoordinator: identity, tickSource: _ => new ValueTask<bool>(false));
     }
 
     private object? GetGeneration() => this.GetGeneration(this.monitor);
