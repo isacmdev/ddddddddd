@@ -2,6 +2,7 @@ namespace ControlParental.Service.Tests;
 
 using ControlParental.Domain;
 using ControlParental.Service;
+using FluentAssertions;
 using Moq;
 using Xunit;
 
@@ -45,6 +46,59 @@ public sealed class EnforcementLevelMonitorSafetyBranchTests
         sink.Verify(value => value.SetHealthBlockingIssues(true), Times.Once);
         sink.Verify(value => value.SetHealthBlockingIssues(false), Times.Once);
         Assert.Empty(monitor.CurrentIssues);
+    }
+
+    [Fact]
+    public async Task KeyedFirstApplyProjectsHealthAndEventButReplayDoesNothing()
+    {
+        var health = CreateHealth(out var sink);
+        var store = new Mock<IIssueStore>();
+        var key = new IssueKey(4, EnforcementIssueType.ClockTampering, "keyed-monitor");
+        var issue = new DurableIssue(
+            key, EnforcementIssueSeverity.Critical, "changed", Now, Now, 1, true, null, null, 1, "key-1");
+        var eventCount = 0;
+        var calls = 0;
+        store.Setup(value => value.UpsertActiveAsync(
+                key, EnforcementIssueSeverity.Critical, "changed", It.IsAny<DateTimeOffset>(), "key-1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new IssueUpsertResult(issue, calls++ > 0));
+        using var monitor = CreateMonitor(health.Object, store.Object);
+        monitor.IssueDetected += (_, _) => eventCount++;
+
+        await monitor.AddIssueAsync(key, EnforcementIssueSeverity.Critical, "changed", "key-1");
+        var firstIssues = monitor.CurrentIssues;
+        var firstLevel = monitor.CurrentLevel;
+        var firstHealthCalls = sink.Invocations.Count(invocation => invocation.Method.Name == nameof(IAuthoritativeHealthSink.SetHealthBlockingIssues));
+        var firstIssue = Assert.Single(firstIssues);
+        firstIssue.Key.Should().Be(key);
+        firstIssue.Severity.Should().Be(EnforcementIssueSeverity.Critical);
+        firstIssue.Description.Should().Be("changed");
+        firstIssue.OccurrenceCount.Should().Be(1);
+        monitor.CurrentLevel.Should().Be(EnforcementLevel.Degraded);
+        sink.Verify(value => value.SetHealthBlockingIssues(true), Times.Once);
+        eventCount.Should().Be(1);
+
+        await monitor.AddIssueAsync(key, EnforcementIssueSeverity.Critical, "changed", "key-1");
+
+        store.Verify(value => value.UpsertActiveAsync(
+            key, EnforcementIssueSeverity.Critical, "changed", It.IsAny<DateTimeOffset>(), "key-1", It.IsAny<CancellationToken>()), Times.Exactly(2));
+        monitor.CurrentIssues.Should().BeEquivalentTo(firstIssues);
+        monitor.CurrentLevel.Should().Be(firstLevel);
+        sink.Invocations.Count(invocation => invocation.Method.Name == nameof(IAuthoritativeHealthSink.SetHealthBlockingIssues))
+            .Should().Be(firstHealthCalls);
+        eventCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task KeyedDefaultInterfaceAdmissionFailsClosed()
+    {
+        var monitor = new Mock<IEnforcementLevelMonitor> { CallBase = true };
+        var key = new IssueKey(4, EnforcementIssueType.ClockTampering, "unsupported-keyed");
+
+        var act = () => monitor.Object.AddIssueAsync(
+            key, EnforcementIssueSeverity.Warning, "evidence", "key-1");
+
+        await act.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("Keyed issue admission is not supported.");
     }
 
     [Fact]

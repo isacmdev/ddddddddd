@@ -42,11 +42,50 @@ public sealed class FileIssueStore : IIssueStore
         DateTimeOffset observedAt,
         CancellationToken cancellationToken = default)
     {
+        var result = await this.UpsertCoreAsync(key, severity, evidence, observedAt, null, cancellationToken);
+        return result.Issue;
+    }
+
+    public async Task<IssueUpsertResult> UpsertActiveAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string evidence,
+        DateTimeOffset observedAt,
+        string? idempotencyKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await this.UpsertCoreAsync(key, severity, evidence, observedAt, idempotencyKey, cancellationToken);
+    }
+
+    private async Task<IssueUpsertResult> UpsertCoreAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string evidence,
+        DateTimeOffset observedAt,
+        string? idempotencyKey,
+        CancellationToken cancellationToken)
+    {
         ValidateKey(key);
+        ValidateIdempotencyKey(idempotencyKey);
         await this.gate.WaitAsync(cancellationToken);
         try
         {
             await this.EnsureLoadedAsync(cancellationToken);
+            if (!string.IsNullOrEmpty(idempotencyKey))
+            {
+                var prior = this.issues!.Values.FirstOrDefault(issue =>
+                    string.Equals(issue.LastIdempotencyKey, idempotencyKey, StringComparison.Ordinal));
+                if (prior != null)
+                {
+                    if (prior.Key != key || prior.Severity != severity || prior.LastEvidence != evidence)
+                    {
+                        throw new InvalidOperationException("The idempotency key conflicts with durable issue state.");
+                    }
+
+                    return new IssueUpsertResult(prior, IsReplay: true);
+                }
+            }
+
             this.issues!.TryGetValue(key, out var existing);
             if (existing == null && this.issues.Count >= MaximumRecords)
             {
@@ -68,10 +107,11 @@ public sealed class FileIssueStore : IIssueStore
                 IsActive: true,
                 ResolvedAt: null,
                 ResolutionEvidence: null,
-                Revision: checked((existing?.Revision ?? 0) + 1));
+                Revision: checked((existing?.Revision ?? 0) + 1),
+                LastIdempotencyKey: string.IsNullOrEmpty(idempotencyKey) ? null : idempotencyKey);
             this.issues[key] = updated;
             await this.SaveAsync(cancellationToken);
-            return updated;
+            return new IssueUpsertResult(updated, IsReplay: false);
         }
         finally
         {
@@ -128,7 +168,7 @@ public sealed class FileIssueStore : IIssueStore
             await using var stream = new FileStream(
                 this.path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
             var document = await JsonSerializer.DeserializeAsync<IssueDocument>(stream, cancellationToken: cancellationToken);
-            if (document == null || document.Version != CurrentDocumentVersion || document.Issues == null)
+            if (document == null || document.Version != CurrentDocumentVersion || document.Issues == null || document.Issues.Length > MaximumRecords)
             {
                 throw new InvalidDataException("The durable issue document has an unsupported or incomplete format.");
             }
@@ -187,6 +227,19 @@ public sealed class FileIssueStore : IIssueStore
         if (string.IsNullOrWhiteSpace(key.Cause))
         {
             throw new ArgumentException("A semantic issue cause is required.", nameof(key));
+        }
+    }
+
+    private static void ValidateIdempotencyKey(string? idempotencyKey)
+    {
+        if (string.IsNullOrEmpty(idempotencyKey))
+        {
+            return;
+        }
+
+        if (idempotencyKey.Length > 256 || idempotencyKey.Any(char.IsWhiteSpace))
+        {
+            throw new ArgumentException("The idempotency key is invalid.", nameof(idempotencyKey));
         }
     }
 

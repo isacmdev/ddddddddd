@@ -11,6 +11,14 @@ public interface IIssueStore
         DateTimeOffset observedAt,
         CancellationToken cancellationToken = default);
 
+    Task<IssueUpsertResult> UpsertActiveAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string evidence,
+        DateTimeOffset observedAt,
+        string? idempotencyKey,
+        CancellationToken cancellationToken = default);
+
     Task ResolveAsync(
         IssueKey key,
         string recoveryEvidence,
@@ -28,4 +36,7 @@ public sealed record DurableIssue(
     bool IsActive,
     DateTimeOffset? ResolvedAt,
     string? ResolutionEvidence,
-    long Revision);
+    long Revision,
+    string? LastIdempotencyKey = null);
+
+public sealed record IssueUpsertResult(DurableIssue Issue, bool IsReplay);

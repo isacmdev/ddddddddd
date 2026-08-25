@@ -86,6 +86,16 @@ public interface IEnforcementLevelMonitor
         return Task.CompletedTask;
     }
 
+    Task AddIssueAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string description,
+        string? idempotencyKey,
+        CancellationToken cancellationToken = default)
+    {
+        throw new NotSupportedException("Keyed issue admission is not supported.");
+    }
+
     Task ResolveIssueAsync(
         IssueKey key,
         string recoveryEvidence,

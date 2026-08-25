@@ -439,6 +439,40 @@ public sealed class EnforcementLevelMonitor : IEnforcementLevelMonitor, IDisposa
         this.FireIssueDetected(issue);
     }
 
+    public async Task AddIssueAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string description,
+        string? idempotencyKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(idempotencyKey) || this.issueStore == null)
+        {
+            await this.AddIssueAsync(key, severity, description, cancellationToken);
+            return;
+        }
+
+        var result = await this.issueStore.UpsertActiveAsync(
+            key, severity, description, this.timeProvider.WallClockNow, idempotencyKey, cancellationToken);
+        if (result.IsReplay)
+        {
+            return;
+        }
+
+        var issue = ToEnforcementIssue(result.Issue);
+        lock (this.lockObject)
+        {
+            this.semanticIssues[key] = issue;
+            this.currentIssues.RemoveAll(current => current.Key == key);
+            this.currentIssues.Add(issue);
+            this.currentLevel = this.CalculateEnforcementLevel(this.currentIssues);
+        }
+
+        this.HealthSink?.SetHealthBlockingIssues(
+            this.CurrentIssues.Any(current => current.Severity >= EnforcementIssueSeverity.Severe));
+        this.FireIssueDetected(issue);
+    }
+
     public async Task ResolveIssueAsync(
         IssueKey key,
         string recoveryEvidence,
