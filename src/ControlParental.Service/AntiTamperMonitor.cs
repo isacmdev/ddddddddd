@@ -34,6 +34,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private bool clockJumpDetected;
     private bool timezoneChangedDetected;
     private readonly AsyncLocal<Generation?> callbackGeneration = new();
+    internal Func<Task>? AdmissionCompletionRemovalGapForTesting { get; set; }
     private sealed class Generation
     {
         internal readonly CancellationTokenSource Cancellation;
@@ -238,16 +239,16 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     }
     private Admission AdmitLocked(Generation current, Func<Task> work, CancellationToken callerToken)
     {
-        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, acquired, callerToken, work);
-        _ = CompleteAdmissionAsync(execution, completion, owned, current.Cancellation.Token, callerToken);
-        this.AdmitTask(current, owned.Task); return new(completion.Task, gate);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, acquired, callerToken, work); var removalCompleted = this.AdmissionCompletionRemovalGapForTesting is null ? null : new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _ = CompleteAdmissionAsync(current, execution, completion, owned, removalCompleted, this.AdmissionCompletionRemovalGapForTesting, callerToken);
+        this.AdmitTask(current, owned.Task, removalCompleted); return new(completion.Task, gate);
     }
-    private static async Task CompleteAdmissionAsync(Task execution, TaskCompletionSource completion, TaskCompletionSource owned, CancellationToken ownerToken, CancellationToken callerToken)
+    private static async Task CompleteAdmissionAsync(Generation current, Task execution, TaskCompletionSource completion, TaskCompletionSource owned, TaskCompletionSource? removalCompleted, Func<Task>? removalGap, CancellationToken callerToken)
     {
         using var registration = callerToken.Register(() => completion.TrySetCanceled(callerToken));
         try { await execution.ConfigureAwait(false); completion.TrySetResult(); owned.TrySetResult(); }
-        catch (OperationCanceledException exception) { var token = exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : ownerToken; completion.TrySetCanceled(token); owned.TrySetCanceled(token); }
-        catch (Exception exception) { completion.TrySetException(exception); owned.TrySetException(exception); }
+        catch (OperationCanceledException exception) { var token = exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : current.Cancellation.Token; completion.TrySetCanceled(token); owned.TrySetCanceled(token); }
+        catch (Exception exception) { current.EffectFault.TrySetResult(exception); completion.TrySetException(exception); owned.TrySetException(exception); if (removalGap is not null) { await removalCompleted!.Task.ConfigureAwait(false); await removalGap().ConfigureAwait(false); } }
     }
     private Task RunAdmittedStageAsync(Generation current, Func<Task> work)
     {
@@ -282,10 +283,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     {
         Admission? admission = null; lock (this.lockObject) if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen) admission = this.AdmitLocked(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }); admission?.Gate.TrySetResult();
     }
-    private void AdmitTask(Generation current, Task task)
+    private void AdmitTask(Generation current, Task task, TaskCompletionSource? removalCompleted = null)
     {
         current.OwnedTasks.Add(task);
-        _ = task.ContinueWith(completed => { var fault = completed.Exception?.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException); if (fault is not null) current.Lifecycle.TrySetException(fault); lock (this.lockObject) current.OwnedTasks.Remove(completed); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = task.ContinueWith(completed => { var fault = completed.Exception?.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException); if (fault is not null) current.Lifecycle.TrySetException(fault); lock (this.lockObject) current.OwnedTasks.Remove(completed); removalCompleted?.TrySetResult(); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
     private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner, CancellationToken callerToken = default)
     {
