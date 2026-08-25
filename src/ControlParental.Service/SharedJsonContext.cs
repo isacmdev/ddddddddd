@@ -36,6 +36,7 @@ using ControlParental.Domain;
 [JsonSerializable(typeof(VerdictReaction))]
 [JsonSerializable(typeof(EnforcementIssueType))]
 [JsonSerializable(typeof(EnforcementIssueSeverity))]
+[JsonSerializable(typeof(IntegrityEscalationStateEnvelope))]
 [JsonSerializable(typeof(Dictionary<string, object>))]
 [JsonSerializable(typeof(List<UsageLogEntry>))]
 [JsonSerializable(typeof(List<DeviceAlertEntry>))]
