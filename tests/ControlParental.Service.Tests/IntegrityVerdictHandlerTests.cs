@@ -15,6 +15,14 @@ using Xunit;
 /// </summary>
 public class IntegrityVerdictHandlerTests : IDisposable
 {
+    private static IntegrityVerdictHandler CreateActive(DateTimeOffset now, string scope = "local")
+    {
+        var handler = new IntegrityVerdictHandler(identityScope: scope, clock: () => now);
+        handler.SetServiceStartTime(DateTimeOffset.MinValue);
+        handler.DisableShadowMode();
+        return handler;
+    }
+
     private readonly Mock<IOutboxManager> mockOutboxManager;
     private readonly IntegrityVerdictHandler handler;
 
@@ -683,5 +691,162 @@ public class IntegrityVerdictHandlerTests : IDisposable
         ordered.HandleVerdict("revoked", true, acceptance).Action.Should().Be(VerdictAction.ShadowWarn);
         ordered.IsCircuitOpen.Should().BeTrue();
         ordered.EvaluateDeadline(acceptance).Action.Should().Be(VerdictAction.None);
+    }
+
+    [Fact]
+    public void SnapshotRestore_PreservesAllDurableStateAndRejectsIdentityOrInvariantChanges()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var source = CreateActive(now, "device-a");
+        source.HandleVerdictDecision("revoked", true, now);
+        source.HandleVerdictDecision("revoked", true, now.AddSeconds(1));
+        var expected = source.Snapshot();
+
+        using var restored = new IntegrityVerdictHandler(identityScope: "device-a", clock: () => now);
+        restored.Restore(expected);
+        restored.Snapshot().Should().Be(expected);
+
+        using var wrongIdentity = new IntegrityVerdictHandler(identityScope: "device-b", clock: () => now);
+        var identityError = Assert.Throws<IntegrityEscalationStateException>(() => wrongIdentity.Restore(expected));
+        identityError.Error.Should().Be(IntegrityEscalationStateError.WrongIdentity);
+
+        var invalid = expected with { RevokedStreak = 1, TrustStreak = 1 };
+        Assert.Throws<IntegrityEscalationStateException>(() => restored.Restore(invalid));
+        restored.Snapshot().Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("unknown", true)]
+    [InlineData(" malformed ", true)]
+    public void NonDefinitiveVerdict_PreservesEveryDurableField(string? verdict, bool success)
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var subject = CreateActive(now);
+        subject.HandleVerdict("revoked", true, now);
+        subject.HandleVerdict("revoked", true, now.AddSeconds(1));
+        var before = subject.Snapshot();
+
+        subject.HandleVerdictDecision(verdict, success, now.AddSeconds(2));
+
+        subject.Snapshot().Should().Be(before);
+    }
+
+    [Fact]
+    public void CancelledVerdict_DoesNotAllocateSequenceOrEpoch()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var subject = new IntegrityVerdictHandler(clock: () => now);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var before = subject.Snapshot();
+
+        Assert.Throws<TaskCanceledException>(() => subject.HandleVerdictDecisionAsync(
+            "revoked", true, now, cancellation.Token).GetAwaiter().GetResult());
+
+        subject.Snapshot().Should().Be(before);
+    }
+
+    [Fact]
+    public void DefinitiveRevoked_AllocatesMonotonicallyAndPreservesThirdDeadline()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var subject = CreateActive(now);
+        var first = subject.HandleVerdictDecision("revoked", true, now);
+        var second = subject.HandleVerdictDecision("revoked", true, now.AddSeconds(1));
+        var third = subject.HandleVerdictDecision("revoked", true, now.AddSeconds(2));
+        var fourth = subject.HandleVerdictDecision("revoked", true, now.AddSeconds(3));
+
+        (first.Sequence, second.Sequence, third.Sequence, fourth.Sequence).Should().Be((1, 2, 3, 4));
+        third.Epoch.Should().Be(3);
+        fourth.Notification.Should().BeNull();
+        var state = subject.Snapshot();
+        state.Phase.Should().Be(EscalationPhase.Pending);
+        state.DeadlineOriginUtc.Should().Be(now.AddSeconds(2));
+        state.DeadlineDueUtc.Should().Be(now.AddSeconds(2).AddMinutes(5));
+        state.Epoch.Should().Be(4);
+        state.Sequence.Should().Be(4);
+    }
+
+    [Fact]
+    public async Task ConcurrentDefinitiveVerdicts_AreLinearizedWithoutLostDurableState()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var subject = CreateActive(now);
+        using var start = new ManualResetEventSlim(false);
+        var inputs = new[]
+        {
+            (Verdict: "revoked", Timestamp: now),
+            (Verdict: "trust", Timestamp: now.AddSeconds(1)),
+            (Verdict: "revoked", Timestamp: now.AddSeconds(2)),
+            (Verdict: "trust", Timestamp: now.AddSeconds(3)),
+        };
+
+        var calls = inputs.Select((input, index) => Task.Run(() =>
+        {
+            start.Wait();
+            return (index, input, decision: subject.HandleVerdictDecision(input.Verdict, true, input.Timestamp));
+        })).ToArray();
+
+        start.Set();
+        var results = await Task.WhenAll(calls);
+        var ordered = results.OrderBy(result => result.decision.Sequence).ToArray();
+
+        ordered.Select(result => result.decision.Sequence).Should().Equal(1, 2, 3, 4);
+        ordered.Select(result => result.decision.Epoch).Should().Equal(1, 2, 3, 4);
+
+        using var serial = CreateActive(now);
+        foreach (var result in ordered)
+        {
+            serial.HandleVerdictDecision(result.input.Verdict, true, result.input.Timestamp)
+                .Sequence.Should().Be(result.decision.Sequence);
+        }
+
+        subject.Snapshot().Should().Be(serial.Snapshot());
+    }
+
+    [Fact]
+    public void TrustBeforeDeadline_CancelsPendingAndThreeTrustsRecoverExactlyOnce()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var subject = CreateActive(now);
+        for (var i = 0; i < 3; i++) subject.HandleVerdict("revoked", true, now.AddSeconds(i));
+        subject.HandleVerdict("trust", true, now.AddSeconds(3));
+        subject.Snapshot().Phase.Should().Be(EscalationPhase.Normal);
+        subject.EvaluateDeadline(now.AddMinutes(6)).Action.Should().Be(VerdictAction.None);
+
+        var first = subject.HandleVerdict("revoked", true, now.AddMinutes(6));
+        var second = subject.HandleVerdict("revoked", true, now.AddMinutes(6).AddSeconds(1));
+        subject.HandleVerdict("revoked", true, now.AddMinutes(6).AddSeconds(2));
+        subject.EvaluateDeadline(now.AddMinutes(12)).Action.Should().Be(VerdictAction.Degrade);
+        subject.HandleVerdict("trust", true, now.AddMinutes(12)).IsAuthoritativeRecovery.Should().BeFalse();
+        subject.HandleVerdict("trust", true, now.AddMinutes(12).AddSeconds(1)).IsAuthoritativeRecovery.Should().BeFalse();
+        subject.HandleVerdict("trust", true, now.AddMinutes(12).AddSeconds(2)).IsAuthoritativeRecovery.Should().BeTrue();
+        subject.HandleVerdict("trust", true, now.AddMinutes(12).AddSeconds(3)).IsAuthoritativeRecovery.Should().BeFalse();
+        first.Action.Should().Be(VerdictAction.Warn);
+        second.Action.Should().Be(VerdictAction.Limit);
+    }
+
+    [Fact]
+    public void Restore_RollbackOrInvalidTimingFailsClosedWithoutPartialApply()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(10);
+        using var source = CreateActive(now, "device-a");
+        source.HandleVerdict("revoked", true, now);
+        source.HandleVerdict("revoked", true, now.AddSeconds(1));
+        source.HandleVerdict("revoked", true, now.AddSeconds(2));
+        var valid = source.Snapshot();
+
+        using var target = new IntegrityVerdictHandler(identityScope: "device-a", clock: () => now);
+        target.HandleVerdict("trust", true, now);
+        var original = target.Snapshot();
+        var rollback = valid with { MaxWallClockSeenUtc = now.AddMinutes(1) };
+        var rollbackError = Assert.Throws<IntegrityEscalationStateException>(() => target.Restore(rollback));
+        rollbackError.Error.Should().Be(IntegrityEscalationStateError.StaleState);
+        target.Snapshot().Should().Be(original);
+
+        var invalidTiming = valid with { DeadlineDueUtc = valid.DeadlineDueUtc!.Value.AddMinutes(1) };
+        Assert.Throws<IntegrityEscalationStateException>(() => target.Restore(invalidTiming));
+        target.Snapshot().Should().Be(original);
     }
 }

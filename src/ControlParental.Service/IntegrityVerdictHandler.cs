@@ -127,6 +127,12 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
     private bool shadowMode;
     private long sequence;
     private long epoch;
+    private DateTimeOffset maxWallClockSeenUtc;
+    private bool recoveryLatch;
+    private string? pendingReactionId;
+    private string? completedReactionId;
+    private string? pendingNotificationId;
+    private string? completedNotificationId;
     private readonly object stateGate = new();
     private readonly Func<DateTimeOffset> clock;
     private NotificationCommand? notificationForDecision;
@@ -149,6 +155,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         _ = onReaction;
         this.clock = clock ?? (() => DateTimeOffset.UtcNow);
         this.identityScope = identityScope;
+        this.maxWallClockSeenUtc = this.clock();
     }
 
     /// <inheritdoc />
@@ -187,23 +194,49 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         var observedAt = this.clock();
         lock (this.stateGate)
         {
+            this.notificationForDecision = null;
+            if (!success || verdict is not ("trust" or "revoked"))
+            {
+                var nonDefinitiveReaction = this.HandleVerdictCore(verdict, success, timestamp, observedAt, definitive: false);
+                return this.CreateDecisionLocked(nonDefinitiveReaction, observedAt, identityScope, this.sequence, this.epoch);
+            }
+
             var identity = this.AllocateDecisionIdentityLocked();
             this.sequence = identity.Sequence;
             this.epoch = identity.Epoch;
-            this.notificationForDecision = null;
             var reaction = this.HandleVerdictCore(verdict, success, timestamp, observedAt);
-            var scope = identityScope ?? this.identityScope;
-            return new VerdictDecision(
-                identity.Sequence,
-                identity.Epoch,
-                reaction,
-                this.notificationForDecision,
-                observedAt,
-                scope,
-                BuildIdempotencyKey(scope, identity.Epoch, identity.Sequence, reaction.Action.ToString()),
-                this.notificationForDecision is null ? null : BuildIdempotencyKey(scope, identity.Epoch, identity.Sequence, "notification"));
+            this.maxWallClockSeenUtc = MaxUtc(this.maxWallClockSeenUtc, observedAt);
+            var decision = this.CreateDecisionLocked(reaction, observedAt, identityScope, identity.Sequence, identity.Epoch);
+            if (decision.Notification is not null)
+            {
+                this.pendingReactionId = decision.ReactionIdempotencyKey;
+                this.pendingNotificationId = decision.NotificationIdempotencyKey;
+            }
+            this.recoveryLatch = decision.Reaction.IsAuthoritativeRecovery;
+            return decision;
         }
     }
+
+    private VerdictDecision CreateDecisionLocked(
+        VerdictReaction reaction,
+        DateTimeOffset observedAt,
+        string? requestedScope,
+        long decisionSequence,
+        long decisionEpoch)
+    {
+        var scope = requestedScope ?? this.identityScope;
+        return new VerdictDecision(
+            decisionSequence,
+            decisionEpoch,
+            reaction,
+            this.notificationForDecision,
+            observedAt,
+            scope,
+            BuildIdempotencyKey(scope, decisionEpoch, decisionSequence, reaction.Action.ToString()),
+            this.notificationForDecision is null ? null : BuildIdempotencyKey(scope, decisionEpoch, decisionSequence, "notification"));
+    }
+
+    private static DateTimeOffset MaxUtc(DateTimeOffset left, DateTimeOffset right) => left >= right ? left : right;
 
     private (long Sequence, long Epoch) AllocateDecisionIdentityLocked()
     {
@@ -223,7 +256,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
             ? Task.FromCanceled<VerdictDecision>(cancellationToken)
             : Task.FromResult(this.HandleVerdictDecision(verdict, success, timestamp));
 
-    private VerdictReaction HandleVerdictCore(string? verdict, bool success, DateTimeOffset timestamp, DateTimeOffset acceptanceTime)
+    private VerdictReaction HandleVerdictCore(string? verdict, bool success, DateTimeOffset timestamp, DateTimeOffset acceptanceTime, bool definitive = true)
     {
         // Mechanism 5: Grace period — skip first N minutes after startup
         if ((timestamp - this.serviceStartTime).TotalMinutes < GracePeriodMinutes)
@@ -231,7 +264,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
             return new VerdictReaction(VerdictAction.ShadowWarn, null, "Grace period active, skipping check");
         }
 
-        var deadlineWon = this.CommitDeadlineIfDueLocked(acceptanceTime);
+        var deadlineWon = definitive && this.CommitDeadlineIfDueLocked(acceptanceTime);
 
         // Mechanism 8: Circuit breaker — if open, skip all verdicts
         if (this.IsCircuitOpenAtLocked(acceptanceTime))
@@ -323,12 +356,24 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         var observedAt = this.clock();
         lock (this.stateGate)
         {
+            if (string.IsNullOrWhiteSpace(reason))
+            {
+                this.notificationForDecision = null;
+                return this.CreateDecisionLocked(
+                    new VerdictReaction(VerdictAction.None, null, "Invalid local integrity failure"),
+                    observedAt,
+                    identityScope,
+                    this.sequence,
+                    this.epoch);
+            }
+
             var identity = this.AllocateDecisionIdentityLocked();
             this.sequence = identity.Sequence;
             this.epoch = identity.Epoch;
             this.notificationForDecision = null;
             var reaction = this.HandleLocalFailureCore(reason, timestamp);
             var scope = identityScope ?? this.identityScope;
+            this.maxWallClockSeenUtc = MaxUtc(this.maxWallClockSeenUtc, observedAt);
             return new VerdictDecision(
                 identity.Sequence,
                 identity.Epoch,
@@ -386,7 +431,7 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         // Mechanism 4: Escalation before DEGRADED — notify admin, wait 5 minutes
         if (!this.pendingDegradeNotified)
         {
-            this.escalationDueAt = acceptanceTime.AddMinutes(EscalationDelayMinutes);
+            this.escalationDueAt = timestamp.AddMinutes(EscalationDelayMinutes);
             // Enqueue admin notification
             this.notificationForDecision = new NotificationCommand(
                 "integrity_degrade_pending",
@@ -443,6 +488,75 @@ public sealed class IntegrityVerdictHandler : IIntegrityVerdictHandler, IDisposa
         this.escalationFired = true;
         this.degraded = true;
         return true;
+    }
+
+    public IntegrityEscalationState Snapshot()
+    {
+        lock (this.stateGate)
+        {
+            var phase = this.degraded
+                ? EscalationPhase.Degraded
+                : this.pendingDegradeNotified && !this.escalationFired
+                    ? EscalationPhase.Pending
+                    : EscalationPhase.Normal;
+            return new IntegrityEscalationState(
+                this.identityScope,
+                1,
+                IntegrityEscalationState.CurrentSchemaVersion,
+                this.epoch,
+                this.sequence,
+                Math.Min(this.consecutiveRevokedCount, IntegrityEscalationState.DefinitiveRevokedThreshold),
+                Math.Min(this.consecutiveTrustCount, IntegrityEscalationState.DefinitiveTrustRecoveryThreshold),
+                phase,
+                phase == EscalationPhase.Pending ? this.escalationDueAt!.Value.AddMinutes(-EscalationDelayMinutes) : null,
+                phase == EscalationPhase.Pending ? this.escalationDueAt : null,
+                this.maxWallClockSeenUtc,
+                true,
+                this.escalationFired,
+                this.recoveryLatch,
+                this.pendingReactionId,
+                this.completedReactionId,
+                this.pendingNotificationId,
+                this.completedNotificationId);
+        }
+    }
+
+    public void Restore(IntegrityEscalationState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        state.Validate();
+        var now = this.clock();
+        if (state.IdentityScope != this.identityScope)
+        {
+            throw new IntegrityEscalationStateException(IntegrityEscalationStateError.WrongIdentity, "The escalation identity is different.");
+        }
+        if (state.PolicyVersion != 1)
+        {
+            throw new IntegrityEscalationStateException(IntegrityEscalationStateError.InvalidState, "The escalation policy version is different.");
+        }
+        if (state.MaxWallClockSeenUtc > now)
+        {
+            throw new IntegrityEscalationStateException(IntegrityEscalationStateError.StaleState, "The escalation state is from the future.");
+        }
+
+        lock (this.stateGate)
+        {
+            this.epoch = state.Epoch;
+            this.sequence = state.Sequence;
+            this.consecutiveRevokedCount = state.RevokedStreak;
+            this.consecutiveTrustCount = state.TrustStreak;
+            this.pendingDegradeNotified = state.Phase == EscalationPhase.Pending;
+            this.escalationFired = state.FiredLatch;
+            this.degraded = state.Phase == EscalationPhase.Degraded;
+            this.escalationDueAt = state.DeadlineDueUtc;
+            this.maxWallClockSeenUtc = state.MaxWallClockSeenUtc;
+            this.recoveryLatch = state.RecoveryLatch;
+            this.pendingReactionId = state.PendingReactionId;
+            this.completedReactionId = state.CompletedReactionId;
+            this.pendingNotificationId = state.PendingNotificationId;
+            this.completedNotificationId = state.CompletedNotificationId;
+            this.notificationForDecision = null;
+        }
     }
 
     internal void SeedDecisionCountersForTesting(long sequence, long epoch)
