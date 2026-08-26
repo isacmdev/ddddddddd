@@ -1286,6 +1286,158 @@ public class AntiTamperMonitorTests : IDisposable
         store.State.CompletedNotificationId.Should().Be("notification-agent");
     }
 
+    [Fact]
+    public async Task DurableOwner_SaveFailureBeforeEffect_RetryUsesTheSameKey()
+    {
+        var store = new RecordingEscalationStore();
+        var decision = Decision(20, 20, "save-before-effect", null);
+        this.ConfigureHealthyBackend();
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        store.SaveFailureAt = store.SaveCalls + 1;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(decision));
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), "save-before-effect", It.IsAny<CancellationToken>()), Times.Never);
+        await monitor.ExecuteDecisionAsync(decision);
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), "save-before-effect", It.IsAny<CancellationToken>()), Times.Once);
+        store.State!.PendingReactionId.Should().Be("save-before-effect"); store.State.CompletedReactionId.Should().Be("save-before-effect");
+        store.State.PendingNotificationId.Should().BeNull(); store.State.CompletedNotificationId.Should().BeNull();
+        this.mockOutboxManager.Invocations.Should().BeEmpty();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task DurableOwner_ProgressSaveFailure_RetryRepeatsExactEffectAndConverges()
+    {
+        var store = new RecordingEscalationStore();
+        var decision = Decision(21, 21, "progress-retry", "progress-notification");
+        this.ConfigureHealthyBackend();
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        store.SaveFailureAt = store.SaveCalls + 2;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(decision));
+        store.State!.PendingReactionId.Should().Be("progress-retry"); store.State.CompletedReactionId.Should().BeNull();
+        store.State.PendingNotificationId.Should().Be("progress-notification"); store.State.CompletedNotificationId.Should().BeNull();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+
+        this.mockEnforcementLevelMonitor.Invocations.Clear(); this.mockOutboxManager.Invocations.Clear();
+        using (var restarted = this.CreatePureMonitor(store: store))
+        {
+            await restarted.StartAsync();
+            this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), "progress-retry", It.IsAny<CancellationToken>()), Times.Once);
+            this.mockOutboxManager.Verify(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), "progress-notification", It.IsAny<CancellationToken>()), Times.Once);
+            store.State.PendingReactionId.Should().Be("progress-retry"); store.State.CompletedReactionId.Should().Be("progress-retry");
+            store.State.PendingNotificationId.Should().Be("progress-notification"); store.State.CompletedNotificationId.Should().Be("progress-notification");
+            await restarted.StopAsync();
+        }
+
+        this.mockEnforcementLevelMonitor.Invocations.Clear(); this.mockOutboxManager.Invocations.Clear();
+        using var finalRestart = this.CreatePureMonitor(store: store);
+        await finalRestart.StartAsync();
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); this.mockOutboxManager.Invocations.Should().BeEmpty();
+        store.State.PendingReactionId.Should().Be("progress-retry"); store.State.CompletedReactionId.Should().Be("progress-retry");
+        store.State.PendingNotificationId.Should().Be("progress-notification"); store.State.CompletedNotificationId.Should().Be("progress-notification");
+        await finalRestart.StopAsync();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartupLoadAfterStop_IsolatedByOutcome(bool fault)
+    {
+        var state = ValidState("startup-load-reaction", "startup-load-notification") with { CompletedReactionId = null, CompletedNotificationId = null };
+        var entered = NewSignal(); var release = NewSignal();
+        var store = new RecordingEscalationStore(state)
+        {
+            LoadBehavior = async _ => { entered.SetResult(); await release.Task; if (fault) throw new InvalidOperationException("stale startup load"); return state; },
+        };
+        this.ConfigureHealthyBackend();
+        using var monitor = this.CreatePureMonitor(store: store);
+        var start = Task.Run(() => monitor.StartAsync()); await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = monitor.StopAsync(); release.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start); await stop;
+        store.SaveCalls.Should().Be(0); store.State!.PendingReactionId.Should().Be("startup-load-reaction"); store.State.CompletedReactionId.Should().BeNull();
+        store.State.PendingNotificationId.Should().Be("startup-load-notification"); store.State.CompletedNotificationId.Should().BeNull();
+        this.mockBackendClient.VerifyNoOtherCalls();
+        this.mockEnforcementLevelMonitor.VerifyNoOtherCalls(); this.mockOutboxManager.Invocations.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartupReactionAfterStop_DoesNotContinueOrSurfaceStaleFault(bool fault)
+    {
+        var state = ValidState("startup-reaction", "startup-notification") with { CompletedReactionId = null, CompletedNotificationId = null };
+        var store = new RecordingEscalationStore(state);
+        var entered = NewSignal(); var release = NewSignal();
+        this.ConfigureHealthyBackend();
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Returns<IssueKey, EnforcementIssueSeverity, string, string?, CancellationToken>(async (_, _, _, _, _) => { entered.SetResult(); await release.Task; if (fault) throw new InvalidOperationException("stale startup reaction"); });
+        using var monitor = this.CreatePureMonitor(store: store);
+        var start = Task.Run(() => monitor.StartAsync()); await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = monitor.StopAsync(); release.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start); await stop;
+        store.SaveCalls.Should().Be(0); store.State!.PendingReactionId.Should().Be("startup-reaction");
+        this.mockOutboxManager.Invocations.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartupReactionProgressSaveAfterStop_IsolatedByOutcome(bool fault)
+    {
+        var state = ValidState("startup-save", null); var store = new RecordingEscalationStore(state);
+        this.ConfigureHealthyBackend();
+        this.mockEnforcementLevelMonitor.Setup(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        store.SaveGate = NewSignal(); store.SaveException = fault ? new InvalidOperationException("stale startup save") : null;
+        using var monitor = this.CreatePureMonitor(store: store);
+        var start = Task.Run(() => monitor.StartAsync()); await store.SaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = monitor.StopAsync(); await Task.Delay(20);
+        store.SaveGate.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start); await stop;
+        store.State!.PendingReactionId.Should().Be("startup-save");
+        store.State.CompletedReactionId.Should().Be(fault ? null : "startup-save");
+        this.mockOutboxManager.Invocations.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartupNotificationCompletionAfterStop_DoesNotStartProgressSave(bool fault)
+    {
+        var state = ValidState("startup-reaction-complete", "startup-notification") with { CompletedReactionId = "startup-reaction-complete", CompletedNotificationId = null };
+        var store = new RecordingEscalationStore(state); var entered = NewSignal(); var release = NewSignal();
+        this.ConfigureHealthyBackend();
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns<string, string, string, DateTimeOffset, string, CancellationToken>(async (_, _, _, _, _, _) => { entered.SetResult(); await release.Task; if (fault) throw new InvalidOperationException("stale startup notification"); });
+        using var monitor = this.CreatePureMonitor(store: store);
+        var start = Task.Run(() => monitor.StartAsync()); await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = monitor.StopAsync(); release.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start); await stop;
+        store.SaveCalls.Should().Be(0); store.State!.CompletedNotificationId.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartupNotificationProgressSaveAfterStop_IsolatedByOutcome(bool fault)
+    {
+        var state = ValidState("startup-reaction-complete", "startup-notification") with { CompletedReactionId = "startup-reaction-complete", CompletedNotificationId = null };
+        var store = new RecordingEscalationStore(state) { SaveGate = NewSignal(), SaveException = fault ? new InvalidOperationException("stale notification progress save") : null };
+        this.ConfigureHealthyBackend();
+        this.mockOutboxManager.Setup(m => m.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var monitor = this.CreatePureMonitor(store: store);
+        var start = Task.Run(() => monitor.StartAsync()); await store.SaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = monitor.StopAsync(); await Task.Delay(20); store.SaveGate.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start); await stop;
+        store.State!.PendingNotificationId.Should().Be("startup-notification");
+        store.State.CompletedNotificationId.Should().Be(fault ? null : "startup-notification");
+    }
+
     private static IntegrityEscalationState ValidState(string reaction, string? notification, EscalationPhase phase = EscalationPhase.Normal, bool recoveryLatch = false, int trustStreak = 0)
         => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 1, 0, trustStreak, phase, null, null, DateTimeOffset.UtcNow, true, phase == EscalationPhase.Degraded, recoveryLatch, reaction, notification is null ? null : reaction, notification, notification);
 
@@ -1298,9 +1450,14 @@ public class AntiTamperMonitorTests : IDisposable
         public Action? OnLoad { get; set; }
         public Exception? LoadException { get; set; }
         public Func<CancellationToken, Task<IntegrityEscalationState?>>? LoadBehavior { get; set; }
+        public int SaveCalls { get; private set; }
+        public int? SaveFailureAt { get; set; }
         public CancellationToken ObservedToken { get; private set; }
+        public TaskCompletionSource? SaveGate { get; set; }
+        public TaskCompletionSource SaveEntered { get; private set; } = NewSignal();
+        public Exception? SaveException { get; set; }
         public async Task<IntegrityEscalationState?> LoadAsync(string identity, CancellationToken cancellationToken = default) { this.Loads++; this.ObservedToken = cancellationToken; this.OnLoad?.Invoke(); if (this.LoadBehavior is not null) return await this.LoadBehavior(cancellationToken); if (this.LoadException is not null) throw this.LoadException; return this.State; }
-        public Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default) { value.Validate(); this.Last = value; this.State = value.State; return Task.CompletedTask; }
+        public async Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default) { this.SaveCalls++; if (this.SaveGate is not null) { this.SaveEntered.TrySetResult(); await this.SaveGate.Task; if (this.SaveException is not null) throw this.SaveException; } if (this.SaveCalls == this.SaveFailureAt) throw new InvalidOperationException("save retry"); value.Validate(); this.Last = value; this.State = value.State; }
     }
 
     private static VerdictDecision Decision(long epoch, long sequence, string reactionKey, string? notificationKey)

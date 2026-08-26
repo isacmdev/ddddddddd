@@ -313,7 +313,15 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         await current.Gate.WaitAsync(current.Cancellation.Token).ConfigureAwait(false);
         try
         {
-            await this.RehydrateAsync(current).ConfigureAwait(false);
+            try
+            {
+                await this.RehydrateAsync(current).ConfigureAwait(false);
+            }
+            catch (Exception) when (!this.IsGenerationActive(current))
+            {
+                return;
+            }
+            if (!this.IsGenerationActive(current)) return;
             await this.PerformIntegrityCheckAsync(current, current.Cancellation.Token, true).ConfigureAwait(false);
         }
         finally
@@ -332,6 +340,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
         var identity = this.identityCoordinator?.CurrentState.DeviceId ?? "local";
         var state = await this.stateStore.LoadAsync(identity, owner.Cancellation.Token).ConfigureAwait(false);
+        if (!this.IsGenerationActive(owner)) return;
         if (state is not null)
         {
             state.Validate();
@@ -342,6 +351,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
             owner.DurableState = state;
             await this.ReconcileDurableEffectsAsync(owner, state).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
         }
 
         owner.Rehydrated = true;
@@ -361,8 +371,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 await this.enforcementLevelMonitor.AddIssueAsync(issue, EnforcementIssueSeverity.Severe, "Integrity reaction", state.PendingReactionId, CancellationToken.None).ConfigureAwait(false);
             }
 
+            if (!this.IsGenerationActive(owner)) return;
             state = state with { CompletedReactionId = state.PendingReactionId };
             await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
         }
 
         if (state.PendingNotificationId is not null && state.PendingNotificationId != state.CompletedNotificationId)
@@ -370,8 +382,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             await this.outboxManager.EnqueueIntegrityNotificationAsync(
                 "integrity_degrade_pending", "Integrity degradation pending", "Integrity escalation requires attention",
                 this.timeProvider.WallClockNow, state.PendingNotificationId, CancellationToken.None).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
             state = state with { CompletedNotificationId = state.PendingNotificationId };
             await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
         }
 
         owner.DurableState = state;
@@ -730,8 +744,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             try
             {
                 await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
-                owner.ReactionProgress = new(shape, decision.ReactionIdempotencyKey);
-                await this.SaveEffectProgressAsync(owner, reactionDomain: true).ConfigureAwait(false);
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
             }
             catch
             {
@@ -752,8 +765,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 {
                     await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", decision.ReactionIdempotencyKey, CancellationToken.None).ConfigureAwait(false);
                 }
-                owner.ReactionProgress = new(shape, decision.ReactionIdempotencyKey);
-                await this.SaveEffectProgressAsync(owner, reactionDomain: true).ConfigureAwait(false);
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
             }
             catch
             {
@@ -774,8 +786,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                     decision.Notification.Timestamp,
                     decision.NotificationIdempotencyKey,
                     CancellationToken.None).ConfigureAwait(false);
-                owner.NotificationProgress = new(shape, decision.NotificationIdempotencyKey);
-                await this.SaveEffectProgressAsync(owner, reactionDomain: false).ConfigureAwait(false);
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: false).ConfigureAwait(false);
                 if (owner.PendingRetry is { ReactionDomain: false }) owner.PendingRetry = null;
             }
             catch
@@ -871,14 +882,22 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         await this.SaveStateAsync(owner, state).ConfigureAwait(false);
     }
 
-    private async Task SaveEffectProgressAsync(Generation owner, bool reactionDomain)
+    private async Task SaveEffectProgressAsync(Generation owner, DecisionShape shape, bool reactionDomain)
     {
-        if (this.stateStore is null || owner.DurableState is null) return;
+        if (this.stateStore is null)
+        {
+            if (reactionDomain) owner.ReactionProgress = new(shape, shape.ReactionKey);
+            else if (shape.NotificationKey is not null) owner.NotificationProgress = new(shape, shape.NotificationKey);
+            return;
+        }
+        if (owner.DurableState is null) return;
         var state = owner.DurableState;
         state = reactionDomain
             ? state with { CompletedReactionId = state.PendingReactionId }
             : state with { CompletedNotificationId = state.PendingNotificationId };
         await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+        if (reactionDomain) owner.ReactionProgress = new(shape, state.PendingReactionId!);
+        else owner.NotificationProgress = new(shape, state.PendingNotificationId!);
     }
 
     private async Task SaveStateAsync(Generation owner, IntegrityEscalationState state)
