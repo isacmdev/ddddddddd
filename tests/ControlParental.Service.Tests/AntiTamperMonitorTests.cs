@@ -1261,6 +1261,245 @@ public class AntiTamperMonitorTests : IDisposable
     }
 
     [Fact]
+    public async Task DeadlineOwner_UsesPersistedDueForBeforeDueAndOneShotDegradation()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var state = PendingState(now.AddMinutes(5));
+        var store = new RecordingEscalationStore(state);
+        var degraded = NewSignal();
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now);
+        this.ConfigurePureBackend("unknown");
+        this.mockEnforcementLevelMonitor
+            .Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
+
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        var generation = this.GetGeneration(monitor)!;
+        this.GetResource(generation, "DeadlineTimer").Should().NotBeNull();
+
+        this.InvokeGeneration(monitor, "AdmitDeadlineCheck", generation);
+        await Task.Delay(50);
+        store.State!.Phase.Should().Be(EscalationPhase.Pending);
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty();
+
+        now = state.DeadlineDueUtc!.Value;
+        this.InvokeGeneration(monitor, "AdmitDeadlineCheck", generation);
+        await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        this.InvokeGeneration(monitor, "AdmitDeadlineCheck", generation);
+        await Task.Delay(50);
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded);
+        this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1);
+        await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_RollbackFailsClosedWithoutReplacementDelay()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var state = PendingState(now.AddMinutes(5)) with { MaxWallClockSeenUtc = now };
+        var store = new RecordingEscalationStore(state);
+        var reads = 0;
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => Interlocked.Increment(ref reads) == 1 ? now : now.AddMinutes(-1));
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        this.GetResource(this.GetGeneration(monitor), "DeadlineTimer").Should().BeNull();
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded);
+        this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1);
+        await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_SyntheticEarlyCallbackDoesNotRearmOrResubtract()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var state = PendingState(now.AddMinutes(5));
+        var store = new RecordingEscalationStore(state);
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now);
+        this.ConfigurePureBackend("unknown");
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        var generation = this.GetGeneration(monitor)!;
+        var timer = this.GetResource(generation, "DeadlineTimer");
+        var version = (long)generation.GetType().GetField("DeadlineVersion", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(generation)!;
+        var saves = store.SaveCalls;
+
+        this.InvokeGeneration(monitor, "AdmitDeadlineCheck", generation);
+        await Task.Delay(50);
+
+        this.GetResource(generation, "DeadlineTimer").Should().BeSameAs(timer);
+        generation.GetType().GetField("DeadlineVersion", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(generation).Should().Be(version);
+        store.State!.Phase.Should().Be(EscalationPhase.Pending);
+        store.SaveCalls.Should().Be(saves);
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty();
+        await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_ForwardJumpAdmitsExpiryThroughIntegrityPath()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var monotonic = 1000L;
+        var state = PendingState(now.AddMinutes(5));
+        var store = new RecordingEscalationStore(state);
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now);
+        this.mockTimeProvider.SetupGet(value => value.MonotonicNow).Returns(() => monotonic);
+        this.ConfigurePureBackend("unknown");
+        var degraded = NewSignal();
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        now = state.DeadlineDueUtc!.Value.AddMinutes(1);
+        monotonic++;
+        await monitor.TriggerIntegrityCheckAsync();
+        await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded);
+        await monitor.StopAsync();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task DeadlineOwner_ActualOneShotTimerDegradesAtOrAfterDue(int minutesFromDue)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var due = now.AddMinutes(minutesFromDue);
+        var state = PendingState(due);
+        var store = new RecordingEscalationStore(state);
+        var degraded = NewSignal();
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now);
+        this.mockTimeProvider.SetupGet(value => value.MonotonicNow).Returns(1000L);
+        this.mockPrivilegeInspector.Setup(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        this.mockIntegrityChecker.Setup(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe"));
+        this.mockBackendClient.Setup(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(false, null));
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
+
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+        var generation = this.GetGeneration(monitor)!;
+        await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded);
+        store.Last!.State.PendingReactionId.Should().NotBeNullOrWhiteSpace();
+        this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1);
+        await monitor.StopAsync();
+        this.GetResource(generation, "DeadlineTimer").Should().BeNull();
+        this.GetResourceCount(generation, "DeadlineTimerDisposals").Should().Be(1);
+
+        this.mockEnforcementLevelMonitor.Invocations.Clear();
+        this.mockBackendClient.Setup(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(true, "trust"));
+        this.mockEnforcementLevelMonitor.Setup(value => value.ResolveIssueAsync(It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        using var recovery = this.CreatePureMonitor(store: store);
+        await recovery.StartAsync();
+        var recoveryGeneration = this.GetGeneration(recovery);
+        await recovery.TriggerIntegrityCheckAsync(); await recovery.TriggerIntegrityCheckAsync(); await recovery.TriggerIntegrityCheckAsync();
+        this.mockEnforcementLevelMonitor.Verify(value => value.ResolveIssueAsync(It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        await recovery.TriggerIntegrityCheckAsync();
+        this.mockEnforcementLevelMonitor.Verify(value => value.ResolveIssueAsync(It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        await recovery.StopAsync();
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_ElapsedCallbackSurvivesQueuedSyntheticAdmission()
+    {
+        var now = DateTimeOffset.UtcNow; var store = new RecordingEscalationStore(PendingState(now.AddMinutes(5)));
+        var degraded = NewSignal(); this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("unknown");
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
+        using var monitor = this.CreatePureMonitor(store: store); await monitor.StartAsync(); var generation = this.GetGeneration(monitor)!;
+        var gate = (SemaphoreSlim)this.GetResource(generation, "Gate"); await gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        this.InvokeGeneration(monitor, "AdmitDeadlineCheck", generation);
+        ((Timer)this.GetResource(generation, "DeadlineTimer")).Change(TimeSpan.Zero, Timeout.InfiniteTimeSpan);
+        try
+        {
+            SpinWait.SpinUntil(() => ((ICollection<Task>)this.GetResource(generation, "OwnedTasks")).Count >= 2, TimeSpan.FromSeconds(2)).Should().BeTrue();
+        }
+        finally { gate.Release(); }
+        await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded); this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1);
+        await monitor.StopAsync();
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DeadlineOwner_TimingDefectsNormalizeOnlyPendingState(bool rollback)
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(-1); var pending = PendingState(now.AddMinutes(5)) with { PendingReactionId = null, CompletedReactionId = null, MaxWallClockSeenUtc = rollback ? now.AddMinutes(1) : now, TimingValid = rollback };
+        var store = new RecordingEscalationStore(pending); var degraded = NewSignal(); this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
+        using var monitor = this.CreatePureMonitor(store: store); await monitor.StartAsync(); await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        store.State!.Phase.Should().Be(EscalationPhase.Degraded); store.State.Validate(); this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1); await monitor.StopAsync();
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_UnknownPendingCorruptionStillFailsClosed()
+    {
+        var store = new RecordingEscalationStore(PendingState(DateTimeOffset.UtcNow.AddMinutes(5)) with { IdentityScope = string.Empty }); this.ConfigurePureBackend("unknown");
+        using var monitor = this.CreatePureMonitor(store: store); await Assert.ThrowsAsync<IntegrityEscalationStateException>(() => monitor.StartAsync());
+        this.mockEnforcementLevelMonitor.Invocations.Should().BeEmpty(); await Assert.ThrowsAsync<IntegrityEscalationStateException>(() => monitor.StopAsync());
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_StopRestartDisposesOldTimerAndRejectsStaleGeneration()
+    {
+        var now = DateTimeOffset.UtcNow; var due = now.AddMinutes(5); var store = new RecordingEscalationStore(PendingState(due));
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("unknown"); using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync(); var first = this.GetGeneration(monitor)!; this.GetResource(first, "DeadlineTimer").Should().NotBeNull();
+        await monitor.StopAsync(); this.GetResource(first, "DeadlineTimer").Should().BeNull(); this.GetResourceCount(first, "DeadlineTimerDisposals").Should().Be(1);
+        await monitor.StartAsync(); var second = this.GetGeneration(monitor)!; second.Should().NotBeSameAs(first); this.GetResource(second, "DeadlineTimer").Should().NotBeNull();
+        var snapshot = store.State; this.InvokeGeneration(monitor, "AdmitDeadlineCheck", first); await Task.Yield(); store.State.Should().Be(snapshot); this.GetResource(second, "DeadlineTimer").Should().NotBeNull();
+        await monitor.StopAsync(); this.GetResourceCount(second, "DeadlineTimerDisposals").Should().Be(1);
+    }
+
+    [Fact]
+    public async Task DeadlineOwner_TrustFreshIdentityAndDirectDisposeRejectStaleCallbacks()
+    {
+        var now = DateTimeOffset.UtcNow; var store = new RecordingEscalationStore(PendingState(now.AddMinutes(5)));
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("unknown");
+        using var monitor = this.CreatePureMonitor(store: store); await monitor.StartAsync();
+        var first = this.GetGeneration(monitor)!; var firstTimer = this.GetResource(first, "DeadlineTimer"); var firstVersion = this.GetDeadlineVersion(first);
+        var due = store.State!.DeadlineDueUtc; var origin = store.State.DeadlineOriginUtc; var disposals = this.GetResourceCount(first, "DeadlineTimerDisposals");
+        this.ConfigurePureBackend("trust"); await monitor.TriggerIntegrityCheckAsync();
+        store.State!.Phase.Should().Be(EscalationPhase.Normal); store.State.DeadlineDueUtc.Should().BeNull(); store.State.DeadlineOriginUtc.Should().BeNull();
+        this.GetResource(first, "DeadlineTimer").Should().BeNull(); this.GetResourceCount(first, "DeadlineTimerDisposals").Should().Be(disposals + 1);
+        var before = this.CollaboratorSnapshot(); this.InvokeDeadline(monitor, first, firstVersion, true); await Task.Yield(); this.CollaboratorSnapshot().Should().Equal(before);
+        this.ConfigurePureBackend("revoked"); now = now.AddSeconds(1); await monitor.TriggerIntegrityCheckAsync(); await monitor.TriggerIntegrityCheckAsync(); await monitor.TriggerIntegrityCheckAsync();
+        store.State!.Phase.Should().Be(EscalationPhase.Pending); store.State.DeadlineDueUtc.Should().NotBe(due); store.State.DeadlineOriginUtc.Should().NotBe(origin);
+        var second = this.GetGeneration(monitor)!; var secondTimer = this.GetResource(second, "DeadlineTimer"); var secondVersion = this.GetDeadlineVersion(second);
+        second.Should().BeSameAs(this.GetGeneration(monitor)); secondVersion.Should().BeGreaterThan(firstVersion); secondTimer.Should().NotBeNull(); secondTimer.Should().NotBeSameAs(firstTimer);
+        this.InvokeDeadline(monitor, first, firstVersion, true); await Task.Yield(); this.GetResource(second, "DeadlineTimer").Should().BeSameAs(secondTimer); this.GetDeadlineVersion(second).Should().Be(secondVersion);
+        monitor.Dispose(); this.GetResource(second, "DeadlineTimer").Should().BeNull(); this.GetResourceCount(second, "DeadlineTimerDisposals").Should().Be(disposals + 2); monitor.Dispose();
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DeadlineOwner_RealTimerFaultRestartConvergesByExactKey(bool saveFault)
+    {
+        var now = DateTimeOffset.UtcNow; var store = new RecordingEscalationStore(PendingState(now.AddMinutes(5)));
+        var failure = new InvalidOperationException(saveFault ? "deadline save fault" : "deadline effect fault"); var entered = NewSignal();
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("unknown");
+        var failedSave = 0;
+        if (!saveFault) this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns<IssueKey, EnforcementIssueSeverity, string, string?, CancellationToken>((_, _, _, _, _) => { entered.TrySetResult(); return Task.FromException(failure); });
+        using (var monitor = this.CreatePureMonitor(store: store))
+        {
+            await monitor.StartAsync().WaitAsync(TimeSpan.FromSeconds(2)); now = store.State!.DeadlineDueUtc!.Value;
+            if (saveFault) { failedSave = store.SaveCalls + 1; store.SaveFailureAt = failedSave; }
+            ((Timer)this.GetResource(this.GetGeneration(monitor), "DeadlineTimer")).Change(TimeSpan.Zero, Timeout.InfiniteTimeSpan);
+            if (saveFault) SpinWait.SpinUntil(() => store.SaveCalls >= failedSave, TimeSpan.FromSeconds(2)).Should().BeTrue(); else await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync().WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+        store.State!.Validate(); var key = store.LastAttempted?.State.PendingReactionId ?? store.State.PendingReactionId; key.Should().NotBeNullOrWhiteSpace();
+        if (saveFault) store.State.Phase.Should().Be(EscalationPhase.Pending); else { store.State.Phase.Should().Be(EscalationPhase.Degraded); store.State.CompletedReactionId.Should().BeNull(); }
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        store.SaveException = null; store.SaveGate = null; store.SaveFailureAt = null; this.mockBackendClient.Setup(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(false, null));
+        using var restarted = this.CreatePureMonitor(store: store); await restarted.StartAsync().WaitAsync(TimeSpan.FromSeconds(2)); SpinWait.SpinUntil(() => store.State!.CompletedReactionId == key, TimeSpan.FromSeconds(2)).Should().BeTrue();
+        store.State!.Validate(); store.State.CompletedReactionId.Should().Be(key); await restarted.StopAsync();
+    }
+
+    [Fact]
     public async Task DurableOwner_RecordAgentDeathRestartReconcilesPersistedAuthorityWithoutDuplicateKey()
     {
         var state = ValidState("reaction-agent", "notification-agent") with { CompletedReactionId = null, CompletedNotificationId = null };
@@ -1441,11 +1680,15 @@ public class AntiTamperMonitorTests : IDisposable
     private static IntegrityEscalationState ValidState(string reaction, string? notification, EscalationPhase phase = EscalationPhase.Normal, bool recoveryLatch = false, int trustStreak = 0)
         => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 1, 0, trustStreak, phase, null, null, DateTimeOffset.UtcNow, true, phase == EscalationPhase.Degraded, recoveryLatch, reaction, notification is null ? null : reaction, notification, notification);
 
+    private static IntegrityEscalationState PendingState(DateTimeOffset due)
+        => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 4, 3, 0, EscalationPhase.Pending, due.AddMinutes(-5), due, due.AddMinutes(-5), true, false, false, "deadline-reaction", "deadline-reaction", null, null);
+
     private sealed class RecordingEscalationStore : IIntegrityEscalationStateStore
     {
         public RecordingEscalationStore(IntegrityEscalationState? state = null) => this.State = state;
         public IntegrityEscalationState? State { get; set; }
         public IntegrityEscalationStateEnvelope? Last { get; private set; }
+        public IntegrityEscalationStateEnvelope? LastAttempted { get; private set; }
         public int Loads { get; private set; }
         public Action? OnLoad { get; set; }
         public Exception? LoadException { get; set; }
@@ -1457,7 +1700,7 @@ public class AntiTamperMonitorTests : IDisposable
         public TaskCompletionSource SaveEntered { get; private set; } = NewSignal();
         public Exception? SaveException { get; set; }
         public async Task<IntegrityEscalationState?> LoadAsync(string identity, CancellationToken cancellationToken = default) { this.Loads++; this.ObservedToken = cancellationToken; this.OnLoad?.Invoke(); if (this.LoadBehavior is not null) return await this.LoadBehavior(cancellationToken); if (this.LoadException is not null) throw this.LoadException; return this.State; }
-        public async Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default) { this.SaveCalls++; if (this.SaveGate is not null) { this.SaveEntered.TrySetResult(); await this.SaveGate.Task; if (this.SaveException is not null) throw this.SaveException; } if (this.SaveCalls == this.SaveFailureAt) throw new InvalidOperationException("save retry"); value.Validate(); this.Last = value; this.State = value.State; }
+        public async Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default) { this.SaveCalls++; this.LastAttempted = value; if (this.SaveGate is not null) { this.SaveEntered.TrySetResult(); await this.SaveGate.Task; if (this.SaveException is not null) throw this.SaveException; } if (this.SaveCalls == this.SaveFailureAt) throw new InvalidOperationException("save retry"); value.Validate(); this.Last = value; this.State = value.State; }
     }
 
     private static VerdictDecision Decision(long epoch, long sequence, string reactionKey, string? notificationKey)
@@ -1497,7 +1740,18 @@ public class AntiTamperMonitorTests : IDisposable
 
     private static async ValueTask<bool> FaultingTick(TaskCompletionSource entered, TaskCompletionSource fault, Exception failure) { entered.SetResult(); await fault.Task; throw failure; }
 
-    private void InvokeGeneration(AntiTamperMonitor monitor, string method, object generation) => typeof(AntiTamperMonitor).GetMethod(method, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(monitor, new[] { generation });
+    private void InvokeGeneration(AntiTamperMonitor monitor, string method, object generation)
+        => typeof(AntiTamperMonitor).GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .Single(value => value.Name == method && value.GetParameters().Length == 1)
+            .Invoke(monitor, new[] { generation });
+
+    private void InvokeDeadline(AntiTamperMonitor monitor, object generation, long version, bool elapsed)
+        => typeof(AntiTamperMonitor).GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .Single(value => value.Name == "AdmitDeadlineCheck" && value.GetParameters().Length == 3)
+            .Invoke(monitor, new[] { generation, (object)version, elapsed });
+
+    private long GetDeadlineVersion(object generation)
+        => (long)generation.GetType().GetField("DeadlineVersion", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(generation)!;
 
     private AntiTamperMonitor CreateMonitor(Func<CancellationToken, ValueTask<bool>> tickSource, ConcurrentQueue<TamperEvent>? events = null)
         => new(this.mockTimeProvider.Object, this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, this.mockVerdictHandler.Object, onTamperDetected: events is null ? null : events.Enqueue, tickSource: tickSource);

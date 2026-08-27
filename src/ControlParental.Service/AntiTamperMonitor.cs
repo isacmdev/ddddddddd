@@ -46,8 +46,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         internal Task? InitialOperation;
         internal readonly HashSet<Task> OwnedTasks = new();
         internal readonly Func<CancellationToken, ValueTask<bool>>? TickSource;
-        internal Timer? TimezoneTimer; internal PeriodicTimer? TickTimer; internal Task? Loop; internal Task? Drain;
-        internal int CancellationDisposals; internal int GateDisposals; internal int TickTimerDisposals; internal int TimezoneTimerDisposals;
+        internal Timer? TimezoneTimer; internal Timer? DeadlineTimer; internal PeriodicTimer? TickTimer; internal Task? Loop; internal Task? Drain;
+        internal long DeadlineVersion; internal bool DeadlineArmed;
+        internal int CancellationDisposals; internal int GateDisposals; internal int TickTimerDisposals; internal int TimezoneTimerDisposals; internal int DeadlineTimerDisposals;
         internal bool AdmissionOpen = true; internal string Timezone = TimeZoneInfo.Local.Id;
         internal EffectProgress? ReactionProgress;
         internal EffectProgress? NotificationProgress;
@@ -199,7 +200,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             if (current is null) task = Task.CompletedTask;
             else
             {
-                current.AdmissionOpen = false; current.Cancellation.Cancel();
+                current.AdmissionOpen = false; current.Cancellation.Cancel(); this.CancelDeadlineLocked(current);
                 current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
                 task = this.BeginDrainLocked(current, out startDrain);
             }
@@ -294,6 +295,63 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     {
         Admission? admission = null; lock (this.lockObject) if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen) admission = this.AdmitLocked(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }); admission?.Gate.TrySetResult();
     }
+    private void AdmitDeadlineCheck(Generation current) => this.AdmitDeadlineCheck(current, current.DeadlineVersion, false);
+    private void AdmitDeadlineCheck(Generation current, long version, bool elapsed)
+    {
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (!this.IsGenerationActiveLocked(current) || !current.DeadlineArmed || current.DeadlineVersion != version) return;
+            admission = this.AdmitLocked(current, () => this.RunDeadlineAsync(current, version, elapsed));
+        }
+        admission?.Gate.TrySetResult();
+    }
+    private async Task RunDeadlineAsync(Generation owner, long version, bool elapsed)
+    {
+        await owner.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!this.IsGenerationActive(owner) || !owner.DeadlineArmed || owner.DeadlineVersion != version) return;
+            var now = this.timeProvider.WallClockNow;
+            var state = owner.DurableState;
+            if (state is null || state.Phase != EscalationPhase.Pending) return;
+            var failClosed = now < state.MaxWallClockSeenUtc;
+            var decision = this.verdictHandler is IntegrityVerdictHandler pureHandler
+                ? pureHandler.EvaluateDeadlineDecision(elapsed || failClosed ? state.DeadlineDueUtc!.Value : now, state.IdentityScope)
+                : null;
+            if (decision is null || decision.Reaction.Action != VerdictAction.Degrade)
+            {
+                return;
+            }
+            await this.ExecuteDecisionChainAsync(owner, decision, this.identityCoordinator?.CurrentState).ConfigureAwait(false);
+        }
+        finally { owner.Gate.Release(); }
+    }
+    private bool IsGenerationActiveLocked(Generation current)
+        => !this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen;
+    private void ArmDeadline(Generation owner, IntegrityEscalationState state)
+    {
+        lock (this.lockObject)
+        {
+            if (!this.IsGenerationActiveLocked(owner) || state.Phase != EscalationPhase.Pending) return;
+            var now = this.timeProvider.WallClockNow;
+            if (now < state.MaxWallClockSeenUtc) return;
+            this.CancelDeadlineLocked(owner);
+            var version = ++owner.DeadlineVersion;
+            var delay = state.DeadlineDueUtc!.Value <= now ? TimeSpan.Zero : state.DeadlineDueUtc.Value - now;
+            owner.DeadlineArmed = true;
+            owner.DeadlineTimer = new Timer(_ => this.AdmitDeadlineCheck(owner, version, true), null, delay, Timeout.InfiniteTimeSpan);
+        }
+    }
+    private void CancelDeadlineLocked(Generation owner)
+    {
+        owner.DeadlineArmed = false;
+        owner.DeadlineVersion++;
+        if (owner.DeadlineTimer is not null)
+        {
+            owner.DeadlineTimer.Dispose(); owner.DeadlineTimer = null; owner.DeadlineTimerDisposals++;
+        }
+    }
     private void AdmitTask(Generation current, Task task, TaskCompletionSource? removalCompleted = null)
     {
         current.OwnedTasks.Add(task);
@@ -343,6 +401,13 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         if (!this.IsGenerationActive(owner)) return;
         if (state is not null)
         {
+            var now = this.timeProvider.WallClockNow;
+            var timingDefect = state.Phase == EscalationPhase.Pending
+                && (!state.TimingValid || state.MaxWallClockSeenUtc > now);
+            if (timingDefect)
+            {
+                state = state with { MaxWallClockSeenUtc = now, TimingValid = true };
+            }
             state.Validate();
             if (this.verdictHandler is IntegrityVerdictHandler pureHandler)
             {
@@ -350,6 +415,19 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             }
 
             owner.DurableState = state;
+            if (state.Phase == EscalationPhase.Pending)
+            {
+                if (timingDefect || this.timeProvider.WallClockNow < state.MaxWallClockSeenUtc)
+                {
+                    var decision = ((IntegrityVerdictHandler)this.verdictHandler).EvaluateDeadlineDecision(state.DeadlineDueUtc!.Value, state.IdentityScope);
+                    await this.ExecuteDecisionChainAsync(owner, decision, this.identityCoordinator?.CurrentState).ConfigureAwait(false);
+                    state = owner.DurableState ?? state;
+                }
+                else
+                {
+                    this.ArmDeadline(owner, state);
+                }
+            }
             await this.ReconcileDurableEffectsAsync(owner, state).ConfigureAwait(false);
             if (!this.IsGenerationActive(owner)) return;
         }
@@ -397,7 +475,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         while (true) { Task[] owned; lock (this.lockObject) owned = current.OwnedTasks.ToArray(); if (owned.Length == 0) break; failure ??= await CaptureFailureAsync(Task.WhenAll(owned), true).ConfigureAwait(false); }
         if (failure is null && current.EffectFault.Task.Status == TaskStatus.RanToCompletion) failure = current.EffectFault.Task.Result;
 
-        lock (this.lockObject) { if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
+        lock (this.lockObject) { this.CancelDeadlineLocked(current); if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
 
         current.Cancellation.Dispose(); current.CancellationDisposals++;
         if (failure is not null) throw failure;
@@ -559,6 +637,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 this.FireClockJump(jump, direction, current);
                 return Task.CompletedTask;
             }).ConfigureAwait(false);
+            if (direction > 0) this.AdmitDeadlineCheck(current);
         }
 
         await Task.CompletedTask;
@@ -909,7 +988,13 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             state);
         envelope.Validate();
         await this.stateStore.SaveAsync(envelope, owner.Cancellation.Token).ConfigureAwait(false);
+        var phaseChanged = owner.DurableState?.Phase != state.Phase;
         owner.DurableState = state;
+        if (phaseChanged)
+        {
+            if (state.Phase == EscalationPhase.Pending) this.ArmDeadline(owner, state);
+            else lock (this.lockObject) this.CancelDeadlineLocked(owner);
+        }
     }
 
     private async Task ProcessVerdictReactionAsync(
@@ -1090,7 +1175,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             else
             {
                 current.AdmissionOpen = false;
-                current.Cancellation.Cancel();
+                current.Cancellation.Cancel(); this.CancelDeadlineLocked(current);
                 current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
                 drain = this.BeginDrainLocked(current, out startDrain);
             }
