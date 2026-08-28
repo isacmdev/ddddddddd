@@ -1,0 +1,1 @@
+{"contract":"control-parental.windows","version":1,"message_type":"wns.hint","correlation_id":"00000000-0000-4000-8000-000000000030","payload":{"hint_type":"sync","policy":{"allow":true}}}

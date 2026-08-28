@@ -1,0 +1,1 @@
+{"contract":"control-parental.windows","version":1,"message_type":"set_protected_account.request","correlation_id":"00000000-0000-4000-8000-000000000001","payload":{"operation_id":"00000000-0000-4000-8000-000000000002","username":"child01","sid":"S-1-5-21-111111111-222222222-333333333-1001","requested_at":"2026-08-28T12:00:00Z","extensions":{"x-example":{"display_hint":"safe"}}}}
