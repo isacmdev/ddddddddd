@@ -1136,6 +1136,97 @@ public class AntiTamperMonitorTests : IDisposable
     }
 
     [Fact]
+    public async Task DurableOwner_RestartWithInvalidPendingSeverity_FailsBeforeAnyEffect()
+    {
+        var due = DateTimeOffset.UtcNow.AddMinutes(5);
+        var pending = PendingState(due) with
+        {
+            CompletedReactionId = null,
+            PendingNotificationId = "notification-invalid-severity",
+            PendingEffectDescriptor = PendingState(due).PendingEffectDescriptor! with
+            {
+                Severity = (EnforcementIssueSeverity)999,
+                NotificationType = "integrity_degrade_pending",
+                NotificationTitle = "title",
+                NotificationBody = "body",
+                NotificationTimestamp = DateTimeOffset.UnixEpoch,
+            },
+        };
+        var store = new RecordingEscalationStore(pending);
+        this.ConfigureHealthyBackend();
+        var monitor = this.CreatePureMonitor(store: store);
+
+        var error = await Assert.ThrowsAsync<IntegrityEscalationStateException>(() => monitor.StartAsync());
+
+        error.Error.Should().Be(IntegrityEscalationStateError.InvalidEffectDescriptor);
+        this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(
+            It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(),
+            It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        this.mockEnforcementLevelMonitor.Verify(m => m.ResolveIssueAsync(
+            It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        this.mockOutboxManager.Invocations.Should().BeEmpty();
+
+        await Assert.ThrowsAsync<IntegrityEscalationStateException>(() => monitor.StopAsync());
+        monitor.Dispose();
+    }
+
+    [Fact]
+    public async Task DurableReplay_ThirdRevoked_ReusesExactReactionAndNotificationSemantics()
+    {
+        var observedAt = DateTimeOffset.UtcNow;
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(observedAt.AddSeconds(1));
+        this.mockPrivilegeInspector.Setup(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        this.mockIntegrityChecker.Setup(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe"));
+        this.mockBackendClient.Setup(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(false, null));
+        var handler = new IntegrityVerdictHandler(clock: () => observedAt);
+        handler.SetServiceStartTime(observedAt.AddMinutes(-10));
+        var store = new RecordingEscalationStore();
+        var firstAttempt = true;
+        var reactions = new List<(EnforcementIssueSeverity Severity, string Reason)>();
+        var notifications = new List<(string Type, string Title, string Body, DateTimeOffset Timestamp)>();
+
+        this.mockEnforcementLevelMonitor
+            .Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Returns<IssueKey, EnforcementIssueSeverity, string, string?, CancellationToken>((_, severity, reason, _, _) =>
+            {
+                reactions.Add((severity, reason));
+                return firstAttempt
+                    ? Task.FromException(new InvalidOperationException("crash after durable prepare"))
+                    : Task.CompletedTask;
+            });
+        this.mockOutboxManager
+            .Setup(value => value.EnqueueIntegrityNotificationAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns<string, string, string, DateTimeOffset, string, CancellationToken>((type, title, body, timestamp, _, _) =>
+            {
+                notifications.Add((type, title, body, timestamp));
+                return Task.CompletedTask;
+            });
+
+        var monitor = this.CreatePureMonitor(handler: handler, store: store);
+        await monitor.StartAsync();
+        _ = handler.HandleVerdictDecision("revoked", true, observedAt);
+        _ = handler.HandleVerdictDecision("revoked", true, observedAt);
+        var thirdRevoked = handler.HandleVerdictDecision("revoked", true, observedAt);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.ExecuteDecisionAsync(thirdRevoked));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => monitor.StopAsync());
+
+        firstAttempt = false;
+        this.mockEnforcementLevelMonitor.Invocations.Clear();
+        this.mockOutboxManager.Invocations.Clear();
+        using var restarted = this.CreatePureMonitor(store: store);
+        await restarted.StartAsync();
+
+        reactions.Should().HaveCount(2);
+        reactions[1].Should().Be((thirdRevoked.Reaction.Severity!.Value, thirdRevoked.Reaction.Reason!));
+        notifications.Should().ContainSingle().Which.Should().Be((
+            thirdRevoked.Notification!.Type,
+            thirdRevoked.Notification.Title,
+            thirdRevoked.Notification.Body,
+            thirdRevoked.Notification.Timestamp));
+        await restarted.StopAsync();
+    }
+
+    [Fact]
     public async Task DurableOwner_CompletedReplayIsNoOp_ButDistinctLaterDecisionExecutes()
     {
         var store = new RecordingEscalationStore(ValidState("completed-old", "completed-old") with { CompletedReactionId = "completed-old" });
@@ -1162,7 +1253,7 @@ public class AntiTamperMonitorTests : IDisposable
         using var monitor = this.CreatePureMonitor(store: store);
         await monitor.StartAsync();
         await monitor.TriggerIntegrityCheckAsync();
-        this.mockEnforcementLevelMonitor.Verify(m => m.ResolveIssueAsync(It.IsAny<IssueKey>(), "authoritative backend trust verdict", It.IsAny<CancellationToken>()), Times.Once);
+        this.mockEnforcementLevelMonitor.Verify(m => m.ResolveIssueAsync(It.IsAny<IssueKey>(), "Authoritative trust recovery", It.IsAny<CancellationToken>()), Times.Once);
         this.mockEnforcementLevelMonitor.Verify(m => m.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
         store.Last!.Validate();
         await monitor.StopAsync();
@@ -1236,7 +1327,7 @@ public class AntiTamperMonitorTests : IDisposable
             boundaries[3].Key.Should().NotBeNullOrWhiteSpace();
             await monitor.StopAsync();
         }
-        store.State = store.State! with { Phase = EscalationPhase.Degraded, FiredLatch = true, RecoveryLatch = false, RevokedStreak = 0, TrustStreak = 0, DeadlineOriginUtc = null, DeadlineDueUtc = null, PendingReactionId = null, CompletedReactionId = null, PendingNotificationId = null, CompletedNotificationId = null };
+        store.State = store.State! with { Phase = EscalationPhase.Degraded, FiredLatch = true, RecoveryLatch = false, RevokedStreak = 0, TrustStreak = 0, DeadlineOriginUtc = null, DeadlineDueUtc = null, PendingReactionId = null, CompletedReactionId = null, PendingNotificationId = null, CompletedNotificationId = null, PendingEffectDescriptor = null };
         verdict = "unknown";
         this.mockEnforcementLevelMonitor.Setup(m => m.ResolveIssueAsync(It.IsAny<IssueKey>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         using var recovery = this.CreatePureMonitor(store: store);
@@ -1424,13 +1515,64 @@ public class AntiTamperMonitorTests : IDisposable
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task DeadlineOwner_TimingDefectsNormalizeOnlyPendingState(bool rollback)
+    public async Task DeadlineOwner_TimingDefectsReplayOldEffectsBeforeNewFailClosedDeadline(bool rollback)
     {
-        var now = DateTimeOffset.UtcNow.AddMinutes(-1); var pending = PendingState(now.AddMinutes(5)) with { PendingReactionId = null, CompletedReactionId = null, MaxWallClockSeenUtc = rollback ? now.AddMinutes(1) : now, TimingValid = rollback };
-        var store = new RecordingEscalationStore(pending); var degraded = NewSignal(); this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now); this.ConfigurePureBackend("trust");
-        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>())).Returns(() => { degraded.TrySetResult(); return Task.CompletedTask; });
-        using var monitor = this.CreatePureMonitor(store: store); await monitor.StartAsync(); await degraded.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        store.State!.Phase.Should().Be(EscalationPhase.Degraded); store.State.Validate(); this.mockEnforcementLevelMonitor.Invocations.Count(value => value.Method.Name == nameof(IEnforcementLevelMonitor.AddIssueAsync)).Should().Be(1); await monitor.StopAsync();
+        var now = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var oldNotificationTimestamp = now.AddSeconds(-30);
+        var oldReactionKey = "integrity/local/integrity-binary/4/4/limit";
+        var oldNotificationKey = "integrity/local/integrity-binary/4/4/notification";
+        var pending = PendingState(now.AddMinutes(5)) with
+        {
+            PendingReactionId = oldReactionKey,
+            CompletedReactionId = null,
+            PendingNotificationId = oldNotificationKey,
+            CompletedNotificationId = null,
+            MaxWallClockSeenUtc = rollback ? now.AddMinutes(1) : now,
+            TimingValid = rollback,
+            PendingEffectDescriptor = new(
+                IntegrityEscalationEffectDescriptor.CurrentVersion,
+                IntegrityEscalationReactionKind.AddIssue,
+                EnforcementIssueSeverity.Warning,
+                "old warning reason",
+                "old_notification_type",
+                "Old warning",
+                "Old warning body",
+                oldNotificationTimestamp),
+        };
+        var store = new RecordingEscalationStore(pending);
+        var calls = new List<string>();
+        this.mockTimeProvider.SetupGet(value => value.WallClockNow).Returns(() => now);
+        this.ConfigurePureBackend("trust");
+        this.mockEnforcementLevelMonitor.Setup(value => value.AddIssueAsync(
+                It.IsAny<IssueKey>(), It.IsAny<EnforcementIssueSeverity>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback<IssueKey, EnforcementIssueSeverity, string, string?, CancellationToken>((_, severity, reason, key, _) => calls.Add($"reaction:{key}:{severity}:{reason}"))
+            .Returns(Task.CompletedTask);
+        this.mockOutboxManager.Setup(value => value.EnqueueIntegrityNotificationAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Callback<string, string, string, DateTimeOffset, string, CancellationToken>((type, title, body, timestamp, key, _) =>
+            {
+                calls.Add($"notification:{key}");
+                (type, title, body, timestamp).Should().Be(("old_notification_type", "Old warning", "Old warning body", oldNotificationTimestamp));
+            })
+            .Returns(Task.CompletedTask);
+
+        using var monitor = this.CreatePureMonitor(store: store);
+        await monitor.StartAsync();
+
+        calls.Should().HaveCount(3);
+        calls[0].Should().Be($"reaction:{oldReactionKey}:Warning:old warning reason");
+        calls[1].Should().Be($"notification:{oldNotificationKey}");
+        calls[2].Should().Match("reaction:*:Severe:Integrity deadline reached");
+        var newReactionKey = store.State!.PendingReactionId;
+        newReactionKey.Should().NotBe(oldReactionKey);
+        store.State.CompletedReactionId.Should().Be(newReactionKey);
+        store.State.PendingNotificationId.Should().BeNull();
+        store.State.CompletedNotificationId.Should().BeNull();
+        store.State.Phase.Should().Be(EscalationPhase.Degraded);
+        store.State.PendingEffectDescriptor!.Severity.Should().Be(EnforcementIssueSeverity.Severe);
+        store.State.PendingEffectDescriptor.Reason.Should().Be("Integrity deadline reached");
+        store.State.Validate();
+        await monitor.StopAsync();
     }
 
     [Fact]
@@ -1678,10 +1820,35 @@ public class AntiTamperMonitorTests : IDisposable
     }
 
     private static IntegrityEscalationState ValidState(string reaction, string? notification, EscalationPhase phase = EscalationPhase.Normal, bool recoveryLatch = false, int trustStreak = 0)
-        => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 1, 0, trustStreak, phase, null, null, DateTimeOffset.UtcNow, true, phase == EscalationPhase.Degraded, recoveryLatch, reaction, notification is null ? null : reaction, notification, notification);
+    {
+        var descriptor = new IntegrityEscalationEffectDescriptor(
+            IntegrityEscalationEffectDescriptor.CurrentVersion,
+            IntegrityEscalationReactionKind.AddIssue,
+            EnforcementIssueSeverity.Severe,
+            "Integrity reaction",
+            notification is null ? null : "integrity_degrade_pending",
+            notification is null ? null : "title",
+            notification is null ? null : "body",
+            notification is null ? null : DateTimeOffset.UnixEpoch);
+        return new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 1, 0, trustStreak, phase, null, null, DateTimeOffset.UtcNow, true, phase == EscalationPhase.Degraded, recoveryLatch, reaction, notification is null ? null : reaction, notification, notification)
+        {
+            PendingEffectDescriptor = descriptor,
+        };
+    }
 
     private static IntegrityEscalationState PendingState(DateTimeOffset due)
-        => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 4, 3, 0, EscalationPhase.Pending, due.AddMinutes(-5), due, due.AddMinutes(-5), true, false, false, "deadline-reaction", "deadline-reaction", null, null);
+        => new("local", 1, IntegrityEscalationState.CurrentSchemaVersion, 1, 4, 3, 0, EscalationPhase.Pending, due.AddMinutes(-5), due, due.AddMinutes(-5), true, false, false, "deadline-reaction", "deadline-reaction", null, null)
+        {
+            PendingEffectDescriptor = new(
+                IntegrityEscalationEffectDescriptor.CurrentVersion,
+                IntegrityEscalationReactionKind.AddIssue,
+                EnforcementIssueSeverity.Severe,
+                "Integrity deadline reached",
+                null,
+                null,
+                null,
+                null),
+        };
 
     private sealed class RecordingEscalationStore : IIntegrityEscalationStateStore
     {
@@ -1712,9 +1879,10 @@ public class AntiTamperMonitorTests : IDisposable
 
     private void ConfigurePureBackendAfterStartup(string verdict) { this.ConfigurePureBackend(verdict); var calls = 0; this.mockBackendClient.Setup(c => c.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(() => Interlocked.Increment(ref calls) == 1 ? new IntegrityReportResult(true, "trust") : new IntegrityReportResult(true, verdict)); }
 
-    private AntiTamperMonitor CreatePureMonitor(IBackendIdentityCoordinator? identity = null, IOutboxManager? outbox = null, IIntegrityEscalationStateStore? store = null)
+    private AntiTamperMonitor CreatePureMonitor(IBackendIdentityCoordinator? identity = null, IOutboxManager? outbox = null, IIntegrityEscalationStateStore? store = null, IntegrityVerdictHandler? handler = null)
     {
-        var handler = new IntegrityVerdictHandler(clock: () => DateTimeOffset.UtcNow); handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
+        handler ??= new IntegrityVerdictHandler(clock: () => DateTimeOffset.UtcNow);
+        handler.SetServiceStartTime(DateTimeOffset.UtcNow.AddMinutes(-10));
         return new(this.mockTimeProvider.Object, outbox ?? this.mockOutboxManager.Object, this.mockPrivilegeInspector.Object, this.mockEnforcementLevelMonitor.Object, this.mockIntegrityChecker.Object, this.mockBackendClient.Object, handler, identityCoordinator: identity, tickSource: _ => new ValueTask<bool>(false), stateStore: store);
     }
 

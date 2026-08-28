@@ -49,8 +49,7 @@ public class ControlParentalServiceReenforcementTests : IDisposable
             policyRepository: new Mock<IPolicyRepository>().Object,
             processTerminator: new Mock<IProcessTerminator>().Object,
             protectedProcessReporter: this.mockProtectedProcessReporter.Object,
-            enforcementLevelMonitor: new Mock<IEnforcementLevelMonitor>().Object,
-            antiTamperMonitor: new Mock<IAntiTamperMonitor>().Object);
+            enforcementLevelMonitor: new Mock<IEnforcementLevelMonitor>().Object);
 
         this.SetEnforcementEngine(this.mockEnforcementEngine.Object);
     }

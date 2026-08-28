@@ -8,6 +8,8 @@ public enum EscalationPhase
 public enum IntegrityEscalationStateError
 {
     InvalidState,
+    MissingEffectDescriptor,
+    InvalidEffectDescriptor,
     UnsupportedDocumentVersion,
     UnsupportedSchemaVersion,
     WrongIdentity,
@@ -22,6 +24,54 @@ public sealed class IntegrityEscalationStateException : Exception
 
     public IntegrityEscalationStateError Error { get; }
 }
+
+public enum IntegrityEscalationReactionKind
+{
+    AddIssue,
+    ResolveIssue,
+}
+
+public sealed record IntegrityEscalationEffectDescriptor(
+    int Version,
+    IntegrityEscalationReactionKind ReactionKind,
+    EnforcementIssueSeverity? Severity,
+    string Reason,
+    string? NotificationType,
+    string? NotificationTitle,
+    string? NotificationBody,
+    DateTimeOffset? NotificationTimestamp)
+{
+    public const int CurrentVersion = 1;
+    public const int MaximumReasonLength = 1024;
+    public const int MaximumNotificationFieldLength = 4096;
+
+    public void Validate()
+    {
+        if (this.Version != CurrentVersion || !Enum.IsDefined(this.ReactionKind) ||
+            string.IsNullOrWhiteSpace(this.Reason) || this.Reason.Length > MaximumReasonLength ||
+            this.ReactionKind == IntegrityEscalationReactionKind.AddIssue &&
+            (this.Severity is null || !Enum.IsDefined(this.Severity.Value) || this.Severity.Value < EnforcementIssueSeverity.Warning) ||
+            this.ReactionKind == IntegrityEscalationReactionKind.ResolveIssue && this.Severity is not null)
+        {
+            throw InvalidDescriptor();
+        }
+
+        var notificationFields = new[] { this.NotificationType, this.NotificationTitle, this.NotificationBody };
+        var hasNotification = notificationFields.Any(value => value is not null) || this.NotificationTimestamp is not null;
+        if (hasNotification &&
+            (notificationFields.Any(string.IsNullOrWhiteSpace) ||
+             notificationFields.Any(value => value!.Length > MaximumNotificationFieldLength) ||
+             this.NotificationTimestamp is null || !IsUtc(this.NotificationTimestamp.Value)))
+        {
+            throw InvalidDescriptor();
+        }
+    }
+
+    private static bool IsUtc(DateTimeOffset value) => value.Offset == TimeSpan.Zero && value != default;
+    private static IntegrityEscalationStateException InvalidDescriptor() =>
+        new(IntegrityEscalationStateError.InvalidEffectDescriptor, "The durable escalation effect descriptor is invalid.");
+}
+
 public sealed record IntegrityEscalationState(
     string IdentityScope,
     int PolicyVersion,
@@ -49,6 +99,8 @@ public sealed record IntegrityEscalationState(
     public const int DefinitiveRevokedThreshold = 3;
     public const int DefinitiveTrustRecoveryThreshold = 3;
     public static readonly TimeSpan EscalationDeadlineDelay = TimeSpan.FromMinutes(5);
+    public IntegrityEscalationEffectDescriptor? PendingEffectDescriptor { get; init; }
+
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(this.IdentityScope) || this.IdentityScope.Length > MaximumIdentityLength ||
@@ -86,6 +138,25 @@ public sealed record IntegrityEscalationState(
            )
         {
             throw InvalidState();
+        }
+
+        var reactionPending = this.PendingReactionId is not null && this.PendingReactionId != this.CompletedReactionId;
+        var notificationPending = this.PendingNotificationId is not null && this.PendingNotificationId != this.CompletedNotificationId;
+        if ((reactionPending || notificationPending) && this.PendingEffectDescriptor is null)
+        {
+            throw new IntegrityEscalationStateException(
+                IntegrityEscalationStateError.MissingEffectDescriptor,
+                "A pending escalation effect is missing its durable descriptor.");
+        }
+        if (this.PendingEffectDescriptor is not null)
+        {
+            this.PendingEffectDescriptor.Validate();
+            if (this.PendingReactionId is null ||
+                notificationPending && this.PendingEffectDescriptor.NotificationType is null ||
+                !notificationPending && this.PendingEffectDescriptor.NotificationType is not null && this.PendingNotificationId is null)
+            {
+                throw InvalidState();
+            }
         }
     }
 

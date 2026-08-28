@@ -415,6 +415,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             }
 
             owner.DurableState = state;
+            await this.ReconcileDurableEffectsAsync(owner, state).ConfigureAwait(false);
+            state = owner.DurableState ?? state;
+            if (!this.IsGenerationActive(owner)) return;
             if (state.Phase == EscalationPhase.Pending)
             {
                 if (timingDefect || this.timeProvider.WallClockNow < state.MaxWallClockSeenUtc)
@@ -428,7 +431,6 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                     this.ArmDeadline(owner, state);
                 }
             }
-            await this.ReconcileDurableEffectsAsync(owner, state).ConfigureAwait(false);
             if (!this.IsGenerationActive(owner)) return;
         }
 
@@ -437,16 +439,28 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
     private async Task ReconcileDurableEffectsAsync(Generation owner, IntegrityEscalationState state)
     {
+        var descriptor = state.PendingEffectDescriptor;
         if (state.PendingReactionId is not null && state.PendingReactionId != state.CompletedReactionId)
         {
-            var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", this.identityCoordinator?.CurrentState.DeviceId);
-            if (state.Phase == EscalationPhase.Degraded && state.RecoveryLatch)
+            if (descriptor is null)
             {
-                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
+                throw new IntegrityEscalationStateException(
+                    IntegrityEscalationStateError.MissingEffectDescriptor,
+                    "A pending escalation reaction is missing its durable descriptor.");
+            }
+            var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", state.IdentityScope);
+            if (descriptor.ReactionKind == IntegrityEscalationReactionKind.ResolveIssue)
+            {
+                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, descriptor.Reason, CancellationToken.None).ConfigureAwait(false);
             }
             else
             {
-                await this.enforcementLevelMonitor.AddIssueAsync(issue, EnforcementIssueSeverity.Severe, "Integrity reaction", state.PendingReactionId, CancellationToken.None).ConfigureAwait(false);
+                await this.enforcementLevelMonitor.AddIssueAsync(
+                    issue,
+                    descriptor.Severity!.Value,
+                    descriptor.Reason,
+                    state.PendingReactionId,
+                    CancellationToken.None).ConfigureAwait(false);
             }
 
             if (!this.IsGenerationActive(owner)) return;
@@ -457,9 +471,19 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
         if (state.PendingNotificationId is not null && state.PendingNotificationId != state.CompletedNotificationId)
         {
+            if (descriptor?.NotificationType is null || descriptor.NotificationTitle is null || descriptor.NotificationBody is null || descriptor.NotificationTimestamp is null)
+            {
+                throw new IntegrityEscalationStateException(
+                    IntegrityEscalationStateError.InvalidEffectDescriptor,
+                    "A pending escalation notification is missing its durable payload.");
+            }
             await this.outboxManager.EnqueueIntegrityNotificationAsync(
-                "integrity_degrade_pending", "Integrity degradation pending", "Integrity escalation requires attention",
-                this.timeProvider.WallClockNow, state.PendingNotificationId, CancellationToken.None).ConfigureAwait(false);
+                descriptor.NotificationType,
+                descriptor.NotificationTitle,
+                descriptor.NotificationBody,
+                descriptor.NotificationTimestamp.Value,
+                state.PendingNotificationId,
+                CancellationToken.None).ConfigureAwait(false);
             if (!this.IsGenerationActive(owner)) return;
             state = state with { CompletedNotificationId = state.PendingNotificationId };
             await this.SaveStateAsync(owner, state).ConfigureAwait(false);
@@ -813,16 +837,18 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
     private async Task ExecuteDecisionChainAsync(Generation owner, VerdictDecision decision, BackendIdentityState? identity)
     {
-        var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", identity?.DeviceId);
+        var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", decision.IdentityScope);
         var reaction = decision.Reaction;
         var shape = this.GetDecisionShape(decision);
+        var decisionDescriptor = CreateEffectDescriptor(decision);
         this.ValidateAdmission(owner, shape);
-        await this.PrepareDurableStateAsync(owner, decision).ConfigureAwait(false);
+        await this.PrepareDurableStateAsync(owner, decision, decisionDescriptor).ConfigureAwait(false);
+        var effectDescriptor = owner.DurableState?.PendingEffectDescriptor ?? decisionDescriptor;
         if (reaction.IsAuthoritativeRecovery && this.ShouldExecute(owner, shape, decision.ReactionIdempotencyKey, true))
         {
             try
             {
-                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, "authoritative backend trust verdict", CancellationToken.None).ConfigureAwait(false);
+                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, effectDescriptor!.Reason, CancellationToken.None).ConfigureAwait(false);
                 await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
             }
             catch
@@ -838,11 +864,20 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             {
                 if (this.stateStore is null)
                 {
-                    await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", CancellationToken.None).ConfigureAwait(false);
+                    await this.enforcementLevelMonitor.AddIssueAsync(
+                        issue,
+                        effectDescriptor!.Severity!.Value,
+                        effectDescriptor.Reason,
+                        CancellationToken.None).ConfigureAwait(false);
                 }
                 else
                 {
-                    await this.enforcementLevelMonitor.AddIssueAsync(issue, reaction.Severity ?? EnforcementIssueSeverity.Warning, reaction.Reason ?? "Integrity reaction", decision.ReactionIdempotencyKey, CancellationToken.None).ConfigureAwait(false);
+                    await this.enforcementLevelMonitor.AddIssueAsync(
+                        issue,
+                        effectDescriptor!.Severity!.Value,
+                        effectDescriptor.Reason,
+                        decision.ReactionIdempotencyKey,
+                        CancellationToken.None).ConfigureAwait(false);
                 }
                 await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
             }
@@ -859,10 +894,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             try
             {
                 await this.outboxManager.EnqueueIntegrityNotificationAsync(
-                    decision.Notification.Type,
-                    decision.Notification.Title,
-                    decision.Notification.Body,
-                    decision.Notification.Timestamp,
+                    effectDescriptor!.NotificationType!,
+                    effectDescriptor.NotificationTitle!,
+                    effectDescriptor.NotificationBody!,
+                    effectDescriptor.NotificationTimestamp!.Value,
                     decision.NotificationIdempotencyKey,
                     CancellationToken.None).ConfigureAwait(false);
                 await this.SaveEffectProgressAsync(owner, shape, reactionDomain: false).ConfigureAwait(false);
@@ -942,21 +977,43 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         throw new InvalidOperationException("Conflicting effect identity at the same decision position.");
     }
 
-    private async Task PrepareDurableStateAsync(Generation owner, VerdictDecision decision)
+    private static IntegrityEscalationEffectDescriptor? CreateEffectDescriptor(VerdictDecision decision)
+    {
+        var reaction = decision.Reaction;
+        var recovery = reaction.IsAuthoritativeRecovery;
+        if (!recovery && reaction.Action is not (VerdictAction.Limit or VerdictAction.Degrade)) return null;
+
+        return new IntegrityEscalationEffectDescriptor(
+            IntegrityEscalationEffectDescriptor.CurrentVersion,
+            recovery ? IntegrityEscalationReactionKind.ResolveIssue : IntegrityEscalationReactionKind.AddIssue,
+            recovery ? null : reaction.Severity ?? (reaction.Action == VerdictAction.Degrade ? EnforcementIssueSeverity.Severe : EnforcementIssueSeverity.Warning),
+            reaction.Reason ?? (recovery ? "authoritative backend trust verdict" : "Integrity reaction"),
+            decision.Notification?.Type,
+            decision.Notification?.Title,
+            decision.Notification?.Body,
+            decision.Notification?.Timestamp);
+    }
+
+    private async Task PrepareDurableStateAsync(
+        Generation owner,
+        VerdictDecision decision,
+        IntegrityEscalationEffectDescriptor? decisionDescriptor)
     {
         if (this.stateStore is null || this.verdictHandler is not IntegrityVerdictHandler pureHandler) return;
         var prior = owner.DurableState;
         var snapshot = pureHandler.Snapshot() ?? throw new InvalidOperationException("Handler snapshot was null.");
-        var pendingReaction = decision.Reaction.Action is VerdictAction.Limit or VerdictAction.Degrade || decision.Reaction.IsAuthoritativeRecovery
-            ? decision.ReactionIdempotencyKey : prior?.PendingReactionId;
+        var pendingReaction = decisionDescriptor is not null ? decision.ReactionIdempotencyKey : prior?.PendingReactionId;
+        var samePendingKey = prior?.PendingReactionId is not null && prior.PendingReactionId == pendingReaction;
         var pendingNotification = decision.NotificationIdempotencyKey ??
-            (prior is not null && prior.PendingReactionId == pendingReaction ? prior.PendingNotificationId : null);
+            (samePendingKey ? prior!.PendingNotificationId : null);
+        var durableDescriptor = samePendingKey ? prior!.PendingEffectDescriptor : decisionDescriptor;
         var state = snapshot with
         {
             PendingReactionId = pendingReaction,
-            CompletedReactionId = prior is not null && prior.PendingReactionId == pendingReaction ? prior.CompletedReactionId : null,
+            CompletedReactionId = samePendingKey ? prior!.CompletedReactionId : null,
             PendingNotificationId = pendingNotification,
-            CompletedNotificationId = prior is not null && prior.PendingNotificationId == pendingNotification ? prior.CompletedNotificationId : null,
+            CompletedNotificationId = samePendingKey && prior!.PendingNotificationId == pendingNotification ? prior.CompletedNotificationId : null,
+            PendingEffectDescriptor = durableDescriptor,
         };
         await this.SaveStateAsync(owner, state).ConfigureAwait(false);
     }
@@ -1013,7 +1070,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         {
             if (!this.IsGenerationActive(current)) return;
             await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.ResolveIssueAsync(
-                integrityIssueKey, "authoritative backend trust verdict", cancellationToken)).ConfigureAwait(false);
+                integrityIssueKey, reaction.Reason ?? "authoritative backend trust verdict", cancellationToken)).ConfigureAwait(false);
             return;
         }
 

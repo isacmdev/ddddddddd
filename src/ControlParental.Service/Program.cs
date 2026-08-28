@@ -131,7 +131,8 @@ public static class Program
         IServiceCollection services,
         SupabaseConfig supabaseConfig,
         TlsPinningConfig tlsPinningConfig,
-        Func<HttpClient>? httpClientFactory = null)
+        Func<HttpClient>? httpClientFactory = null,
+        bool registerHostedServices = true)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(supabaseConfig);
@@ -145,16 +146,45 @@ public static class Program
             new BackendIdentityLifecycleClient(httpClientFactory(), supabaseConfig.Url, supabaseConfig.AnonKey));
         services.AddSingleton<BackendIdentityCoordinator>();
         services.AddSingleton<IBackendIdentityCoordinator>(sp => sp.GetRequiredService<BackendIdentityCoordinator>());
-        services.AddHostedService<BackendIdentityStartupService>();
         services.AddSingleton<IBackendClient>(sp =>
             new BackendClient(httpClientFactory(), supabaseConfig.Url, sp.GetRequiredService<IBackendIdentityCoordinator>()));
         services.AddSingleton<IWnsRegistrationIntentStore>(sp =>
             new SecretStoreWnsRegistrationIntentStore(sp.GetRequiredService<ISecretStore>()));
         services.AddSingleton<WnsRegistrationCoordinator>();
         services.AddSingleton<IWnsRegistrationCoordinator>(sp => sp.GetRequiredService<WnsRegistrationCoordinator>());
-        services.AddHostedService<WnsRegistrationReconciliationService>();
+        if (registerHostedServices)
+        {
+            services.AddHostedService<BackendIdentityStartupService>();
+            ConfigureWnsRegistrationHostedService(services);
+        }
         services.AddScoped<IPairingService, PairingService>();
     }
+
+    internal static void ConfigureIntegrityRuntimeHostedServices(IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddHostedService<BackendIdentityStartupService>();
+        services.AddHostedService<ControlParentalService>();
+        ConfigureWnsRegistrationHostedService(services);
+    }
+
+    internal static void ConfigureProductionHostedServices(
+        IServiceCollection services,
+        SupabaseConfig supabaseConfig,
+        TlsPinningConfig tlsPinningConfig,
+        Func<HttpClient>? httpClientFactory = null)
+    {
+        ConfigureBackendIdentityServices(
+            services,
+            supabaseConfig,
+            tlsPinningConfig,
+            httpClientFactory,
+            registerHostedServices: false);
+        ConfigureIntegrityRuntimeHostedServices(services);
+    }
+
+    private static void ConfigureWnsRegistrationHostedService(IServiceCollection services)
+        => services.AddHostedService<WnsRegistrationReconciliationService>();
 
     internal static void ConfigureBackupAdmission(IServiceCollection services)
     {
@@ -394,41 +424,14 @@ public static class Program
         // T03: Register OutboxManager
         builder.Services.AddSingleton<IOutboxManager, OutboxManager>();
 
-        // T23: Register IntegrityChecker for binary integrity verification
+        // T23: Register the durable integrity runtime without constructing it
+        // before backend identity startup has restored the definitive device.
         builder.Services.AddSingleton<IWinTrustVerifier, WinTrustVerifier>();
-        builder.Services.AddScoped<IIntegrityChecker>(sp =>
+        builder.Services.AddSingleton<IIntegrityChecker>(sp =>
             new IntegrityChecker(sp.GetRequiredService<IWinTrustVerifier>()));
-
-        // T23: Register IntegrityVerdictHandler (singleton — maintains state across service lifetime)
-        builder.Services.AddSingleton<IIntegrityVerdictHandler>(sp =>
-            new IntegrityVerdictHandler(sp.GetRequiredService<IOutboxManager>()));
-
-        // T13: Register AntiTamperMonitor
-        builder.Services.AddSingleton<IAntiTamperMonitor>((sp) =>
-        {
-            var timeProvider = sp.GetRequiredService<ITimeProvider>();
-            var outboxManager = sp.GetRequiredService<IOutboxManager>();
-            var privilegeInspector = sp.GetRequiredService<IPrivilegeInspector>();
-            var enforcementLevelMonitor = sp.GetRequiredService<IEnforcementLevelMonitor>();
-            var integrityChecker = sp.GetRequiredService<IIntegrityChecker>();
-            var backendClient = sp.GetRequiredService<IBackendClient>();
-            var verdictHandler = sp.GetRequiredService<IIntegrityVerdictHandler>();
-
-            return new AntiTamperMonitor(
-                timeProvider: timeProvider,
-                outboxManager: outboxManager,
-                privilegeInspector: privilegeInspector,
-                enforcementLevelMonitor: enforcementLevelMonitor,
-                integrityChecker: integrityChecker,
-                backendClient: backendClient,
-                 verdictHandler: verdictHandler,
-                 identityCoordinator: sp.GetRequiredService<IBackendIdentityCoordinator>(),
-                 onTamperDetected: tamperEvent =>
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[AntiTamperMonitor] Tamper event: {tamperEvent.Type} - {tamperEvent.Description}");
-                });
-        });
+        builder.Services.AddSingleton<IIntegrityEscalationStateStore>(_ =>
+            new FileIntegrityEscalationStateStore(Path.Combine(DataFolderPath, "integrity-escalation")));
+        builder.Services.AddSingleton<IntegrityRuntimeFactory>();
 
         // T16: Register SecretStore (infrastructure for T17/T18)
         // Uses DPAPI for secure storage in ProgramData
@@ -442,7 +445,10 @@ public static class Program
         });
 
         // SDD5 Unit 6: one production identity authority owns pairing and backend authorization.
-        ConfigureBackendIdentityServices(builder.Services, supabaseConfig, tlsPinningConfig);
+        ConfigureProductionHostedServices(
+            builder.Services,
+            supabaseConfig,
+            tlsPinningConfig);
 
         // T25: Register ConsentService for data collection consent
         builder.Services.AddScoped<IConsentService, ConsentService>();
@@ -506,7 +512,6 @@ public static class Program
 
         // T10: Service persistence
         builder.Services.AddWindowsService();
-        builder.Services.AddHostedService<ControlParentalService>();
 
         var host = builder.Build();
 
@@ -1163,6 +1168,62 @@ public sealed class SessionManager : IDisposable
     }
 }
 
+file sealed class RuntimeScopedIntegrityStateStore(
+    IIntegrityEscalationStateStore inner,
+    string identity) : IIntegrityEscalationStateStore
+{
+    public Task<IntegrityEscalationState?> LoadAsync(string _, CancellationToken cancellationToken = default)
+        => inner.LoadAsync(identity, cancellationToken);
+
+    public Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default)
+    {
+        if (!string.Equals(value.State.IdentityScope, identity, StringComparison.Ordinal))
+        {
+            throw new IntegrityEscalationStateException(IntegrityEscalationStateError.WrongIdentity, "The runtime escalation state identity does not match the captured identity.");
+        }
+
+        return inner.SaveAsync(value, cancellationToken);
+    }
+}
+
+/// <summary>Creates the integrity runtime after definitive identity startup.</summary>
+public sealed class IntegrityRuntimeFactory(
+    ITimeProvider timeProvider,
+    IOutboxManager outboxManager,
+    IPrivilegeInspector privilegeInspector,
+    IEnforcementLevelMonitor enforcementLevelMonitor,
+    IIntegrityChecker integrityChecker,
+    IBackendClient backendClient,
+    IBackendIdentityCoordinator identityCoordinator,
+    IIntegrityEscalationStateStore stateStore)
+{
+    internal IAntiTamperMonitor? CreatedMonitor { get; private set; }
+
+    internal IAntiTamperMonitor? Create()
+    {
+        var identityScope = identityCoordinator.CurrentState.DeviceId;
+        if (string.IsNullOrWhiteSpace(identityScope))
+        {
+            return null;
+        }
+
+        var handler = new IntegrityVerdictHandler(
+            outboxManager,
+            identityScope: identityScope);
+        this.CreatedMonitor = new AntiTamperMonitor(
+            timeProvider,
+            outboxManager,
+            privilegeInspector,
+            enforcementLevelMonitor,
+            integrityChecker,
+            backendClient,
+            handler,
+            identityCoordinator: identityCoordinator,
+            stateStore: new RuntimeScopedIntegrityStateStore(stateStore, identityScope));
+        return this.CreatedMonitor;
+    }
+}
+
 /// <summary>
 /// Main hosted service for ControlParental.
 /// </summary>
@@ -1182,7 +1243,8 @@ public sealed class ControlParentalService : BackgroundService
     private readonly IProcessTerminator processTerminator;
     private readonly IProtectedProcessReporter? protectedProcessReporter;
     private readonly IEnforcementLevelMonitor? enforcementLevelMonitor;
-    private readonly IAntiTamperMonitor? antiTamperMonitor;
+    private IAntiTamperMonitor? antiTamperMonitor;
+    private readonly IntegrityRuntimeFactory? integrityRuntimeFactory;
     private SessionManager? sessionManager;
     private IIpcChannel? boundAgentChannel;
     private IEnforcementEngine? enforcementEngine;
@@ -1191,6 +1253,12 @@ public sealed class ControlParentalService : BackgroundService
     private Task recoveryTask = Task.CompletedTask;
     private Task timeChangeTask = Task.CompletedTask;
     private readonly SemaphoreSlim bindingGate = new(1, 1);
+    private readonly TaskCompletionSource startupCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object lifecycleLock = new();
+    private Task? stopTask;
+    private bool ownsAntiTamperMonitor;
+    private bool bindingAdmissionClosed;
+    private bool disposed;
     private long agentGeneration;
     private bool childIsAdmin;
     private TimeChangeReason? pendingTimeChange;
@@ -1210,7 +1278,7 @@ public sealed class ControlParentalService : BackgroundService
         IProcessTerminator processTerminator,
         IProtectedProcessReporter? protectedProcessReporter = null,
         IEnforcementLevelMonitor? enforcementLevelMonitor = null,
-        IAntiTamperMonitor? antiTamperMonitor = null)
+        IntegrityRuntimeFactory? integrityRuntimeFactory = null)
     {
         this.scmController = scmController;
         this.privilegeInspector = privilegeInspector;
@@ -1226,31 +1294,50 @@ public sealed class ControlParentalService : BackgroundService
         this.processTerminator = processTerminator;
         this.protectedProcessReporter = protectedProcessReporter;
         this.enforcementLevelMonitor = enforcementLevelMonitor;
-        this.antiTamperMonitor = antiTamperMonitor;
+        this.integrityRuntimeFactory = integrityRuntimeFactory;
+    }
+
+    public override async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await base.StartAsync(cancellationToken).ConfigureAwait(false);
+        await this.startupCompletion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         this.timeProvider.TimeChanged += this.OnTimeChanged;
 
-        // T10: Start health monitoring
-        await this.healthMonitor.StartAsync(stoppingToken);
-        System.Diagnostics.Debug.WriteLine("[ControlParentalService] Health monitor started.");
-
-        await this.ReportProtectedProcessStatusAsync(stoppingToken);
-
-        // T12: Start enforcement level monitoring
-        if (this.enforcementLevelMonitor != null)
+        try
         {
-            await this.enforcementLevelMonitor.StartAsync(stoppingToken);
-            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Enforcement level monitor started.");
+            // T10: Start health monitoring
+            await this.healthMonitor.StartAsync(stoppingToken);
+            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Health monitor started.");
+
+            await this.ReportProtectedProcessStatusAsync(stoppingToken);
+
+            // T12: Start enforcement level monitoring, including Unpaired local safety.
+            if (this.enforcementLevelMonitor != null)
+            {
+                await this.enforcementLevelMonitor.StartAsync(stoppingToken);
+                System.Diagnostics.Debug.WriteLine("[ControlParentalService] Enforcement level monitor started.");
+            }
+
+            // T13: Start anti-tamper monitoring. WNS and scheduled work are
+            // registered after this hosted service; the monitor itself gates
+            // its first remote integrity work on rehydration.
+            await this.StartIntegrityRuntimeAsync(stoppingToken);
+            this.startupCompletion.TrySetResult();
         }
-
-        // T13: Start anti-tamper monitoring
-        if (this.antiTamperMonitor != null)
+        catch (OperationCanceledException exception)
         {
-            await this.antiTamperMonitor.StartAsync(stoppingToken);
-            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Anti-tamper monitor started.");
+            this.startupCompletion.TrySetCanceled(
+                exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : stoppingToken);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            this.startupCompletion.TrySetException(exception);
+            throw;
         }
 
         // T37: Verify child's account is standard
@@ -1334,6 +1421,25 @@ public sealed class ControlParentalService : BackgroundService
         }
     }
 
+    private async Task StartIntegrityRuntimeAsync(CancellationToken stoppingToken)
+    {
+        if (this.integrityRuntimeFactory is null)
+        {
+            return;
+        }
+
+        var monitor = this.integrityRuntimeFactory.Create();
+        if (monitor is null)
+        {
+            return;
+        }
+
+        this.antiTamperMonitor = monitor;
+        this.ownsAntiTamperMonitor = true;
+        await monitor.StartAsync(stoppingToken);
+        System.Diagnostics.Debug.WriteLine("[ControlParentalService] Anti-tamper monitor started.");
+    }
+
     private void OnForegroundChanged(ForegroundChanged message)
     {
         // T06: Update usage counter with foreground change
@@ -1367,8 +1473,18 @@ public sealed class ControlParentalService : BackgroundService
             $"overlay={message.IsOverlayVisible}");
     }
 
-    private void QueueAgentBinding(IIpcChannel? channel, CancellationToken cancellationToken) =>
-        this.bindingTask = this.BindSessionAgentChannelAsync(channel, cancellationToken);
+    private void QueueAgentBinding(IIpcChannel? channel, CancellationToken cancellationToken)
+    {
+        lock (this.lifecycleLock)
+        {
+            if (this.bindingAdmissionClosed || this.disposed)
+            {
+                return;
+            }
+
+            this.bindingTask = this.BindSessionAgentChannelAsync(channel, cancellationToken);
+        }
+    }
 
     private async Task BindSessionAgentChannelAsync(IIpcChannel? channel, CancellationToken cancellationToken)
     {
@@ -1461,44 +1577,147 @@ public sealed class ControlParentalService : BackgroundService
         }
     }
 
-    public override async Task StopAsync(CancellationToken cancellationToken)
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        lock (this.lifecycleLock)
+        {
+            this.bindingAdmissionClosed = true;
+            return this.stopTask ??= this.StopAndBaseAsync(cancellationToken);
+        }
+    }
+
+    private async Task StopAndBaseAsync(CancellationToken cancellationToken)
+    {
+        var failures = new List<Exception>();
+        try
+        {
+            await this.StopCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
+        }
+
+        try
+        {
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
+        }
+
+        ThrowCleanupFailures(failures);
+    }
+
+    private async Task StopCoreAsync(CancellationToken cancellationToken)
     {
         this.timeProvider.TimeChanged -= this.OnTimeChanged;
+        var failures = new List<Exception>();
 
-        // T10: Stop health monitoring
-        await this.healthMonitor.StopAsync();
-
-        // T12: Stop enforcement level monitoring
-        await this.enforcementLevelMonitor?.StopAsync()!;
-
-        // T13: Stop anti-tamper monitoring
-        await this.antiTamperMonitor?.StopAsync()!;
-
-        if (this.usageAccumulator is UsageAccumulator accumulator)
+        await AttemptCleanupAsync(failures, () => this.healthMonitor.StopAsync());
+        await AttemptCleanupAsync(failures, () => this.enforcementLevelMonitor?.StopAsync() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, () => this.antiTamperMonitor?.StopAsync() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, async () =>
         {
-            await accumulator.StopAsync(cancellationToken);
+            if (this.usageAccumulator is UsageAccumulator accumulator)
+            {
+                await accumulator.StopAsync(cancellationToken);
+            }
+            else
+            {
+                this.usageAccumulator.Stop();
+            }
+        });
+        await AttemptCleanupAsync(failures, () =>
+        {
+            this.usageReconciler.Stop();
+            return Task.CompletedTask;
+        });
+        await AttemptCleanupAsync(failures, () => this.bindingTask);
+        await AttemptCleanupAsync(failures, () => this.recoveryTask);
+        await AttemptCleanupAsync(failures, () => this.timeChangeTask);
+
+        if (this.sessionManager is { } session)
+        {
+            await AttemptCleanupAsync(failures, session.StopAsync);
+            await AttemptCleanupAsync(failures, () =>
+            {
+                session.Dispose();
+                return Task.CompletedTask;
+            });
+        }
+
+        await AttemptCleanupAsync(failures, () => this.safetyLoop?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, () =>
+        {
+            this.bindingGate.Dispose();
+            return Task.CompletedTask;
+        });
+        ThrowCleanupFailures(failures);
+    }
+
+    private static async Task AttemptCleanupAsync(List<Exception> failures, Func<Task> cleanup)
+    {
+        try
+        {
+            await cleanup().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
+        }
+    }
+
+    private static void AddCleanupFailures(List<Exception> failures, Exception exception)
+    {
+        if (exception is AggregateException aggregate)
+        {
+            failures.AddRange(aggregate.Flatten().InnerExceptions);
         }
         else
         {
-            this.usageAccumulator.Stop();
+            failures.Add(exception);
         }
-        this.usageReconciler.Stop();
-        await this.bindingTask;
-        await this.recoveryTask;
-        await this.timeChangeTask;
-        if (this.sessionManager != null)
+    }
+
+    private static void ThrowCleanupFailures(IReadOnlyCollection<Exception> failures)
+    {
+        if (failures.Count == 0)
         {
-            await this.sessionManager.StopAsync();
-            this.sessionManager.Dispose();
+            return;
         }
 
-        if (this.safetyLoop != null)
+        if (failures.Count == 1)
         {
-            await this.safetyLoop.DisposeAsync();
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures.Single()).Throw();
+            return;
         }
-        this.bindingGate.Dispose();
 
-        await base.StopAsync(cancellationToken);
+        throw new AggregateException("Service cleanup failed.", failures);
+    }
+
+    public override void Dispose()
+    {
+        IAntiTamperMonitor? monitor = null;
+        lock (this.lifecycleLock)
+        {
+            if (this.disposed)
+            {
+                return;
+            }
+
+            this.disposed = true;
+            this.bindingAdmissionClosed = true;
+            if (this.ownsAntiTamperMonitor)
+            {
+                monitor = this.antiTamperMonitor;
+                this.antiTamperMonitor = null;
+            }
+        }
+
+        monitor?.Dispose();
+        base.Dispose();
     }
 
     private void OnTimeChanged(object? sender, TimeChangedEventArgs args)

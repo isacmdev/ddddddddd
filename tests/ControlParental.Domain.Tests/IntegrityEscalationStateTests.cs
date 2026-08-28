@@ -160,6 +160,62 @@ public sealed class IntegrityEscalationStateTests
         => Create(completedReaction: "reaction-key", completedNotification: "notification-key").Validate();
 
     [Fact]
+    public void LegacyPendingEffectWithoutDescriptor_IsRejectedWithTypedError()
+    {
+        var error = Assert.Throws<IntegrityEscalationStateException>(() => Create(includeDescriptor: false).Validate());
+
+        Assert.Equal(IntegrityEscalationStateError.MissingEffectDescriptor, error.Error);
+    }
+
+    [Fact]
+    public void MalformedPendingEffectDescriptor_IsRejectedWithTypedError()
+    {
+        var malformed = Create() with
+        {
+            PendingEffectDescriptor = CreateDescriptor() with { Reason = string.Empty },
+        };
+
+        var error = Assert.Throws<IntegrityEscalationStateException>(() => malformed.Validate());
+
+        Assert.Equal(IntegrityEscalationStateError.InvalidEffectDescriptor, error.Error);
+    }
+
+    [Theory]
+    [InlineData(-1, false)]
+    [InlineData(999, false)]
+    [InlineData((int)EnforcementIssueSeverity.Info, false)]
+    [InlineData((int)EnforcementIssueSeverity.Warning, true)]
+    [InlineData((int)EnforcementIssueSeverity.Severe, true)]
+    public void AddIssueSeverityMustBeDefinedAndAtLeastWarning(int severity, bool valid)
+    {
+        var descriptor = CreateDescriptor() with { Severity = (EnforcementIssueSeverity)severity };
+        var act = () => descriptor.Validate();
+
+        if (valid)
+        {
+            act();
+            return;
+        }
+
+        var error = Assert.Throws<IntegrityEscalationStateException>(act);
+        Assert.Equal(IntegrityEscalationStateError.InvalidEffectDescriptor, error.Error);
+    }
+
+    [Fact]
+    public void ResolveIssueStillRequiresNullSeverity()
+    {
+        var descriptor = CreateDescriptor() with
+        {
+            ReactionKind = IntegrityEscalationReactionKind.ResolveIssue,
+            Severity = EnforcementIssueSeverity.Warning,
+        };
+
+        var error = Assert.Throws<IntegrityEscalationStateException>(() => descriptor.Validate());
+
+        Assert.Equal(IntegrityEscalationStateError.InvalidEffectDescriptor, error.Error);
+    }
+
+    [Fact]
     public void ReactionOnlyProgressShapesAreAccepted()
     {
         Create(pendingNotification: null).Validate();
@@ -181,17 +237,34 @@ public sealed class IntegrityEscalationStateTests
         DateTimeOffset? origin = null, DateTimeOffset? due = null, DateTimeOffset? maxWallClock = null,
         bool timingValid = true, bool fired = false, string? pendingReaction = "reaction-key",
         string? completedReaction = null, string? pendingNotification = "notification-key",
-        string? completedNotification = null, bool useDefaultTiming = true)
+        string? completedNotification = null, bool useDefaultTiming = true, bool includeDescriptor = true)
     {
         if (phase == EscalationPhase.Pending && useDefaultTiming)
         {
             origin ??= DateTimeOffset.UnixEpoch;
             due ??= DateTimeOffset.UnixEpoch.AddMinutes(5);
         }
+        var descriptor = includeDescriptor && pendingReaction is not null
+            ? CreateDescriptor(pendingNotification is not null)
+            : null;
         return new(identity, policy, schema, epoch, sequence, revoked, trust, phase, origin, due,
             maxWallClock ?? DateTimeOffset.UnixEpoch, timingValid, fired, false, pendingReaction,
-            completedReaction, pendingNotification, completedNotification);
+            completedReaction, pendingNotification, completedNotification)
+        {
+            PendingEffectDescriptor = descriptor,
+        };
     }
+
+    private static IntegrityEscalationEffectDescriptor CreateDescriptor(bool withNotification = true)
+        => new(
+            IntegrityEscalationEffectDescriptor.CurrentVersion,
+            IntegrityEscalationReactionKind.AddIssue,
+            EnforcementIssueSeverity.Warning,
+            "test",
+            withNotification ? "integrity" : null,
+            withNotification ? "title" : null,
+            withNotification ? "body" : null,
+            withNotification ? DateTimeOffset.UnixEpoch : null);
 
     private static void AssertInvalid(IntegrityEscalationState state)
         => Assert.Throws<IntegrityEscalationStateException>(() => state.Validate());

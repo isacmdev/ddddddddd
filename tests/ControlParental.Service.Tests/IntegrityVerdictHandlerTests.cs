@@ -834,8 +834,19 @@ public class IntegrityVerdictHandlerTests : IDisposable
         using var source = CreateActive(now, "device-a");
         source.HandleVerdict("revoked", true, now);
         source.HandleVerdict("revoked", true, now.AddSeconds(1));
-        source.HandleVerdict("revoked", true, now.AddSeconds(2));
-        var valid = source.Snapshot();
+        var escalation = source.HandleVerdictDecision("revoked", true, now.AddSeconds(2));
+        var valid = source.Snapshot() with
+        {
+            PendingEffectDescriptor = new(
+                IntegrityEscalationEffectDescriptor.CurrentVersion,
+                IntegrityEscalationReactionKind.AddIssue,
+                escalation.Reaction.Severity,
+                escalation.Reaction.Reason!,
+                escalation.Notification!.Type,
+                escalation.Notification.Title,
+                escalation.Notification.Body,
+                escalation.Notification.Timestamp),
+        };
 
         using var target = new IntegrityVerdictHandler(identityScope: "device-a", clock: () => now);
         target.HandleVerdict("trust", true, now);
