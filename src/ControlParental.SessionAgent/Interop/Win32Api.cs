@@ -5,6 +5,7 @@
 namespace ControlParental.SessionAgent.Interop;
 
 using System.Runtime.InteropServices;
+using System.Text;
 
 /// <summary>
 /// T05 — Win32 P/Invoke declarations for foreground detection and app identity resolution.
@@ -91,8 +92,14 @@ internal static class Win32Api
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr DispatchMessageW([In] ref MSG lpMsg);
 
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern void PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint removeMsg);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool GetMessageTimeout(
@@ -187,6 +194,12 @@ internal static class Win32Api
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool erase);
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
 
@@ -195,6 +208,33 @@ internal static class Win32Api
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern bool UnregisterClass(string lpClassName, IntPtr hInstance);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT paintStruct);
+
+    [DllImport("user32.dll")]
+    public static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT paintStruct);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateSolidBrush(uint color);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteObject(IntPtr objectHandle);
+
+    [DllImport("user32.dll")]
+    public static extern int FillRect(IntPtr hdc, ref RECT rect, IntPtr brush);
+
+    [DllImport("user32.dll")]
+    public static extern int DrawText(IntPtr hdc, string text, int count, ref RECT rect, uint format);
+
+    [DllImport("gdi32.dll")]
+    public static extern uint SetTextColor(IntPtr hdc, uint color);
+
+    [DllImport("gdi32.dll")]
+    public static extern int SetBkMode(IntPtr hdc, int mode);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
 
     // ── Message box ──────────────────────────────────────────────────
 
@@ -229,6 +269,15 @@ internal static class Win32Api
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_PAINT = 0x000F;
     public const uint WM_ERASEBKGND = 0x0014;
+    public const uint WM_DISPLAYCHANGE = 0x007E;
+    public const uint WM_DPICHANGED = 0x02E0;
+    public const uint WM_SETFOCUS = 0x0007;
+    public const uint DT_CENTER = 0x00000001;
+    public const uint DT_VCENTER = 0x00000004;
+    public const uint DT_WORDBREAK = 0x00000010;
+    public const uint DT_SINGLELINE = 0x00000020;
+    public const uint DT_NOPREFIX = 0x00000800;
+    public const int TRANSPARENT = 1;
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_RBUTTONDOWN = 0x0204;
@@ -252,6 +301,109 @@ internal static class Win32Api
 
     // Cursor IDs
     public const int IDC_ARROW = 32512; // Standard arrow cursor
+
+    // ── DPI APIs ──────────────────────────────────────────────────────
+
+    [DllImport("user32.dll")]
+    internal static extern uint GetDpiForWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    internal static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new(-4);
+
+    // ── Timers ────────────────────────────────────────────────────────
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr nIdEvent, uint uElapse, IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool KillTimer(IntPtr hWnd, UIntPtr uIdEvent);
+
+    // ── Window state / geometry ───────────────────────────────────────
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    internal static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern bool IsWindowEnabled(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetDlgItem(IntPtr hDlg, int nIdDlgItem);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    internal static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr newLong);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr CallWindowProc(IntPtr prevWndFunc, IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    internal static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    internal static extern int GetDlgCtrlID(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetFocus();
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SetActiveWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, ref RECT lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    // ── Constants for overlay windows ─────────────────────────────────
+
+    public const uint WM_COMMAND = 0x0111;
+    public const uint WM_KEYUP = 0x0101;
+    public const uint WM_LBUTTONUP = 0x0202;
+    public const uint WM_KILLFOCUS = 0x0008;
+    public const uint WM_TIMER = 0x0113;
+
+    public const uint BN_CLICKED = 0x0000;
+    public const uint MK_LBUTTON = 0x0001;
+
+    public const uint WS_CHILD = 0x40000000;
+    public const uint WS_TABSTOP = 0x00010000;
+    public const uint BS_PUSHBUTTON = 0x00000000;
+    public const uint BS_DEFPUSHBUTTON = 0x00000001;
+
+    public const int GWL_STYLE = -16;
+    public const int GWL_EXSTYLE = -20;
+    public const int GWL_ID = -12;
+    public const int GWLP_WNDPROC = -4;
+
+    public const int SW_HIDE = 0;
+    public const int SW_SHOWNOACTIVATE = 4;
+    public const int SW_SHOW = 5;
+
+    public const uint GW_HWNDPREV = 3;
+    public const uint GW_CHILD = 5;
 }
 
 /// <summary>
@@ -269,7 +421,7 @@ internal delegate void WinEventDelegate(
 /// <summary>
 /// Win32 POINT structure.
 /// </summary>
-public struct Win32Point
+internal struct Win32Point
 {
     public int X;
     public int Y;
@@ -279,7 +431,7 @@ public struct Win32Point
 /// Win32 MSG structure for message loop.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct MSG
+internal struct MSG
 {
     public IntPtr hWnd;
     public uint message;
@@ -290,15 +442,33 @@ public struct MSG
 }
 
 /// <summary>
+/// Win32 paint state.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PAINTSTRUCT
+{
+    public IntPtr Hdc;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool Erase;
+    public RECT Paint;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool Restore;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool IncUpdate;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[]? Reserved;
+}
+
+/// <summary>
 /// Delegate for monitor enumeration callback.
 /// </summary>
-public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+internal delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
 
 /// <summary>
 /// Win32 RECT structure.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
-public struct RECT
+internal struct RECT
 {
     public int Left;
     public int Top;
@@ -313,7 +483,7 @@ public struct RECT
 /// Win32 MONITORINFO structure.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct MONITORINFO
+internal struct MONITORINFO
 {
     public int cbSize;
     public RECT rcMonitor;
@@ -325,7 +495,7 @@ public struct MONITORINFO
 /// Win32 WNDCLASSEX structure for window class registration.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct WNDCLASSEX
+internal struct WNDCLASSEX
 {
     public int cbSize;
     public int style;

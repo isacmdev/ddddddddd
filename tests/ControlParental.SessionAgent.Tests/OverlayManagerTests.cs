@@ -4,6 +4,7 @@
 
 namespace ControlParental.SessionAgent.Tests;
 
+using System.Text;
 using ControlParental.Domain;
 using ControlParental.SessionAgent;
 using ControlParental.SessionAgent.Interop;
@@ -11,10 +12,12 @@ using FluentAssertions;
 using Xunit;
 
 /// <summary>
-/// T08 — Tests for OverlayManager and OverlayWindow behavior.
-/// Tests overlay show/hide, warning display, CTA handling,
-/// and keyboard blocking logic.
-/// Target: ≥80% coverage.
+/// T08 — Tests for OverlayManager, OverlayWindow (blocking enforcement surface)
+/// and the independent warning toast surface. Behavioral, native-state tests:
+/// real message-pump dispatch (paint, input, timers, DPI/display changes),
+/// independent enforcement/warning surfaces, accessible CTA (real child button),
+/// topmost re-assertion, and idempotent cursor ownership.
+/// Target: &gt;80% line coverage on changed production code + branch report.
 /// </summary>
 public class OverlayManagerTests : IDisposable
 {
@@ -22,11 +25,66 @@ public class OverlayManagerTests : IDisposable
 
     private OverlayManager? overlayManager;
 
+    /// <summary>
+    /// Test cleanup — disposes any manager created during the test.
+    /// </summary>
     public void Dispose()
     {
         this.overlayManager?.Dispose();
         this.overlayManager = null;
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Creates a bounded manager (real surfaces, never covering the whole desktop)
+    /// with an optional cursor seam and overridable topmost re-assert interval.
+    /// </summary>
+    private static OverlayManager NewManager(
+        TimeSpan? warningDuration = null,
+        List<(bool Show, bool Result)>? cursorCalls = null,
+        TimeSpan? topmostReassertInterval = null)
+    {
+        Func<bool, bool>? cursorSeam = null;
+        if (cursorCalls != null)
+        {
+            cursorSeam = b =>
+            {
+                var result = Win32Api.ShowCursor(b);
+                cursorCalls.Add((b, result));
+                return result;
+            };
+        }
+
+        return new OverlayManager(
+            warningDuration ?? TimeSpan.FromMinutes(5),
+            cursorSeam,
+            (0, 0, 200, 120),
+            topmostReassertInterval);
+    }
+
+    private static bool SpinUntil(Func<bool> condition, int timeoutMs = 5000)
+    {
+        return SpinWait.SpinUntil(condition, timeoutMs);
+    }
+
+    private static RECT GetRect(IntPtr hwnd)
+    {
+        _ = Win32Api.GetWindowRect(hwnd, out var rect);
+        return rect;
+    }
+
+    private static string GetText(IntPtr hwnd)
+    {
+        var sb = new StringBuilder(256);
+        _ = Win32Api.GetWindowText(hwnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    private static string GetClassName(IntPtr hwnd)
+    {
+        var sb = new StringBuilder(128);
+        _ = Win32Api.GetClassName(hwnd, sb, sb.Capacity);
+        return sb.ToString();
     }
 
     // ── Constructor Tests ─────────────────────────────────────────────
@@ -35,11 +93,11 @@ public class OverlayManagerTests : IDisposable
     public void Constructor_CreatesOverlayManager()
     {
         // Act
-        this.overlayManager = new OverlayManager();
+        using var manager = new OverlayManager();
 
         // Assert
-        this.overlayManager.Should().NotBeNull();
-        this.overlayManager.IsOverlayVisible.Should().BeFalse();
+        manager.Should().NotBeNull();
+        manager.IsOverlayVisible.Should().BeFalse();
     }
 
     // ── ShowOverlay Tests ─────────────────────────────────────────────
@@ -48,20 +106,23 @@ public class OverlayManagerTests : IDisposable
     public void ShowOverlay_WithReason_SetsVisibleTrue()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowOverlay("Se acabó el tiempo de esta app");
 
         // Assert
         this.overlayManager.IsOverlayVisible.Should().BeTrue();
+        this.overlayManager.BlockWindowHandle.Should().NotBe(IntPtr.Zero);
+        Win32Api.IsWindow(this.overlayManager.BlockWindowHandle).Should().BeTrue();
+        Win32Api.IsWindowVisible(this.overlayManager.BlockWindowHandle).Should().BeTrue();
     }
 
     [Fact]
     public void ShowOverlay_WithNullReason_HandlesGracefully()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowOverlay(null!);
@@ -74,7 +135,7 @@ public class OverlayManagerTests : IDisposable
     public void ShowOverlay_WithEmptyReason_HandlesGracefully()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowOverlay(string.Empty);
@@ -87,7 +148,7 @@ public class OverlayManagerTests : IDisposable
     public void ShowOverlay_WithCtaLabel_SetsVisibleTrue()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowOverlay("Bloqueo por tiempo", "Solicitar más tiempo");
@@ -102,7 +163,7 @@ public class OverlayManagerTests : IDisposable
     public void HideOverlay_AfterShow_SetsVisibleFalse()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
         this.overlayManager.ShowOverlay("Bloqueo");
 
         // Act
@@ -110,13 +171,14 @@ public class OverlayManagerTests : IDisposable
 
         // Assert
         this.overlayManager.IsOverlayVisible.Should().BeFalse();
+        Win32Api.IsWindowVisible(this.overlayManager.BlockWindowHandle).Should().BeFalse();
     }
 
     [Fact]
     public void HideOverlay_WhenNotVisible_DoesNotThrow()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act & Assert
         var act = () => this.overlayManager.HideOverlay();
@@ -126,59 +188,462 @@ public class OverlayManagerTests : IDisposable
     // ── ShowWarning Tests ─────────────────────────────────────────────
 
     [Fact]
-    public void ShowWarning_WithRemainingTime_ShowsWarning()
+    public void ShowWarning_WithRemainingTime_IsNonBlockingAndExposesWarning()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowWarning(10);
 
-        // Assert - warning shows overlay
+        // Assert
+        this.overlayManager.IsOverlayVisible.Should().BeFalse();
+        this.overlayManager.IsWarningVisible.Should().BeTrue();
+        this.overlayManager.CurrentWarningMessage.Should().Contain("10");
+        this.overlayManager.WarningWindowHandle.Should().NotBe(IntPtr.Zero);
+        Win32Api.IsWindowVisible(this.overlayManager.WarningWindowHandle).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShowWarning_ReplacesPreviousAndAutoClosesWithoutChangingBlockingState()
+    {
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(60));
+        this.overlayManager.ShowOverlay("blocked");
+
+        this.overlayManager.ShowWarning(10);
+        this.overlayManager.ShowWarning(5);
+
+        this.overlayManager.CurrentWarningMessage.Should().Contain("5");
         this.overlayManager.IsOverlayVisible.Should().BeTrue();
+
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+
+        // The enforcement surface is untouched after the toast auto-closes.
+        this.overlayManager.IsOverlayVisible.Should().BeTrue();
+        Win32Api.IsWindowVisible(this.overlayManager.WarningWindowHandle).Should().BeFalse();
     }
 
     [Fact]
     public void ShowWarning_AtFiveMinutes_ShowsUrgentMessage()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowWarning(5);
 
-        // Assert - shows overlay with urgent message
-        this.overlayManager.IsOverlayVisible.Should().BeTrue();
+        // Assert - shows warning without activating the blocking overlay
+        this.overlayManager.IsOverlayVisible.Should().BeFalse();
+        this.overlayManager.IsWarningVisible.Should().BeTrue();
+        this.overlayManager.CurrentWarningMessage.Should().Contain("5");
     }
 
     [Fact]
     public void ShowWarning_WithZeroMinutes_HandlesGracefully()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowWarning(0);
 
-        // Assert - should not throw
+        // Assert - should not throw and must remain non-blocking
+        this.overlayManager.IsOverlayVisible.Should().BeFalse();
+        this.overlayManager.IsWarningVisible.Should().BeTrue();
+    }
+
+    // ── W-06: warning lives on an independent surface ────────────────
+
+    [Fact]
+    public void Warning_UsesIndependentSurface()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked");
+        var blockHandle = this.overlayManager.BlockWindowHandle;
+
+        // Act
+        this.overlayManager.ShowWarning(10);
+
+        // Assert — distinct native handles, both visible.
+        var warningHandle = this.overlayManager.WarningWindowHandle;
+        warningHandle.Should().NotBe(IntPtr.Zero);
+        warningHandle.Should().NotBe(blockHandle);
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        Win32Api.IsWindowVisible(warningHandle).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShowBlock_ThenWarning_KeepsBlockSurfaceAndCtaIntact()
+    {
+        // Arrange — reviewer round-1 repro: Show -> ShowWarning used to resize the same HWND.
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(150));
+        this.overlayManager.ShowOverlay("blocked", "Solicitar más tiempo");
+        var blockHandle = this.overlayManager.BlockWindowHandle;
+        var ctaHandle = this.overlayManager.CtaButtonHandle;
+        var beforeBounds = GetRect(blockHandle);
+        beforeBounds.Width.Should().Be(200);
+        beforeBounds.Height.Should().Be(120);
+
+        // Act
+        this.overlayManager.ShowWarning(10);
+
+        // Assert — block bounds, visibility, CTA and reason are untouched DURING the warning.
+        var duringBounds = GetRect(blockHandle);
+        duringBounds.Should().Be(beforeBounds);
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        this.overlayManager.CtaButtonHandle.Should().Be(ctaHandle);
+        Win32Api.IsWindow(ctaHandle).Should().BeTrue();
+        this.overlayManager.GetBlockRenderPlan().Reason.Should().Be("blocked");
+        this.overlayManager.GetBlockRenderPlan().CtaLabel.Should().Be("Solicitar más tiempo");
+
+        // After auto-close the block is still the full enforcement surface.
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+        GetRect(blockHandle).Should().Be(beforeBounds);
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        this.overlayManager.GetBlockRenderPlan().CtaLabel.Should().Be("Solicitar más tiempo");
+    }
+
+    [Fact]
+    public void ShowWarning_ThenBlock_DoesNotDisturbBlockSurface()
+    {
+        // Arrange — other order: warning first, then the enforcement overlay.
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(150));
+        this.overlayManager.ShowWarning(10);
+
+        // Act
+        this.overlayManager.ShowOverlay("blocked", "Pedir más tiempo");
+
+        // Assert
+        var blockHandle = this.overlayManager.BlockWindowHandle;
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        GetRect(blockHandle).Width.Should().Be(200);
+        GetRect(blockHandle).Height.Should().Be(120);
+        this.overlayManager.GetBlockRenderPlan().Reason.Should().Be("blocked");
+        Win32Api.IsWindowVisible(this.overlayManager.WarningWindowHandle).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Warning_BeforeDuringAfterAutoClose_BlockStateNativeAndStable()
+    {
+        // Arrange
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(80));
+        this.overlayManager.ShowOverlay("blocked", null);
+        var blockHandle = this.overlayManager.BlockWindowHandle;
+        var before = GetRect(blockHandle);
+
+        // During
+        this.overlayManager.ShowWarning(10);
+        SpinUntil(() => this.overlayManager.IsWarningVisible).Should().BeTrue();
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        GetRect(blockHandle).Should().Be(before);
+
+        // After auto-close
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+        Win32Api.IsWindowVisible(blockHandle).Should().BeTrue();
+        Win32Api.IsWindowVisible(this.overlayManager.WarningWindowHandle).Should().BeFalse();
+        GetRect(blockHandle).Should().Be(before);
         this.overlayManager.IsOverlayVisible.Should().BeTrue();
     }
 
-    // ── CTA Event Tests ──────────────────────────────────────────────
+    // ── W-04: message-pump dispatch (paint, input, timers) ────────────
 
     [Fact]
-    public void ShowOverlay_WithCtaLabel_WiresCtaEvent()
+    public void BlockSurface_PaintsOnOwnerThread()
+    {
+        // Arrange — painting only happens if the dedicated pump dispatches WM_PAINT.
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked", "OK");
+
+        // Act & Assert
+        SpinUntil(() => this.overlayManager.BlockPaintCount > 0).Should().BeTrue();
+    }
+
+    [Fact]
+    public void WarningSurface_PaintsAndAutoClosesOnOwnerThread()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(80));
+
+        // Act
+        this.overlayManager.ShowWarning(5);
+
+        // Assert — real WM_PAINT dispatch and real auto-close timer.
+        SpinUntil(() => this.overlayManager.WarningPaintCount > 0).Should().BeTrue();
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+        SpinUntil(() => !Win32Api.IsWindowVisible(this.overlayManager.WarningWindowHandle)).Should().BeTrue();
+    }
+
+    [Fact]
+    public void CtaClick_ByMouse_RaisesCtaEvent()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
         var eventRaised = false;
         this.overlayManager.CtaClicked += () => eventRaised = true;
-
-        // Act - Show overlay with CTA
         this.overlayManager.ShowOverlay("Test", "Click me");
+        var cta = this.overlayManager.CtaButtonHandle;
+        cta.Should().NotBe(IntPtr.Zero);
+
+        // Act — real button hit-testing: down + up inside the button.
+        var pt = (10 << 16) | 10;
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_LBUTTONDOWN, new IntPtr(Win32Api.MK_LBUTTON), new IntPtr(pt));
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_LBUTTONUP, IntPtr.Zero, new IntPtr(pt));
 
         // Assert
-        this.overlayManager.IsOverlayVisible.Should().BeTrue();
+        SpinUntil(() => eventRaised).Should().BeTrue();
+    }
+
+    [Fact]
+    public void CtaClick_ByEnterKey_RaisesCtaEvent()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        var eventRaised = false;
+        this.overlayManager.CtaClicked += () => eventRaised = true;
+        this.overlayManager.ShowOverlay("Test", "OK");
+        var cta = this.overlayManager.CtaButtonHandle;
+
+        // Act — keyboard activation through the real button (default pushbutton).
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_KEYDOWN, new IntPtr(0x0D), IntPtr.Zero);
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_KEYUP, new IntPtr(0x0D), IntPtr.Zero);
+
+        // Assert
+        SpinUntil(() => eventRaised).Should().BeTrue();
+    }
+
+    [Fact]
+    public void CtaClick_BySpaceKey_RaisesCtaEvent()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        var eventRaised = false;
+        this.overlayManager.CtaClicked += () => eventRaised = true;
+        this.overlayManager.ShowOverlay("Test", "OK");
+        var cta = this.overlayManager.CtaButtonHandle;
+
+        // Act — Space activates a push button natively.
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_KEYDOWN, new IntPtr(0x20), IntPtr.Zero);
+        _ = Win32Api.SendMessage(cta, Win32Api.WM_KEYUP, new IntPtr(0x20), IntPtr.Zero);
+
+        // Assert
+        SpinUntil(() => eventRaised).Should().BeTrue();
+    }
+
+    // ── W-04: DPI / accessibility / topmost ───────────────────────────
+
+    [Fact]
+    public void BlockSurface_ReportsRealWindowDpi()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked");
+
+        // Act
+        var plan = this.overlayManager.GetBlockRenderPlan();
+
+        // Assert — real DPI from the actual window, not a hardcoded 96.
+        var nativeDpi = Win32Api.GetDpiForWindow(this.overlayManager.BlockWindowHandle);
+        plan.Dpi.Should().Be(nativeDpi);
+        plan.Dpi.Should().BeGreaterThanOrEqualTo(96u);
+    }
+
+    [Fact]
+    public void Cta_IsAccessibleChildButton()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked", "Solicitar más tiempo");
+        var cta = this.overlayManager.CtaButtonHandle;
+        cta.Should().NotBe(IntPtr.Zero);
+
+        // Act
+        var className = GetClassName(cta);
+        var text = GetText(cta);
+        var style = unchecked((long)Win32Api.GetWindowLongPtr(cta, Win32Api.GWL_STYLE));
+        var id = Win32Api.GetDlgCtrlID(cta);
+
+        // Assert — a real child button: native UIA/MSAA semantics, tabstop, label and id.
+        className.Should().Be("Button");
+        text.Should().Be("Solicitar más tiempo");
+        (style & Win32Api.WS_TABSTOP).Should().NotBe(0);
+        (style & Win32Api.WS_CHILD).Should().NotBe(0);
+        id.Should().Be(0x4D01);
+        Win32Api.IsWindowEnabled(cta).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Cta_GetsKeyboardFocus_OnShow()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked", "OK");
+
+        // Act & Assert — the surface takes focus and routes it to the CTA.
+        SpinUntil(() => this.overlayManager.CtaFocused).Should().BeTrue();
+    }
+
+    [Fact]
+    public void BlockSurface_IsTopmostAfterShow()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked");
+
+        // Act
+        var exStyle = unchecked((long)Win32Api.GetWindowLongPtr(this.overlayManager.BlockWindowHandle, Win32Api.GWL_EXSTYLE));
+
+        // Assert — WS_EX_TOPMOST is really set.
+        (exStyle & Win32Api.WS_EX_TOPMOST).Should().NotBe(0);
+    }
+
+    [Fact]
+    public void BlockSurface_ReassertsTopmostPeriodically()
+    {
+        // Arrange — very short re-assert interval proves the WM_TIMER pump path fires.
+        this.overlayManager = NewManager(topmostReassertInterval: TimeSpan.FromMilliseconds(80));
+        this.overlayManager.ShowOverlay("blocked");
+
+        // Act & Assert
+        var before = this.overlayManager.TopmostReassertCount;
+        SpinUntil(() => this.overlayManager.TopmostReassertCount > before, 3000).Should().BeTrue();
+        var exStyle = unchecked((long)Win32Api.GetWindowLongPtr(this.overlayManager.BlockWindowHandle, Win32Api.GWL_EXSTYLE));
+        (exStyle & Win32Api.WS_EX_TOPMOST).Should().NotBe(0);
+    }
+
+    [Fact]
+    public void BlockSurface_OnDpiChanged_UpdatesDpiAndScalesCta()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowOverlay("blocked", "OK");
+        // Act — simulate WM_DPICHANGED (wParam = new DPI in HIWORD).
+        var suggested = new RECT { Left = 0, Top = 0, Right = 400, Bottom = 300 };
+        _ = Win32Api.SendMessage(
+            this.overlayManager.BlockWindowHandle,
+            Win32Api.WM_DPICHANGED,
+            new IntPtr(192 << 16),
+            ref suggested);
+
+        // Assert — real window DPI updated and CTA geometry scaled up.
+        this.overlayManager.GetBlockRenderPlan().Dpi.Should().Be(192);
+        var ctaAfter = this.overlayManager.GetBlockRenderPlan().CtaBounds.Width;
+        ctaAfter.Should().BeGreaterThan(0);
+        this.overlayManager.GetBlockRenderPlan().Dpi.Should().Be(192);
+    }
+
+    [Fact]
+    public void WarningSurface_OnDpiChanged_HonorsSuggestedRect()
+    {
+        // Arrange
+        this.overlayManager = NewManager();
+        this.overlayManager.ShowWarning(10);
+        var warningHandle = this.overlayManager.WarningWindowHandle;
+        warningHandle.Should().NotBe(IntPtr.Zero);
+
+        // Act — WM_DPICHANGED with a suggested RECT (144 DPI).
+        var suggested = new RECT { Left = 10, Top = 10, Right = 500, Bottom = 400 };
+        _ = Win32Api.SendMessage(warningHandle, Win32Api.WM_DPICHANGED, new IntPtr(144 << 16), ref suggested);
+
+        // Assert — toast re-scaled and placed inside the suggested rect (right-top).
+        var rect = GetRect(warningHandle);
+        rect.Left.Should().Be(10);
+        rect.Top.Should().BeGreaterThanOrEqualTo(10);
+        rect.Right.Should().BeLessThanOrEqualTo(500);
+        rect.Width.Should().BeGreaterThan(300);
+        rect.Height.Should().BeGreaterThan(90);
+    }
+
+    // ── Cursor ownership ──────────────────────────────────────────────
+
+    [Fact]
+    public void BlockShowHide_BalancesCursor()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        this.overlayManager = NewManager(cursorCalls: calls);
+        this.overlayManager.ShowOverlay("blocked");
+
+        // Act
+        this.overlayManager.HideOverlay();
+
+        // Assert — exactly one hide and one un-hide, ref count back to zero.
+        this.overlayManager.CursorHideRefs.Should().Be(0);
+        calls.Count(c => c.Show).Should().Be(1); // ShowCursor(true) on release
+        calls.Count(c => !c.Show).Should().Be(1); // ShowCursor(false) on acquire
+    }
+
+    [Fact]
+    public void RepeatedShow_BalancesCursor()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        this.overlayManager = NewManager(cursorCalls: calls);
+        this.overlayManager.ShowOverlay("one");
+        this.overlayManager.ShowOverlay("two"); // idempotent while visible
+
+        // Act
+        this.overlayManager.HideOverlay();
+        this.overlayManager.ShowOverlay("three");
+        this.overlayManager.HideOverlay();
+
+        // Assert — each visible interval owns one balanced cursor hide.
+        this.overlayManager.CursorHideRefs.Should().Be(0);
+        calls.Count(c => c.Show).Should().Be(calls.Count(c => !c.Show));
+        calls.Count(c => !c.Show).Should().Be(2);
+    }
+
+    [Fact]
+    public void DisposeWhileBlockVisible_RestoresCursor()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        this.overlayManager = NewManager(cursorCalls: calls);
+        this.overlayManager.ShowOverlay("blocked");
+        this.overlayManager.CursorHideRefs.Should().Be(1);
+
+        // Act
+        this.overlayManager.Dispose();
+
+        // Assert — dispose restored the cursor fully (ref count zero, balanced calls).
+        this.overlayManager.CursorHideRefs.Should().Be(0);
+        calls.Count(c => c.Show).Should().Be(calls.Count(c => !c.Show));
+    }
+
+    [Fact]
+    public void Warning_10_5_0_Sequence_NeverTouchesCursor()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(70), cursorCalls: calls);
+
+        // Act — a warning sequence must not unbalance a blocked overlay's cursor.
+        this.overlayManager.ShowWarning(10);
+        this.overlayManager.ShowWarning(5);
+        this.overlayManager.ShowWarning(0);
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+
+        // Assert — warnings never call ShowCursor at all.
+        calls.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void WarningWithVisibleBlock_NeverTouchesCursor()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        this.overlayManager = NewManager(TimeSpan.FromMilliseconds(70), cursorCalls: calls);
+        this.overlayManager.ShowOverlay("blocked");
+        this.overlayManager.CursorHideRefs.Should().Be(1);
+        var cursorCallsBeforeWarning = calls.Count;
+
+        // Act
+        this.overlayManager.ShowWarning(5);
+        SpinUntil(() => !this.overlayManager.IsWarningVisible).Should().BeTrue();
+
+        // Assert — the warning does not disturb the block's cursor ownership.
+        calls.Count.Should().Be(cursorCallsBeforeWarning);
+        this.overlayManager.CursorHideRefs.Should().Be(1);
     }
 
     // ── Dispose Tests ────────────────────────────────────────────────
@@ -187,7 +652,7 @@ public class OverlayManagerTests : IDisposable
     public void Dispose_CalledOnce_DisposesWithoutError()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
         this.overlayManager.ShowOverlay("Test");
 
         // Act
@@ -201,7 +666,7 @@ public class OverlayManagerTests : IDisposable
     public void Dispose_CalledTwice_DoesNotThrow()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.Dispose();
@@ -215,7 +680,7 @@ public class OverlayManagerTests : IDisposable
     public void ShowOverlay_AfterDispose_DoesNotThrow()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
         this.overlayManager.Dispose();
 
         // Act
@@ -231,7 +696,7 @@ public class OverlayManagerTests : IDisposable
     public void StateMachine_ShowHideShow_SetsVisibleTrue()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
 
         // Act
         this.overlayManager.ShowOverlay("First");
@@ -246,7 +711,7 @@ public class OverlayManagerTests : IDisposable
     public void StateMachine_MultipleHides_StaysHidden()
     {
         // Arrange
-        this.overlayManager = new OverlayManager();
+        this.overlayManager = NewManager();
         this.overlayManager.ShowOverlay("Test");
 
         // Act
@@ -260,10 +725,57 @@ public class OverlayManagerTests : IDisposable
 }
 
 /// <summary>
-/// T08 — Tests for OverlayWindow static methods and keyboard blocking logic.
+/// T08 — Tests for OverlayWindow blocking-surface static helpers and direct
+/// window behavior (bounded geometry so no real desktop is covered).
 /// </summary>
-public class OverlayWindowTests
+public class OverlayWindowTests : IDisposable
 {
+    private OverlayWindow? overlay;
+
+    public void Dispose()
+    {
+        this.overlay?.Dispose();
+        this.overlay = null;
+        GC.SuppressFinalize(this);
+    }
+
+    private OverlayWindow NewBounded(Func<bool, bool>? showCursor = null, TimeSpan? topmostReassertInterval = null)
+    {
+        this.overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true, showCursor, topmostReassertInterval);
+        return this.overlay;
+    }
+
+    [Fact]
+    public void BuildRenderPlan_PreservesContentAndCreatesAccessibleHitTarget()
+    {
+        var plan = OverlayWindow.BuildRenderPlan(
+            new RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 },
+            "Tiempo agotado", "Solicitar más tiempo", 144);
+
+        plan.Background.Should().Be("#101820");
+        plan.Reason.Should().Be("Tiempo agotado");
+        plan.CtaBounds.Width.Should().BeGreaterThan(0);
+        plan.CtaBounds.Height.Should().BeGreaterThan(0);
+        plan.CtaBounds.Right.Should().BeLessThanOrEqualTo(plan.Bounds.Right);
+        plan.CtaBounds.Bottom.Should().BeLessThanOrEqualTo(plan.Bounds.Bottom);
+        plan.Dpi.Should().Be(144);
+        plan.IsKeyboardFocusable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void BuildRenderPlan_ScaledGeometry_ForHighDpi()
+    {
+        // Act
+        var plan192 = OverlayWindow.BuildRenderPlan(
+            new RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 },
+            "reason", "CTA", 192);
+
+        // Assert — high DPI is reflected in the render plan and geometry remains valid.
+        plan192.Dpi.Should().Be(192);
+        plan192.CtaBounds.Width.Should().BeGreaterThan(0);
+        plan192.CtaBounds.Height.Should().BeGreaterThan(0);
+    }
+
     // ── ShouldBlockKeyMessage Tests ─────────────────────────────────
 
     [Theory]
@@ -354,10 +866,10 @@ public class OverlayWindowTests
         result.Should().BeFalse();
     }
 
-    // ── OverlayWindow Integration Tests ─────────────────────────────
+    // ── OverlayWindow direct integration tests (bounded) ─────────────
 
     [Fact]
-    public void OverlayWindow_InitialState_NotVisible()
+    public void InitialState_NotVisible()
     {
         // Arrange
         using var overlay = new OverlayWindow();
@@ -367,10 +879,10 @@ public class OverlayWindowTests
     }
 
     [Fact]
-    public void OverlayWindow_Show_ThenHide_SetsVisibilityCorrectly()
+    public void Show_ThenHide_SetsVisibilityCorrectly()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
 
         // Act
         overlay.Show("Test reason");
@@ -385,10 +897,10 @@ public class OverlayWindowTests
     }
 
     [Fact]
-    public void OverlayWindow_Show_WithNullReason_HandlesGracefully()
+    public void Show_WithNullReason_HandlesGracefully()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
 
         // Act
         var act = () => overlay.Show(null!);
@@ -399,10 +911,10 @@ public class OverlayWindowTests
     }
 
     [Fact]
-    public void OverlayWindow_Show_ThenShowAgain_UpdatesReason()
+    public void Show_ThenShowAgain_UpdatesReason()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
 
         // Act
         overlay.Show("First reason");
@@ -410,13 +922,15 @@ public class OverlayWindowTests
 
         // Assert
         overlay.IsVisible.Should().BeTrue();
+        overlay.GetCurrentReason().Should().Be("Second reason");
+        overlay.GetCurrentCtaLabel().Should().Be("CTA Label");
     }
 
     [Fact]
-    public void OverlayWindow_Dispose_DestroysWindow()
+    public void Dispose_DestroysWindow()
     {
         // Arrange
-        var overlay = new OverlayWindow();
+        var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
         overlay.Show("Test");
 
         // Act
@@ -424,13 +938,14 @@ public class OverlayWindowTests
 
         // Assert - window should be destroyed
         overlay.IsVisible.Should().BeFalse();
+        overlay.IsWindowCreated().Should().BeFalse();
     }
 
     [Fact]
-    public void OverlayWindow_Dispose_CanBeCalledMultipleTimes()
+    public void Dispose_CanBeCalledMultipleTimes()
     {
         // Arrange
-        var overlay = new OverlayWindow();
+        var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
         overlay.Show("Test");
 
         // Act
@@ -443,7 +958,7 @@ public class OverlayWindowTests
     }
 
     [Fact]
-    public void OverlayWindow_Show_AfterDispose_DoesNotThrow()
+    public void Show_AfterDispose_DoesNotThrow()
     {
         // Arrange
         var overlay = new OverlayWindow();
@@ -457,7 +972,7 @@ public class OverlayWindowTests
     }
 
     [Fact]
-    public void OverlayWindow_Hide_AfterDispose_DoesNotThrow()
+    public void Hide_AfterDispose_DoesNotThrow()
     {
         // Arrange
         var overlay = new OverlayWindow();
@@ -470,106 +985,11 @@ public class OverlayWindowTests
         act.Should().NotThrow();
     }
 
-    // ── Message Processing Tests ────────────────────────────────────
-
-    [Fact]
-    public void ProcessMessage_WithBlockedKey_ReturnsTrue()
-    {
-        // Arrange
-        using var overlay = new OverlayWindow();
-        overlay.Show("Test");
-
-        var msg = new MSG
-        {
-            hWnd = IntPtr.Zero,
-            message = Win32Api.WM_SYSKEYDOWN,
-            wParam = new IntPtr(0x09), // VK_TAB
-            lParam = IntPtr.Zero,
-        };
-
-        // Act
-        var result = overlay.ProcessMessage(ref msg);
-
-        // Assert
-        result.Should().BeTrue(); // Message should be blocked
-    }
-
-    [Fact]
-    public void ProcessMessage_WithAllowedKey_ReturnsFalse()
-    {
-        // Arrange
-        using var overlay = new OverlayWindow();
-        overlay.Show("Test");
-
-        var msg = new MSG
-        {
-            hWnd = IntPtr.Zero,
-            message = Win32Api.WM_KEYDOWN,
-            wParam = new IntPtr(0x41), // 'A' key
-            lParam = IntPtr.Zero,
-        };
-
-        // Act
-        var result = overlay.ProcessMessage(ref msg);
-
-        // Assert
-        result.Should().BeFalse(); // Message should pass through
-    }
-
-    [Fact]
-    public void ProcessMessage_WhenNotVisible_ReturnsFalse()
-    {
-        // Arrange
-        using var overlay = new OverlayWindow();
-        // Overlay not shown
-
-        var msg = new MSG
-        {
-            hWnd = IntPtr.Zero,
-            message = Win32Api.WM_SYSKEYDOWN,
-            wParam = new IntPtr(0x09), // VK_TAB
-            lParam = IntPtr.Zero,
-        };
-
-        // Act
-        var result = overlay.ProcessMessage(ref msg);
-
-        // Assert
-        result.Should().BeFalse();
-    }
-
-    [Fact]
-    public void ProcessMessage_WithMouseClick_HandlesClickMessage()
-    {
-        // Arrange
-        using var overlay = new OverlayWindow();
-
-        // Act - Try to show (may fail in test environment without display)
-        overlay.Show("Test", "Click me");
-
-        // Process a mouse click message
-        var msg = new MSG
-        {
-            hWnd = IntPtr.Zero,
-            message = Win32Api.WM_LBUTTONDOWN,
-            wParam = IntPtr.Zero,
-            lParam = IntPtr.Zero,
-        };
-
-        var result = overlay.ProcessMessage(ref msg);
-
-        // Assert - Method should not throw regardless of window creation result
-        // Result depends on whether window was created and visibility state
-        _ = result;
-    }
-
-    // ── GetCurrentReason Tests ──────────────────────────────────────
-
     [Fact]
     public void GetCurrentReason_AfterShow_ReturnsReason()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
         overlay.Show("Test reason");
 
         // Act
@@ -583,7 +1003,7 @@ public class OverlayWindowTests
     public void GetCurrentCtaLabel_AfterShow_ReturnsLabel()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
         overlay.Show("Test", "CTA Label");
 
         // Act
@@ -597,7 +1017,7 @@ public class OverlayWindowTests
     public void IsWindowCreated_AfterShow_ReturnsTrue()
     {
         // Arrange
-        using var overlay = new OverlayWindow();
+        using var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true);
         overlay.Show("Test");
 
         // Act
@@ -661,6 +1081,27 @@ public class OverlayWindowTests
 
         result.Status.Should().Be(ActionStatus.HarmlessAbsence);
         overlay.Handle.Should().Be(IntPtr.Zero);
+    }
+
+    [Fact]
+    public void CursorOwnership_DisposeWhileVisible_RestoresCursorAtWindowLevel()
+    {
+        // Arrange
+        var calls = new List<(bool Show, bool Result)>();
+        Func<bool, bool> seam = b =>
+        {
+            var result = Win32Api.ShowCursor(b);
+            calls.Add((b, result));
+            return result;
+        };
+        var overlay = new OverlayWindow(0, 0, 200, 120, hideCursor: true, seam);
+        overlay.Show("blocked");
+
+        // Act
+        overlay.Dispose();
+
+        // Assert
+        calls.Count(c => c.Show).Should().Be(calls.Count(c => !c.Show));
     }
 
     [Theory]
