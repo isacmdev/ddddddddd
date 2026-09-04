@@ -10,6 +10,18 @@ namespace ControlParental.Domain;
 public interface IPolicyRepository
 {
     /// <summary>
+    /// Gets whether the durable policy row is quarantined due to a conflicting
+    /// same-version snapshot. A quarantined policy is not authoritative.
+    /// </summary>
+    bool IsPolicyQuarantined => false;
+
+    /// <summary>
+    /// Gets the safe, non-sensitive quarantine reason, when present.
+    /// </summary>
+    string? PolicyQuarantineReason => null;
+
+
+    /// <summary>
     /// Gets the current active policy.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>

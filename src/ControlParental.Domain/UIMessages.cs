@@ -208,3 +208,35 @@ public sealed record TriggerSync() : IUIMessage
     /// <inheritdoc />
     public string MessageType => nameof(TriggerSync);
 }
+
+/// <summary>Requests the current Service-owned realtime identity lease.</summary>
+public sealed record GetRealtimeIdentity() : IUIMessage
+{
+    /// <summary>Gets the version of the realtime identity IPC contract.</summary>
+    public int ContractVersion { get; init; } = 1;
+
+    /// <summary>Gets the request correlation identifier.</summary>
+    public string CorrelationId { get; init; } = Guid.NewGuid().ToString("D");
+
+    /// <inheritdoc />
+    public string MessageType => nameof(GetRealtimeIdentity);
+}
+
+/// <summary>Service response containing a short-lived realtime identity lease.</summary>
+public sealed record RealtimeIdentityResponse(
+    bool Success,
+    string? AccessToken,
+    string? DeviceId,
+    long Generation,
+    DateTimeOffset ExpiresAt,
+    string ErrorCode) : IUIMessage
+{
+    /// <summary>Gets the version of the realtime identity IPC contract.</summary>
+    public int ContractVersion { get; init; } = 1;
+
+    /// <summary>Gets the request correlation identifier.</summary>
+    public string CorrelationId { get; init; } = Guid.NewGuid().ToString("D");
+
+    /// <inheritdoc />
+    public string MessageType => nameof(RealtimeIdentityResponse);
+}

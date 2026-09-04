@@ -9,6 +9,7 @@ using System.Data.Common;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -146,6 +147,9 @@ public static class Program
             new BackendIdentityLifecycleClient(httpClientFactory(), supabaseConfig.Url, supabaseConfig.AnonKey));
         services.AddSingleton<BackendIdentityCoordinator>();
         services.AddSingleton<IBackendIdentityCoordinator>(sp => sp.GetRequiredService<BackendIdentityCoordinator>());
+        services.AddSingleton<BackendRealtimeIdentityAuthority>();
+        services.AddSingleton<IRealtimeIdentityAuthority>(sp =>
+            sp.GetRequiredService<BackendRealtimeIdentityAuthority>());
         services.AddSingleton<IBackendClient>(sp =>
             new BackendClient(httpClientFactory(), supabaseConfig.Url, sp.GetRequiredService<IBackendIdentityCoordinator>()));
         services.AddSingleton<IWnsRegistrationIntentStore>(sp =>
@@ -243,7 +247,17 @@ public static class Program
         }
         finally
         {
-            await host.StopAsync().ConfigureAwait(false);
+            using var stopCts = new CancellationTokenSource(timeout ?? DefaultBackupAdmissionTimeout);
+            try
+            {
+                await host.StopAsync()
+                    .WaitAsync(stopCts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stopCts.IsCancellationRequested)
+            {
+                System.Diagnostics.Debug.WriteLine("[Program] Backup host shutdown exceeded its finite timeout.");
+            }
         }
     }
 
@@ -473,7 +487,8 @@ public static class Program
                 sp.GetRequiredService<IServiceScopeFactory>(),
                 sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<UIMessageHandler>>(),
                  sp.GetRequiredService<IWnsRegistrationCoordinator>(),
-                 sp.GetRequiredService<IScheduledWorkService>()));
+                 sp.GetRequiredService<IScheduledWorkService>(),
+                 sp.GetRequiredService<BackendRealtimeIdentityAuthority>()));
         builder.Services.AddSingleton<NamedPipeUIServer>(sp =>
             new NamedPipeUIServer(
                 null,
@@ -545,8 +560,14 @@ public static class Program
     internal static async Task InitializeDatabaseAsync(ControlParentalDbContext db, CancellationToken cancellationToken = default)
     {
         await db.Database.EnsureCreatedAsync(cancellationToken);
-        await EnsureUsageTodayElapsedSecondsColumnAsync(db);
-        await SqliteSchemaBootstrapper.AdoptAsync(db, cancellationToken);
+        await SqliteSchemaBootstrapper.AdoptAsync(
+            db,
+            cancellationToken,
+            async (transaction, token) =>
+            {
+                await EnsurePolicyColumnsAsync(db, transaction, token);
+                await EnsureUsageTodayElapsedSecondsColumnAsync(db, transaction, token);
+            });
     }
 
     internal static async Task StartHostAfterDatabaseInitializationAsync(IHost host, CancellationToken cancellationToken = default)
@@ -568,7 +589,44 @@ public static class Program
         await RunSelectedModeAsync(host, isBackupMode, backupMode, cancellationToken);
     }
 
-    private static async Task EnsureUsageTodayElapsedSecondsColumnAsync(ControlParentalDbContext db)
+    private static async Task EnsurePolicyColumnsAsync(ControlParentalDbContext db, SqliteTransaction transaction, CancellationToken ct)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+        {
+            await connection.OpenAsync(ct);
+        }
+
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "PRAGMA table_info(policies)";
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) columns.Add(reader.GetString(1));
+        }
+
+        if (columns.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var definition in new[]
+        {
+            (Name: "snapshot_hash", Sql: "TEXT NOT NULL DEFAULT ''"),
+            (Name: "is_quarantined", Sql: "INTEGER NOT NULL DEFAULT 0"),
+            (Name: "quarantine_reason", Sql: "TEXT NULL"),
+        })
+        {
+            if (columns.Contains(definition.Name)) continue;
+            await using var alter = connection.CreateCommand();
+            alter.Transaction = transaction;
+            alter.CommandText = $"ALTER TABLE policies ADD COLUMN {definition.Name} {definition.Sql}";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
+    }
+
+    private static async Task EnsureUsageTodayElapsedSecondsColumnAsync(ControlParentalDbContext db, SqliteTransaction transaction, CancellationToken ct)
     {
         var connection = db.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
@@ -579,9 +637,10 @@ public static class Program
         var hasElapsedSecondsColumn = false;
         using (var command = connection.CreateCommand())
         {
+            command.Transaction = transaction;
             command.CommandText = "PRAGMA table_info(usage_today)";
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
+            using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
             {
                 if (string.Equals(reader.GetString(1), "elapsed_seconds", StringComparison.OrdinalIgnoreCase))
                 {
@@ -594,18 +653,20 @@ public static class Program
         if (!hasElapsedSecondsColumn)
         {
             using var alter = connection.CreateCommand();
+            alter.Transaction = transaction;
             alter.CommandText = "ALTER TABLE usage_today ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0";
-            await alter.ExecuteNonQueryAsync();
+            await alter.ExecuteNonQueryAsync(ct);
         }
 
         using var backfill = connection.CreateCommand();
+        backfill.Transaction = transaction;
         backfill.CommandText = @"
 UPDATE usage_today
 SET elapsed_seconds = CASE
     WHEN elapsed_seconds = 0 AND minutes > 0 THEN minutes * 60
     ELSE elapsed_seconds
 END";
-        await backfill.ExecuteNonQueryAsync();
+        await backfill.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>

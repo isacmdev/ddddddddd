@@ -73,6 +73,22 @@ public sealed class EnforcementEngine : IEnforcementEngine, IDisposable
             var policy = await this.policyRepository.GetPolicyAsync(cancellationToken);
             if (policy == null)
             {
+                if (this.policyRepository.IsPolicyQuarantined)
+                {
+                    const string reason = "Política en cuarentena por conflicto de versión/hash";
+                    this.isEvaluationDegraded = true;
+                    this.lastEvaluationFailure = this.policyRepository.PolicyQuarantineReason ?? reason;
+                    return new EnforcementResult
+                    {
+                        Success = false,
+                        Blocked = true,
+                        ReasonText = reason,
+                        ErrorMessage = this.lastEvaluationFailure,
+                        IsDegraded = true,
+                        Timestamp = timestamp,
+                    };
+                }
+
                 System.Diagnostics.Debug.WriteLine(
                     $"[EnforcementEngine] No policy available. Allowing {appId}.");
                 this.isEvaluationDegraded = false;

@@ -253,26 +253,41 @@ public class WnsLifecycleTests
     }
 
     [Fact]
-    public async Task HandleRawNotificationAsyncWithMalformedPayloadEmitsTypedTriggerSync()
+    public async Task HandleRawNotificationAsyncWithMalformedPayloadDoesNotEmitTriggerSync()
     {
         var malformedPayload = Encoding.UTF8.GetBytes("{not-json");
 
         var json = await CaptureTriggerSyncJsonAsync(malformedPayload).ConfigureAwait(false);
 
-        AssertTriggerSync(json);
+        Assert.Null(json);
     }
 
     [Fact]
     public async Task HandleRawNotificationAsyncWithValidPayloadEmitsTypedTriggerSync()
     {
-        var validPayload = Encoding.UTF8.GetBytes("{\"event\":\"sync\",\"version\":42}");
+        var validPayload = Encoding.UTF8.GetBytes("{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"wns.hint\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"payload\":{\"hint_type\":\"sync\"}}");
 
         var json = await CaptureTriggerSyncJsonAsync(validPayload).ConfigureAwait(false);
 
-        AssertTriggerSync(json);
+        Assert.NotNull(json);
+        AssertTriggerSync(json!);
     }
 
-    private static async Task<string> CaptureTriggerSyncJsonAsync(ReadOnlyMemory<byte> rawPayload)
+    [Fact(DisplayName = "CT-11 productive WNS seam accepts the 1024-byte hint and rejects the 1025-byte hint")]
+    [Trait("ContractTest", "CT-11")]
+    public async Task CT11_ProductiveWnsSeamAcceptsOnlyBoundedHints()
+    {
+        var valid = await CaptureTriggerSyncJsonAsync(
+            Encoding.UTF8.GetBytes(ReadFixture("valid-hint-1024.json"))).ConfigureAwait(false);
+        var oversized = await CaptureTriggerSyncJsonAsync(
+            Encoding.UTF8.GetBytes(ReadFixture("invalid-hint-1025.json"))).ConfigureAwait(false);
+
+        Assert.NotNull(valid);
+        AssertTriggerSync(valid!);
+        Assert.Null(oversized);
+    }
+
+    private static async Task<string?> CaptureTriggerSyncJsonAsync(ReadOnlyMemory<byte> rawPayload)
     {
         var capturedJson = string.Empty;
         var signalTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -293,10 +308,39 @@ public class WnsLifecycleTests
         var completedTask = await Task.WhenAny(signalTcs.Task, Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token)).ConfigureAwait(false);
         if (completedTask != signalTcs.Task)
         {
-            throw new TimeoutException("Timed out waiting for TriggerSync serialization capture.");
+            return null;
         }
 
         return capturedJson;
+    }
+
+    private static string ReadFixture(string fixture)
+    {
+        var root = RepositoryRootLocator.Locate(typeof(WnsLifecycleTests));
+        return File.ReadAllText(
+            Path.Combine(root, "openspec", "changes", "shared-contracts-freeze", "fixtures", fixture),
+            Encoding.UTF8);
+    }
+
+    [Fact]
+    public void ExtractRawPayload_ConsumesByteArrayPayloadProperty()
+    {
+        var payload = new byte[] { 1, 2, 3 };
+        var args = new FakeWnsEventArgs(payload);
+        var method = typeof(WnsPushNotificationHandler).GetMethod(
+            "ExtractRawPayload",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+
+        Assert.NotNull(method);
+        var result = (ReadOnlyMemory<byte>)method!.Invoke(null, new object[] { args })!;
+
+        Assert.Equal(payload, result.ToArray());
+    }
+
+    private sealed class FakeWnsEventArgs
+    {
+        public FakeWnsEventArgs(byte[] payload) => this.Payload = payload;
+        public byte[] Payload { get; }
     }
 
     [Fact]

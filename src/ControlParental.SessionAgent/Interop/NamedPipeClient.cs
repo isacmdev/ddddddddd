@@ -120,7 +120,9 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
             return;
         }
 
-            var json = JsonSerializer.Serialize(message);
+            var typeInfo = UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())
+                ?? throw new InvalidOperationException("Unsupported IPC message type.");
+            var json = JsonSerializer.Serialize(message, typeInfo);
             await this.WriteFrameAsync(json, cancellationToken);
     }
 
@@ -241,7 +243,8 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (!root.TryGetProperty("MessageType", out var typeElement))
+            if (!root.TryGetProperty("MessageType", out var typeElement)
+                || typeElement.ValueKind != JsonValueKind.String)
             {
                 return null;
             }
@@ -250,14 +253,14 @@ public sealed class NamedPipeClient : IIpcChannel, IDisposable
 
             return messageType switch
             {
-                nameof(ShowOverlay) => JsonSerializer.Deserialize<ShowOverlay>(json),
-                nameof(HideOverlay) => JsonSerializer.Deserialize<HideOverlay>(json),
-                nameof(ShowWarning) => JsonSerializer.Deserialize<ShowWarning>(json),
-                nameof(LockWorkstation) => JsonSerializer.Deserialize<LockWorkstation>(json),
-                nameof(AgentAuthority) => JsonSerializer.Deserialize<AgentAuthority>(json),
-                nameof(AgentCommandRequest) => JsonSerializer.Deserialize<AgentCommandRequest>(json),
-                nameof(RequestStateSnapshot) => JsonSerializer.Deserialize<RequestStateSnapshot>(json),
-                nameof(Ping) => JsonSerializer.Deserialize<Ping>(json),
+                nameof(ShowOverlay) => root.Deserialize(UIMessagesJsonContext.Default.ShowOverlay),
+                nameof(HideOverlay) => root.Deserialize(UIMessagesJsonContext.Default.HideOverlay),
+                nameof(ShowWarning) => root.Deserialize(UIMessagesJsonContext.Default.ShowWarning),
+                nameof(LockWorkstation) => root.Deserialize(UIMessagesJsonContext.Default.LockWorkstation),
+                nameof(AgentAuthority) => root.Deserialize(UIMessagesJsonContext.Default.AgentAuthority),
+                nameof(AgentCommandRequest) => root.Deserialize(UIMessagesJsonContext.Default.AgentCommandRequest),
+                nameof(RequestStateSnapshot) => root.Deserialize(UIMessagesJsonContext.Default.RequestStateSnapshot),
+                nameof(Ping) => root.Deserialize(UIMessagesJsonContext.Default.Ping),
                 _ => null,
             };
         }

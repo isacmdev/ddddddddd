@@ -21,7 +21,9 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
     private Policy? policySnapshot;
     private bool policySnapshotInitialized;
     private long policySnapshotRevision;
-
+    private bool policyQuarantined;
+    private string? policyQuarantineReason;
+    private const string SameVersionHashMismatchReason = "same_version_snapshot_hash_mismatch";
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -36,6 +38,28 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
         this.timeProvider = timeProvider;
     }
 
+    public bool IsPolicyQuarantined
+    {
+        get
+        {
+            lock (this.policySnapshotSync)
+            {
+                return this.policyQuarantined;
+            }
+        }
+    }
+
+    public string? PolicyQuarantineReason
+    {
+        get
+        {
+            lock (this.policySnapshotSync)
+            {
+                return this.policyQuarantineReason;
+            }
+        }
+    }
+
     // ── Policy persistence ──────────────────────────────────────────────
 
     /// <summary>
@@ -45,6 +69,18 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
     /// <returns>True if applied, false if discarded.</returns>
     public async Task<bool> UpsertPolicyAsync(Policy policy, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(policy);
+        try
+        {
+            policy.Validate();
+        }
+        catch (ArgumentException)
+        {
+            // Invalid remote input must not open a database transaction or
+            // publish a partially materialized policy.
+            return false;
+        }
+
         await this.policyGate.WaitAsync(ct);
         try
         {
@@ -55,6 +91,18 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
 
             if (existing != null && existing.Version >= policy.Version)
             {
+                if (existing.Version == policy.Version
+                    && !string.Equals(existing.SnapshotHash, policy.SnapshotHash, StringComparison.Ordinal))
+                {
+                    existing.IsQuarantined = true;
+                    existing.QuarantineReason = SameVersionHashMismatchReason;
+                    await db.SaveChangesAsync(ct);
+                    // The conflict is authoritative immediately after the durable
+                    // write. Do not leave the previous snapshot available to the
+                    // active enforcement process while the row is quarantined.
+                    this.SetPolicySnapshot(null, SameVersionHashMismatchReason);
+
+                }
                 return false;
             }
 
@@ -65,6 +113,9 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
             if (existing != null)
             {
                 existing.Version = policy.Version;
+                existing.SnapshotHash = policy.SnapshotHash;
+                existing.IsQuarantined = false;
+                existing.QuarantineReason = null;
                 existing.PolicyJson = policyJson;
                 existing.CategoryAssignmentsJson = categoryAssignmentsJson;
                 existing.LastUpdated = this.timeProvider.WallClockNow;
@@ -75,6 +126,7 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
                 {
                     DeviceId = policy.DeviceId,
                     Version = policy.Version,
+                    SnapshotHash = policy.SnapshotHash,
                     PolicyJson = policyJson,
                     CategoryAssignmentsJson = categoryAssignmentsJson,
                     LastUpdated = this.timeProvider.WallClockNow,
@@ -86,7 +138,7 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
             await PolicyRepository.SyncGrantsAsync(db, policy, ct);
 
             await db.SaveChangesAsync(ct);
-            this.PublishPolicySnapshot(policy);
+            this.SetPolicySnapshot(policy, null);
             return true;
         }
         finally
@@ -100,14 +152,6 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
     /// </summary>
     public async Task<Policy?> GetPolicyAsync(CancellationToken ct = default)
     {
-        lock (this.policySnapshotSync)
-        {
-            if (this.policySnapshotInitialized)
-            {
-                return this.policySnapshot;
-            }
-        }
-
         await this.policyGate.WaitAsync(ct);
         try
         {
@@ -121,10 +165,15 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
 
             await using var db = this.dbContextFactory.CreateDbContext();
             var entity = await db.Policies.AsNoTracking().FirstOrDefaultAsync(ct);
-            var policy = entity == null
+            // A conflicting rewrite is a durable quarantine. Never expose the
+            // previous snapshot to enforcement after restart or cache invalidation.
+            var policy = entity == null || entity.IsQuarantined
                 ? null
                 : JsonSerializer.Deserialize<Policy>(entity.PolicyJson, JsonOptions);
-            this.PublishPolicySnapshot(policy);
+            var quarantineReason = entity?.IsQuarantined == true
+                ? entity.QuarantineReason ?? SameVersionHashMismatchReason
+                : null;
+            this.SetPolicySnapshot(policy, quarantineReason);
             return policy;
         }
         finally
@@ -143,15 +192,18 @@ public sealed class PolicyRepository : IPolicyRepository, IDisposable
         }
     }
 
-    private void PublishPolicySnapshot(Policy? policy)
+    private void SetPolicySnapshot(Policy? policy, string? quarantineReason)
     {
         lock (this.policySnapshotSync)
         {
             this.policySnapshot = policy;
             this.policySnapshotInitialized = true;
+            this.policyQuarantined = quarantineReason is not null;
+            this.policyQuarantineReason = quarantineReason;
             this.policySnapshotRevision++;
         }
     }
+
 
     internal long PolicySnapshotRevision
     {

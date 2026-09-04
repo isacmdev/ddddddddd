@@ -284,7 +284,7 @@ public interface IBackendClient
 /// </summary>
 /// <param name="Success">Indica si el reporte se envió exitosamente.</param>
 /// <param name="Verdict">Veredicto del servidor: "trust", "revoked", o "unknown".</param>
-public sealed record IntegrityReportResult(bool Success, string? Verdict);
+public sealed record IntegrityReportResult(bool Success, string? Verdict, bool IsInvalidEnvelope = false);
 
 /// <summary>
 /// Entrada de log de uso.
@@ -409,6 +409,18 @@ public class TimeRequestEntry
     /// ID de la solicitud.
     /// </summary>
     public required string RequestId { get; init; }
+
+    /// <summary>Stable wire scope; never inferred by a transport caller.</summary>
+    public string? Scope { get; init; }
+
+    /// <summary>Origin of the request on the wire.</summary>
+    public string? Origin { get; init; }
+
+    /// <summary>Policy version observed when the request was created.</summary>
+    public ulong? PolicyVersion { get; init; }
+
+    /// <summary>Informational device identity carried by the wire request.</summary>
+    public Guid? DeviceId { get; init; }
 
     /// <summary>
     /// Minutos solicitados.

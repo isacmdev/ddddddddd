@@ -31,6 +31,7 @@ public partial class App : Application
     private static IServiceProvider? serviceProvider;
     private static OnboardingViewModel? viewModel;
     private static Microsoft.UI.Xaml.Window? mainWindow;
+    private static bool realtimeLifetimeStarted;
 
     /// <summary>
     /// Gets the service provider for DI.
@@ -99,6 +100,9 @@ public partial class App : Application
             mainWindow = new MainWindow(viewModel!);
             Log("MainWindow created, activating...");
             mainWindow.Activate();
+            _ = StartRealtimeLifetimeAsync().ContinueWith(
+                task => Log($"Realtime startup failed: {task.Exception?.GetBaseException().Message}"),
+                TaskScheduler.Default);
             Log("MainWindow activated OK");
         }
         catch (Exception ex)
@@ -117,6 +121,9 @@ public partial class App : Application
                 };
                 fallback.Activate();
                 mainWindow = fallback;
+                _ = StartRealtimeLifetimeAsync().ContinueWith(
+                task => Log($"Realtime startup failed: {task.Exception?.GetBaseException().Message}"),
+                TaskScheduler.Default);
                 Log("Fallback window shown");
             }
             catch (Exception ex2)
@@ -135,6 +142,27 @@ public partial class App : Application
         // of truth (ADR-002).
         services.AddSingleton<IUIChannel, NamedPipeUIChannel>();
         services.AddSingleton<IIpcOnboardingStateService, IpcOnboardingStateService>();
+        services.AddSingleton<IUIPipeClient, NamedPipeUIAdapter>();
+        services.AddSingleton<WindowLifecycleObserver>();
+        services.AddSingleton<IWindowLifecycleObserver>(sp => sp.GetRequiredService<WindowLifecycleObserver>());
+        services.AddSingleton<RealtimeIdentityBridge>();
+        services.AddSingleton<IRealtimeIdentityAuthority>(sp => sp.GetRequiredService<RealtimeIdentityBridge>());
+        services.AddSingleton<SupabaseRealtimeChannels>(sp =>
+            SupabaseRealtimeComposition.CreateFromEnvironment(
+                sp.GetRequiredService<IRealtimeIdentityAuthority>()));
+        services.AddSingleton<IRealtimeSubscriber>(sp =>
+        {
+            var channels = sp.GetRequiredService<SupabaseRealtimeChannels>();
+            var identityAuthority = sp.GetRequiredService<IRealtimeIdentityAuthority>();
+            return new RealtimeSubscriber(
+                channels.Policy,
+                channels.Grants,
+                sp.GetRequiredService<IWindowLifecycleObserver>(),
+                channels.DeviceId ?? string.Empty,
+                sp.GetRequiredService<IUIChannel>(),
+                identityAuthority);
+        });
+        services.AddSingleton<StatusViewModel>();
 
         // T26 PR #14 / Unit 2 — IPC-backed consent service. The App.UI never
         // writes a local consent cache; the Service persists the canonical
@@ -152,6 +180,88 @@ public partial class App : Application
             serviceProvider.GetRequiredService<WnsPushNotificationHandler>());
         services.AddSingleton<WnsRegistrationViewModel>();
         services.AddTransient<WnsRegistrationPage>();
+    }
+
+    private static async Task StartRealtimeLifetimeAsync()
+    {
+        if (realtimeLifetimeStarted || mainWindow is null || serviceProvider is null)
+        {
+            return;
+        }
+
+        await serviceProvider.GetRequiredService<RealtimeIdentityBridge>().StartAsync();
+        var identityBridge = serviceProvider.GetRequiredService<RealtimeIdentityBridge>();
+        var identityDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (identityBridge.Current is null && DateTimeOffset.UtcNow < identityDeadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+        var lifecycle = serviceProvider.GetRequiredService<WindowLifecycleObserver>();
+        var subscriber = serviceProvider.GetRequiredService<IRealtimeSubscriber>();
+        var statusViewModel = serviceProvider.GetRequiredService<StatusViewModel>();
+        realtimeLifetimeStarted = true;
+        mainWindow.Activated += OnMainWindowActivated;
+        mainWindow.Closed += (_, _) =>
+        {
+            mainWindow.Activated -= OnMainWindowActivated;
+            lifecycle.EnterBackground();
+            subscriber.Dispose();
+            statusViewModel.Dispose();
+            _ = DisposeRealtimeLifetimeAsync(subscriber, serviceProvider);
+        };
+        lifecycle.EnterForeground();
+        _ = InitializeStatusAsync(statusViewModel);
+    }
+
+    private static void OnMainWindowActivated(
+        object sender,
+        WindowActivatedEventArgs args)
+    {
+        _ = sender;
+        if (serviceProvider is null)
+        {
+            return;
+        }
+
+        var lifecycle = serviceProvider.GetRequiredService<WindowLifecycleObserver>();
+        if (args.WindowActivationState == WindowActivationState.Deactivated)
+        {
+            lifecycle.EnterBackground();
+        }
+        else
+        {
+            lifecycle.EnterForeground();
+        }
+    }
+
+    private static async Task InitializeStatusAsync(StatusViewModel statusViewModel)
+    {
+        try
+        {
+            await statusViewModel.InitializeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Log($"Realtime status initialization failed: {exception.Message}");
+        }
+    }
+
+    private static async Task DisposeRealtimeLifetimeAsync(
+        IRealtimeSubscriber subscriber,
+        IServiceProvider provider)
+    {
+        try
+        {
+            if (subscriber is RealtimeSubscriber realtimeSubscriber)
+            {
+                await realtimeSubscriber.LifecycleTask;
+            }
+            await provider.GetRequiredService<RealtimeIdentityBridge>().StopAsync();
+        }
+        finally
+        {
+            (provider as IDisposable)?.Dispose();
+        }
     }
 
     private static string FormatMainWindowStartupException(Exception exception)

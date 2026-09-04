@@ -25,7 +25,9 @@ using System.Text.Json.Serialization;
 /// etc.) carry the field as <c>string</c> on the wire, so the round-trip is
 /// symmetric on both sides of the pipe.
 /// </summary>
-[JsonSourceGenerationOptions(UseStringEnumConverter = true)]
+[JsonSourceGenerationOptions(
+    UseStringEnumConverter = true,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow)]
 [JsonSerializable(typeof(GetEnforcementLevel))]
 [JsonSerializable(typeof(EnforcementLevelResponse))]
 [JsonSerializable(typeof(EnforcementLevelCheck))]
@@ -44,6 +46,8 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(GrantInfo))]
 [JsonSerializable(typeof(ActiveIssue))]
 [JsonSerializable(typeof(TriggerSync))]
+[JsonSerializable(typeof(GetRealtimeIdentity))]
+[JsonSerializable(typeof(RealtimeIdentityResponse))]
 [JsonSerializable(typeof(PairDevice))]
 [JsonSerializable(typeof(PairDeviceResponse))]
 [JsonSerializable(typeof(ListAccounts))]

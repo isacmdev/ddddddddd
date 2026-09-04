@@ -22,6 +22,8 @@ public sealed class BackendIdentityAcceptancePackageTests
         Assert.Equal(first.PassedProbes, second.PassedProbes);
         Assert.Equal(first.EvidenceHash, second.EvidenceHash);
         Assert.False(first.ExternalVerified);
+        var receipt = new BackendIdentityContractV1Harness().Pair(PairingCase.ValidDeviceA, "external-verification-probe");
+        Assert.False(receipt.ExternalVerified);
         Assert.Equal("local", first.Mode);
         Assert.DoesNotContain("token", JsonSerializer.Serialize(first), StringComparison.OrdinalIgnoreCase);
     }

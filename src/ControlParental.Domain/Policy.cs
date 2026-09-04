@@ -50,6 +50,10 @@ public sealed record Policy
     [JsonPropertyName("version")]
     public int Version { get; init; }
 
+    /// <summary>Gets the server-authenticated content hash of this snapshot.</summary>
+    [JsonPropertyName("snapshot_hash")]
+    public string SnapshotHash { get; init; } = string.Empty;
+
     /// <summary>
     /// Gets the current device state: active, locked, downtime.
     /// </summary>

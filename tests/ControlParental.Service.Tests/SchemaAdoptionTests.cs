@@ -101,6 +101,23 @@ public sealed class SchemaAdoptionTests
         Assert.Equal(0, await ExecuteScalarAsync<long>(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version';"));
     }
 
+    [Fact]
+    public async Task FailedAdoption_RollsBackPolicyAndUsageColumnAdditions()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await ExecuteAsync(connection, "CREATE TABLE policies (device_id TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL, policy_json TEXT NOT NULL, last_updated TEXT NOT NULL, category_assignments_json TEXT NOT NULL);");
+        await ExecuteAsync(connection, "CREATE TABLE usage_today (app_id INTEGER NOT NULL, server_date TEXT NOT NULL, minutes INTEGER NOT NULL, last_updated TEXT NOT NULL, PRIMARY KEY(app_id, server_date));");
+        await ExecuteAsync(connection, "CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, dedup_key TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, last_attempt_at TEXT NULL, last_error TEXT NULL, status TEXT NULL DEFAULT 'bad');");
+        await using var db = NewDb(connection);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Program.InitializeDatabaseAsync(db));
+
+        Assert.DoesNotContain("snapshot_hash", await ReadTableColumnsAsync(connection, "policies"));
+        Assert.DoesNotContain("is_quarantined", await ReadTableColumnsAsync(connection, "policies"));
+        Assert.DoesNotContain("elapsed_seconds", await ReadTableColumnsAsync(connection, "usage_today"));
+    }
+
     [Theory]
     [InlineData("2")]
     [InlineData("0")]
@@ -467,6 +484,20 @@ public sealed class SchemaAdoptionTests
         while (await reader.ReadAsync())
         {
             result[reader.GetString(1)] = (reader.GetString(2), reader.IsDBNull(4) ? null : reader.GetString(4));
+        }
+
+        return result;
+    }
+
+    private static async Task<HashSet<string>> ReadTableColumnsAsync(SqliteConnection connection, string table)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({table});";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            result.Add(reader.GetString(1));
         }
 
         return result;

@@ -59,7 +59,13 @@ internal static class SqliteSchemaBootstrapper
         ("audit_reference", "TEXT", 0, null!),
     ];
 
-    public static async Task AdoptAsync(ControlParentalDbContext db, CancellationToken cancellationToken = default)
+    public static Task AdoptAsync(ControlParentalDbContext db, CancellationToken cancellationToken = default)
+        => AdoptAsync(db, cancellationToken, null);
+
+    internal static async Task AdoptAsync(
+        ControlParentalDbContext db,
+        CancellationToken cancellationToken,
+        Func<SqliteTransaction, CancellationToken, Task>? additionalMigrations)
     {
         var connection = (SqliteConnection)db.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
@@ -72,6 +78,9 @@ internal static class SqliteSchemaBootstrapper
             var tableInfo = await ReadTableInfoAsync(connection, transaction, "outbox", cancellationToken);
             var columns = tableInfo.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
             ValidateBaseSchema(tableInfo);
+            if (additionalMigrations is not null)
+                await additionalMigrations(transaction, cancellationToken);
+
             if (hasCurrentMarker)
             {
                 ValidateCurrentPhysicalSchema(columns);

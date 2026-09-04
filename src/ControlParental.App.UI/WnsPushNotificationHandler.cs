@@ -16,6 +16,7 @@ using System.Text;
 using System.Text.Json;
 using ControlParental.App.UI.Interop;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
 using Microsoft.Windows.PushNotifications;
 using Windows.Foundation.Metadata;
 
@@ -202,7 +203,12 @@ public sealed class WnsPushNotificationHandler : IDisposable, IWnsRegistrationPo
         ReadOnlyMemory<byte> rawPayload,
         CancellationToken cancellationToken = default)
     {
-        _ = rawPayload;
+        if (rawPayload.IsEmpty
+            || !WireContractCodec.DecodeAndValidate(rawPayload.Span, WireContractCatalog.WnsHint).IsValid)
+        {
+            return Task.CompletedTask;
+        }
+
         return this.SendTriggerSyncAsync(cancellationToken);
     }
 
@@ -246,13 +252,36 @@ public sealed class WnsPushNotificationHandler : IDisposable, IWnsRegistrationPo
         {
             try
             {
-                await this.HandleRawNotificationAsync(ReadOnlyMemory<byte>.Empty, this.cts.Token).ConfigureAwait(false);
+                var rawPayload = ExtractRawPayload(args);
+                await this.HandleRawNotificationAsync(rawPayload, this.cts.Token).ConfigureAwait(false);
             }
             finally
             {
                 deferral?.Complete();
             }
         });
+    }
+
+    private static ReadOnlyMemory<byte> ExtractRawPayload(object args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        foreach (var propertyName in new[] { "Payload", "RawNotification", "Content" })
+        {
+            var value = args.GetType().GetProperty(propertyName)?.GetValue(args);
+            switch (value)
+            {
+                case byte[] bytes:
+                    return bytes;
+                case ReadOnlyMemory<byte> memory:
+                    return memory;
+                case Memory<byte> writableMemory:
+                    return writableMemory;
+                case string text:
+                    return Encoding.UTF8.GetBytes(text);
+            }
+        }
+
+        return ReadOnlyMemory<byte>.Empty;
     }
 
     /// <summary>

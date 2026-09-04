@@ -104,7 +104,7 @@ public class RealtimeSubscriberTests : IDisposable
     }
 
     [Fact]
-    public async Task PolicyBroadcast_FiresPolicyChangedWithCorrectVersion()
+    public async Task LegacyPolicyBroadcast_IsIgnored()
     {
         // Arrange
         this.lifecycle.SimulateEnterForeground();
@@ -121,12 +121,11 @@ public class RealtimeSubscriberTests : IDisposable
         });
 
         // Assert
-        receivedArgs.Should().NotBeNull();
-        receivedArgs!.NewVersion.Should().Be(5);
+        receivedArgs.Should().BeNull();
     }
 
     [Fact]
-    public async Task GrantBroadcast_FiresGrantsChangedWithCorrectData()
+    public async Task LegacyGrantBroadcast_IsIgnored()
     {
         // Arrange
         this.lifecycle.SimulateEnterForeground();
@@ -144,9 +143,28 @@ public class RealtimeSubscriberTests : IDisposable
         });
 
         // Assert
-        receivedArgs.Should().NotBeNull();
-        receivedArgs!.GrantId.Should().Be("g1");
-        receivedArgs.IsApproved.Should().BeTrue();
+        receivedArgs.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task MalformedHintBroadcast_DoesNotApplyState()
+    {
+        this.lifecycle.SimulateEnterForeground();
+        var subscriber = this.CreateSubscriber();
+        await subscriber.ConnectAsync();
+        var policyChanged = 0;
+        subscriber.PolicyChanged += (_, _) => policyChanged++;
+
+        this.policyChannel.FireBroadcast(new Dictionary<string, object?>
+        {
+            ["contract"] = "control-parental.windows",
+            ["version"] = 1,
+            ["message_type"] = "realtime.hint",
+            ["correlation_id"] = "00000000-0000-4000-8000-000000000030",
+            ["payload"] = new Dictionary<string, object?> { ["unknown"] = true },
+        });
+
+        policyChanged.Should().Be(0);
     }
 
     [Fact]
@@ -183,6 +201,182 @@ public class RealtimeSubscriberTests : IDisposable
         act.Should().NotThrow();
         act = () => this.grantsChannel.FireBroadcast(new Dictionary<string, object?>());
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public async Task ConcurrentHints_CoalesceIntoOnePull()
+    {
+        this.lifecycle.SimulateEnterForeground();
+        var pullStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pullCount = 0;
+        this.subscriber = new RealtimeSubscriber(
+            this.policyChannel,
+            this.grantsChannel,
+            this.lifecycle,
+            this.deviceId,
+            _ =>
+            {
+                Interlocked.Increment(ref pullCount);
+                pullStarted.SetResult(true);
+                return releasePull.Task;
+            });
+        await this.subscriber.ConnectAsync();
+        var hint = new Dictionary<string, object?>
+        {
+            ["contract"] = "control-parental.windows", ["version"] = 1,
+            ["message_type"] = "realtime.hint",
+            ["correlation_id"] = "00000000-0000-4000-8000-000000000030",
+            ["payload"] = new Dictionary<string, object?> { ["hint_type"] = "sync" },
+        };
+
+        this.policyChannel.FireBroadcast(hint);
+        await pullStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        this.grantsChannel.FireBroadcast(hint);
+        this.policyChannel.FireBroadcast(hint);
+        releasePull.SetResult(true);
+        await Task.Delay(50);
+
+        Assert.Equal(2, pullCount);
+    }
+
+    [Fact]
+    public async Task PendingHint_IsRetriedAfterTheInFlightPullFails()
+    {
+        this.lifecycle.SimulateEnterForeground();
+        var pullStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failPull = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pullCount = 0;
+        this.subscriber = new RealtimeSubscriber(
+            this.policyChannel,
+            this.grantsChannel,
+            this.lifecycle,
+            this.deviceId,
+            _ =>
+            {
+                if (Interlocked.Increment(ref pullCount) == 1)
+                {
+                    pullStarted.SetResult(true);
+                    return failPull.Task;
+                }
+
+                return Task.CompletedTask;
+            });
+        await this.subscriber.ConnectAsync();
+        var hint = new Dictionary<string, object?>
+        {
+            ["contract"] = "control-parental.windows", ["version"] = 1,
+            ["message_type"] = "realtime.hint",
+            ["correlation_id"] = "00000000-0000-4000-8000-000000000030",
+            ["payload"] = new Dictionary<string, object?> { ["hint_type"] = "sync" },
+        };
+
+        this.policyChannel.FireBroadcast(hint);
+        await pullStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        this.grantsChannel.FireBroadcast(hint);
+        failPull.SetException(new InvalidOperationException("offline"));
+
+        for (var attempt = 0; attempt < 100 && Volatile.Read(ref pullCount) < 2; attempt++)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(2, pullCount);
+    }
+
+    [Fact]
+    public async Task PendingHint_ExpiresAfterFifteenMinutesWithoutRetry()
+    {
+        this.lifecycle.SimulateEnterForeground();
+        var now = DateTimeOffset.Parse("2026-09-03T12:00:00Z");
+        var pullStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failPull = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pullCount = 0;
+        this.subscriber = new RealtimeSubscriber(
+            this.policyChannel,
+            this.grantsChannel,
+            this.lifecycle,
+            this.deviceId,
+            _ =>
+            {
+                if (Interlocked.Increment(ref pullCount) == 1)
+                {
+                    pullStarted.SetResult(true);
+                    return failPull.Task;
+                }
+
+                return Task.CompletedTask;
+            },
+            () => now);
+        await this.subscriber.ConnectAsync();
+        var hint = new Dictionary<string, object?>
+        {
+            ["contract"] = "control-parental.windows", ["version"] = 1,
+            ["message_type"] = "realtime.hint",
+            ["correlation_id"] = "00000000-0000-4000-8000-000000000030",
+            ["payload"] = new Dictionary<string, object?> { ["hint_type"] = "sync" },
+        };
+
+        this.policyChannel.FireBroadcast(hint);
+        await pullStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        this.grantsChannel.FireBroadcast(hint);
+        now = now.AddMinutes(15);
+        failPull.SetException(new InvalidOperationException("offline"));
+        await Task.Delay(100);
+
+        Assert.Equal(1, pullCount);
+    }
+
+    [Fact]
+    public async Task IdentityRotation_ReconnectsWithTheCurrentAuthorityGeneration()
+    {
+        var authority = new MutableRealtimeIdentityAuthority(
+            new RealtimeIdentitySnapshot("token-one", this.deviceId, 1));
+        var policy = new CountingFakeRealtimeChannel();
+        var grants = new CountingFakeRealtimeChannel();
+        this.lifecycle.SimulateEnterForeground();
+        using var subscriber = new RealtimeSubscriber(
+            policy,
+            grants,
+            this.lifecycle,
+            this.deviceId,
+            syncPull: null,
+            clock: null,
+            identityAuthority: authority);
+
+        await subscriber.ConnectAsync();
+        authority.Current = new RealtimeIdentitySnapshot("token-two", this.deviceId, 2);
+        authority.RaiseChanged();
+        await subscriber.LifecycleTask;
+
+        subscriber.IsConnected.Should().BeTrue();
+        (policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((2, 2));
+    }
+
+    [Fact]
+    public async Task IdentityRevocation_DoesNotReconnectUntilAuthorityReturns()
+    {
+        var authority = new MutableRealtimeIdentityAuthority(
+            new RealtimeIdentitySnapshot("token-one", this.deviceId, 1));
+        var policy = new CountingFakeRealtimeChannel();
+        var grants = new CountingFakeRealtimeChannel();
+        this.lifecycle.SimulateEnterForeground();
+        using var subscriber = new RealtimeSubscriber(
+            policy,
+            grants,
+            this.lifecycle,
+            this.deviceId,
+            syncPull: null,
+            clock: null,
+            identityAuthority: authority);
+
+        await subscriber.ConnectAsync();
+        authority.Current = null;
+        authority.RaiseChanged();
+        await subscriber.LifecycleTask;
+
+        subscriber.IsConnected.Should().BeFalse();
+        (policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((1, 1));
     }
 
     [Fact]
@@ -225,7 +419,7 @@ public class RealtimeSubscriberTests : IDisposable
         policy.FireLateBroadcast(new() { { "version", 1 } }); grants.FireLateBroadcast(new() { { "grant_id", "old" }, { "is_approved", true } });
         policy.FireBroadcast(new() { { "version", 2 } }); grants.FireBroadcast(new() { { "grant_id", "new" }, { "is_approved", true } });
         policy.FireBroadcast(new()); grants.FireBroadcast(new());
-        (policies, grantsSeen).Should().Be((1, 1));
+        (policies, grantsSeen).Should().Be((0, 0));
         (policy.SubscribeCallCount, grants.SubscribeCallCount).Should().Be((2, 2));
     }
 
@@ -313,5 +507,19 @@ public class RealtimeSubscriberTests : IDisposable
 
         private static TaskCompletionSource<bool> NewSignal() =>
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private sealed class MutableRealtimeIdentityAuthority : IRealtimeIdentityAuthority
+    {
+        public MutableRealtimeIdentityAuthority(RealtimeIdentitySnapshot current)
+        {
+            this.Current = current;
+        }
+
+        public RealtimeIdentitySnapshot? Current { get; set; }
+
+        public event EventHandler? Changed;
+
+        public void RaiseChanged() => this.Changed?.Invoke(this, EventArgs.Empty);
     }
 }

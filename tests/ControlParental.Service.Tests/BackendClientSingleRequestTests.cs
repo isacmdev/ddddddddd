@@ -188,22 +188,20 @@ public class BackendClientSingleRequestTests
             },
             CancellationToken.None);
 
-        Assert.True(result.Success);
-        Assert.Equal("trust", result.Verdict);
+        Assert.False(result.Success);
+        Assert.Null(result.Verdict);
         Assert.Equal(1, requestCount);
         Assert.NotNull(capturedBody);
-        Assert.Contains("\"report_hash\":\"HASH\"", capturedBody!);
-        Assert.Contains("\"binary_hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"", capturedBody!);
-        Assert.Contains("\"signature_valid\":true", capturedBody!);
+        Assert.Contains("\"evidence_id\"", capturedBody!);
+        Assert.Contains("\"binary_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"", capturedBody!);
+        Assert.Contains("\"signature_result\":\"valid\"", capturedBody!);
 
         using var doc = JsonDocument.Parse(capturedBody!);
-        var payload = doc.RootElement;
-        Assert.Equal("HASH", payload.GetProperty("report_hash").GetString());
+        var payload = doc.RootElement.GetProperty("payload");
         Assert.Equal("1.0.0", payload.GetProperty("agent_version").GetString());
-        Assert.Equal("windows", payload.GetProperty("platform").GetString());
-        Assert.Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload.GetProperty("binary_hash").GetString());
-        Assert.True(payload.GetProperty("signature_valid").GetBoolean());
-        Assert.False(string.IsNullOrWhiteSpace(payload.GetProperty("timestamp").GetString()));
+        Assert.Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload.GetProperty("binary_sha256").GetString());
+        Assert.Equal("valid", payload.GetProperty("signature_result").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(payload.GetProperty("collected_at").GetString()));
     }
 
     [Fact]
@@ -234,6 +232,67 @@ public class BackendClientSingleRequestTests
             CancellationToken.None);
 
         Assert.False(result.Success);
-        Assert.Equal(1, requestCount);
+        Assert.Equal(0, requestCount);
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_BareVerdictIsRejectedWithoutTrustDecision()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"verdict\":\"trust\"}"),
+            });
+
+        var sut = new BackendClient(
+            new HttpClient(handlerMock.Object),
+            "https://example.supabase.co",
+            this._deviceAuthenticatorMock.Object);
+
+        var result = await sut.ReportIntegrityAsync(new IntegrityReport
+        {
+            ReportHash = "HASH",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            SignatureValid = true,
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        });
+
+        Assert.False(result.Success);
+        Assert.Null(result.Verdict);
+        Assert.True(result.IsInvalidEnvelope);
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_EmptySuccessfulResponseIsNonDefinitiveNotTransportFailure()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent(string.Empty) });
+
+        var sut = new BackendClient(
+            new HttpClient(handlerMock.Object),
+            "https://example.supabase.co",
+            this._deviceAuthenticatorMock.Object);
+
+        var result = await sut.ReportIntegrityAsync(new IntegrityReport
+        {
+            ReportHash = "HASH",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            SignatureValid = true,
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        });
+
+        Assert.False(result.Success);
+        Assert.Null(result.Verdict);
+        Assert.True(result.IsInvalidEnvelope);
     }
 }

@@ -20,6 +20,7 @@ public sealed class UIMessageHandler
     private readonly ILogger<UIMessageHandler> logger;
     private readonly IWnsRegistrationCoordinator? wnsRegistrationCoordinator;
     private readonly IScheduledWorkService? scheduledWorkService;
+    private readonly BackendRealtimeIdentityAuthority? realtimeIdentityAuthority;
     private Func<IIpcMessage, CancellationToken, Task>? sendToAgentAsync;
 
     public UIMessageHandler(
@@ -28,7 +29,8 @@ public sealed class UIMessageHandler
         IServiceScopeFactory scopeFactory,
         ILogger<UIMessageHandler> logger,
         IWnsRegistrationCoordinator? wnsRegistrationCoordinator = null,
-        IScheduledWorkService? scheduledWorkService = null)
+        IScheduledWorkService? scheduledWorkService = null,
+        BackendRealtimeIdentityAuthority? realtimeIdentityAuthority = null)
     {
         this.onboardingStateService = onboardingStateService;
         this.enforcementLevelQueryHandler = enforcementLevelQueryHandler;
@@ -36,6 +38,7 @@ public sealed class UIMessageHandler
         this.logger = logger;
         this.wnsRegistrationCoordinator = wnsRegistrationCoordinator;
         this.scheduledWorkService = scheduledWorkService;
+        this.realtimeIdentityAuthority = realtimeIdentityAuthority;
     }
 
     /// <summary>
@@ -138,6 +141,33 @@ public sealed class UIMessageHandler
                     .ConfigureAwait(false);
                 return new StepCompletedResponse(
                     admission is SyncAdmissionResult.Accepted or SyncAdmissionResult.Coalesced);
+
+            case GetRealtimeIdentity request:
+                if (!isAuthenticatedPipeClient || this.realtimeIdentityAuthority is null)
+                {
+                    return new RealtimeIdentityResponse(false, null, null, 0, default, "forbidden")
+                    {
+                        CorrelationId = request.CorrelationId,
+                    };
+                }
+
+                var refreshError = await this.realtimeIdentityAuthority.RefreshAsync(ct).ConfigureAwait(false);
+                var identity = this.realtimeIdentityAuthority.Current;
+                return refreshError != BackendIdentityErrorV1.None || identity is null
+                    ? new RealtimeIdentityResponse(false, null, null, 0, default, refreshError.ToString().ToLowerInvariant())
+                    {
+                        CorrelationId = request.CorrelationId,
+                    }
+                    : new RealtimeIdentityResponse(
+                        true,
+                        identity.AccessToken,
+                        identity.DeviceId,
+                        identity.Generation,
+                        identity.ExpiresAt,
+                        "none")
+                    {
+                        CorrelationId = request.CorrelationId,
+                    };
 
             default:
                 System.Diagnostics.Debug.WriteLine(

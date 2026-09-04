@@ -26,7 +26,9 @@ using ControlParental.Domain;
 /// so we reference the Domain context's metadata via this attribute list
 /// rather than redefining the records here.
 /// </summary>
-[JsonSourceGenerationOptions(UseStringEnumConverter = true)]
+[JsonSourceGenerationOptions(
+    UseStringEnumConverter = true,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow)]
 [JsonSerializable(typeof(ControlParental.App.UI.GetEnforcementLevel))]
 [JsonSerializable(typeof(ControlParental.App.UI.EnforcementLevelResponse))]
 [JsonSerializable(typeof(ControlParental.App.UI.EnforcementLevelCheck))]
@@ -45,6 +47,8 @@ using ControlParental.Domain;
 [JsonSerializable(typeof(GrantInfo))]
 [JsonSerializable(typeof(ActiveIssue))]
 [JsonSerializable(typeof(TriggerSync))]
+[JsonSerializable(typeof(ControlParental.Domain.GetRealtimeIdentity))]
+[JsonSerializable(typeof(ControlParental.Domain.RealtimeIdentityResponse))]
 [JsonSerializable(typeof(ControlParental.App.UI.PairDevice))]
 [JsonSerializable(typeof(ControlParental.App.UI.PairDeviceResponse))]
 [JsonSerializable(typeof(ControlParental.App.UI.ListAccounts))]

@@ -32,6 +32,18 @@ public sealed class NamedPipeUIServerDeserializeTests
     }
 
     [Fact]
+    public void DeserializeMessage_GetRealtimeIdentity_NotNull()
+    {
+        var original = new GetRealtimeIdentity();
+        var json = JsonSerializer.Serialize(original, UIMessagesJsonContext.Default.GetRealtimeIdentity);
+
+        var deserialized = DeserializeThroughServer(json);
+
+        Assert.NotNull(deserialized);
+        Assert.IsType<GetRealtimeIdentity>(deserialized);
+    }
+
+    [Fact]
     public void DeserializeMessage_AdvanceOnboardingStep_NotNull()
     {
         // Arrange
@@ -111,6 +123,26 @@ public sealed class NamedPipeUIServerDeserializeTests
         var deserialized = DeserializeThroughServer(unknown);
 
         // Assert
+        Assert.Null(deserialized);
+    }
+
+    [Fact]
+    public void DeserializeMessage_UnknownMember_ReturnsNull()
+    {
+        var json = "{\"MessageType\":\"TriggerSync\",\"unexpected\":true}";
+
+        var deserialized = DeserializeThroughServer(json);
+
+        Assert.Null(deserialized);
+    }
+
+    [Fact]
+    public void DeserializeMessage_NonStringMessageType_ReturnsNull()
+    {
+        var json = "{\"MessageType\":123}";
+
+        var deserialized = DeserializeThroughServer(json);
+
         Assert.Null(deserialized);
     }
 
