@@ -104,9 +104,12 @@ public sealed class CertificatePinningPolicy : ITlsPolicy
 
         foreach (var candidate in candidates)
         {
+            var normalizedCandidate = candidate.StartsWith("sha256/", StringComparison.Ordinal)
+                ? candidate[7..]
+                : candidate;
             try
             {
-                if (Convert.FromBase64String(candidate).Length != Sha256Bytes)
+                if (Convert.FromBase64String(normalizedCandidate).Length != Sha256Bytes)
                 {
                     throw new ArgumentException("TLS pin configuration is invalid.", nameof(configuredPins));
                 }
@@ -116,7 +119,7 @@ public sealed class CertificatePinningPolicy : ITlsPolicy
                 throw new ArgumentException("TLS pin configuration is invalid.", nameof(configuredPins), exception);
             }
 
-            _ = pins.Add(candidate);
+            _ = pins.Add(normalizedCandidate);
         }
 
         return pins;
