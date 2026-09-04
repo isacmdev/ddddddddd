@@ -89,6 +89,15 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(FunnelEventType))]
 [JsonSerializable(typeof(GrantSource))]
 [JsonSerializable(typeof(PairingStatus))]
+[JsonSerializable(typeof(ContractEnvelope))]
+[JsonSerializable(typeof(ContractHint))]
+[JsonSerializable(typeof(SetProtectedAccountRequest))]
+[JsonSerializable(typeof(SetProtectedAccountResponse))]
+[JsonSerializable(typeof(RuntimeActivationState))]
+[JsonSerializable(typeof(CreateTimeRequest))]
+[JsonSerializable(typeof(TimeRequestOutbox))]
+[JsonSerializable(typeof(IntegrityEvidence))]
+[JsonSerializable(typeof(IntegrityVerdict))]
 public sealed partial class UIMessagesJsonContext : JsonSerializerContext
 {
 }

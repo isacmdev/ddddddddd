@@ -9,7 +9,7 @@
 - [x] Specify IntegrityEvidence/Verdict and backend-only authority.
 - [x] Specify WNS/Realtime signal-only behavior and lifecycle convergence.
 - [x] Fix numeric wire limits, required/optional members, extension semantics, canonical JSON fixtures, and ownership handoff.
-- [x] Contract Pre-lane (`device-sync-identity`) freezes the Domain/JSON/CT contract surface and fixture manifest; implementation of `src/ControlParental.Domain/**` and CT-01..CT-12 remains a downstream task **before** lanes A/B/C. Lanes A/B/C consume these contracts and do not redefine them.
+- [x] Contract Pre-lane (`device-sync-identity`) implements and freezes `src/ControlParental.Domain/**`, source-generated JSON metadata, fixtures, and CT-01..CT-12. It must integrate into the canonical base before any parallel lane is created. Lane A is runtime, B is App.UI/status, C is SessionAgent/overlay; D preserves root `Build-MSIX.ps1`.
 - [ ] Backend acceptance adds live two-device JWT/RLS, atomic approval, deduplication, and WNS signal-only tests; these remain external and cannot be claimed by this change.
 
 ## Acceptance test matrix
@@ -17,7 +17,7 @@
 | ID | Executable command / fixture | Expected |
 |---|---|---|
 | CT-01 | `dotnet test --filter FullyQualifiedName~CT01` | Every v1 contract round-trips with stable snake_case and source-generated metadata |
-| CT-02 | `dotnet test --filter FullyQualifiedName~CT02` + `fixtures/invalid-*.json` | Unknown major/enum, missing required, unknown non-extension member, and oversized input reject without side effect |
+| CT-02 | `dotnet test --filter FullyQualifiedName~CT02` + every `fixtures/invalid-*.json` (`invalid-major`, `invalid-enum`, `invalid-missing-required`, `invalid-unknown-required-member`, `invalid-envelope-oversize`, `invalid-reason-too-long`, `invalid-depth`, `invalid-array-too-long`, `invalid-string-too-long`, `invalid-extensions`, `invalid-timestamp-future`, `invalid-minutes-too-high`, `invalid-hint-member`, `invalid-hint-1025`) | Each negative has exactly one declared cause and rejects without side effect |
 | CT-03 | `dotnet test --filter FullyQualifiedName~CT03` | Account ACK then restart; one durable selection; same retry result; conflict rejected |
 | CT-04 | `dotnet test --filter FullyQualifiedName~CT04` | `degraded`/`failed`; onboarding incomplete; cached enforcement remains |
 | CT-05 | `dotnet test --filter FullyQualifiedName~CT05` | One `(device_generation, request_id)` key; truthful state; no inferred approval |
