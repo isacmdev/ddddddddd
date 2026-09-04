@@ -6,7 +6,7 @@
 
 ## Closure Decision
 
-C1B2 stale/fault hardening is runtime-complete and ready for commit authorization. The final blocker from `c1b2-independent-final-report.md` is closed: a cancellation-ignoring startup `LoadAsync` now has deterministic success and fault cases that complete after direct `StopAsync()`.
+C1B2 stale/fault hardening is runtime-complete and ready for commit authorization. The final blocker from [`history/c1b2-independent-final-report.md`](history/c1b2-independent-final-report.md) is closed: a cancellation-ignoring startup `LoadAsync` now has deterministic success and fault cases that complete after direct `StopAsync()`.
 
 The success case returns a valid pending durable state and proves that the stale generation does not restore it into the owner, reconcile effects, Save progress, execute a reaction, enqueue a notification, or continue to a backend integrity check. The matching fault case proves that a stale Load failure is suppressed rather than surfaced by Stop. Both cases pass at runtime, and fresh coverage records both outcomes of the post-Load generation guard at `AntiTamperMonitor.cs:343` (`2/2`).
 
