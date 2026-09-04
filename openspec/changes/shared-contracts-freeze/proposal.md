@@ -2,7 +2,7 @@
 
 ## Intent
 
-Freeze the cross-process and backend-facing contracts required before parallel Windows lanes start. This is a specification-only change: it does not implement pairing, runtime activation, time requests, synchronization, JWT, RLS, WNS, or integrity verification.
+Freeze and implement the cross-process and backend-facing contracts required before parallel Windows lanes start. The Contract Pre-lane owns source-generated Domain types, JSON contexts, fixtures, and CT-01..CT-12; no parallel lane may be created until this lane is integrated into the canonical base.
 
 ## Authority and scope
 
@@ -17,7 +17,7 @@ In scope:
 
 Out of scope:
 
-- Source-code implementation or migrations.
+- Backend migrations and live external integration (the Domain contract implementation and local acceptance suite are in scope).
 - Changes to the backlog, existing APIs, or archived receipts.
 - Live Supabase, WNS, Realtime, staging, or Windows-matrix claims.
 
@@ -33,4 +33,4 @@ Local contract tests may establish `contract-first` conformance only. They MUST 
 
 Before lanes A/B/C start, the single Contract Pre-lane (`device-sync-identity`) owns `src/ControlParental.Domain/**`, all JSON contexts/fixtures, and CT-01 through CT-12. Those lanes consume the frozen output and cannot introduce parallel definitions. Lane D uses the repository-root `Build-MSIX.ps1`; `build/installer/**` is an additional installer scope, not a replacement path.
 
-The v1 wire contract is bounded: 65,536 UTF-8 bytes per envelope, 49,152 bytes per payload, 16 nesting levels, 256 array items, 4,096 bytes per ordinary string, 256 bytes for `reason`, 1–180 for `minutes`, RFC3339 UTC seconds timestamps with a 300-second future validation tolerance and 24-hour maximum age, and 1,024-byte WNS/Realtime hints. Unknown members are rejected unless they are namespaced under optional `extensions` (`x-...`, max 8 keys/8,192 bytes), whose contents are ignored and never authoritative. Canonical valid and invalid JSON examples live under `fixtures/`; field-level rules are normative in `design.md`, with no alternate future-skew rule.
+The v1 wire contract is bounded: 65,536 UTF-8 bytes per envelope, 49,152 bytes per payload, 16 nesting levels, 256 array items, 4,096 bytes per ordinary string, 256 bytes for `reason`, 1–180 for `minutes`, RFC3339 UTC seconds timestamps with a 300-second future validation tolerance and 24-hour maximum age, and 1,024-byte complete WNS/Realtime hint messages measured before transport framing. Unknown members are rejected unless they are namespaced under optional `extensions` (`x-...`, max 8 keys/8,192 bytes), whose contents are ignored and never authoritative. Canonical valid and invalid JSON examples live under `fixtures/`; field-level rules are normative in `design.md`, with no alternate future-skew rule.
