@@ -55,7 +55,18 @@ public sealed class RealtimeIdentityBridgeTests
         public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
             where TQuery : ControlParental.Domain.IUIMessage
             where TResponse : class, ControlParental.Domain.IUIMessage
-            => Task.FromResult(this.Response as TResponse);
+        {
+            if (query is GetRealtimeIdentity request && this.Response is RealtimeIdentityResponse response)
+            {
+                return Task.FromResult((response with
+                {
+                    ContractVersion = request.ContractVersion,
+                    CorrelationId = request.CorrelationId,
+                }) as TResponse);
+            }
+
+            return Task.FromResult(this.Response as TResponse);
+        }
         public Task SendAsync<T>(T message, CancellationToken ct = default) where T : ControlParental.Domain.IUIMessage
             => Task.CompletedTask;
     }

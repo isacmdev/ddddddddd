@@ -60,8 +60,22 @@ public sealed class NamedPipeUIServer : IDisposable
         SecurityIdentifier? parentSid,
         SecurityIdentifier? childSid,
         ILogger<NamedPipeUIServer> logger)
+        : this(parentSid, childSid, logger, $"{PipeNamePrefix}.{UIPPipeName}")
     {
-        this.pipeName = $"{PipeNamePrefix}.{UIPPipeName}";
+    }
+
+    /// <summary>
+    /// Initializes a testable instance with an isolated pipe name.
+    /// </summary>
+    internal NamedPipeUIServer(
+        SecurityIdentifier? parentSid,
+        SecurityIdentifier? childSid,
+        ILogger<NamedPipeUIServer> logger,
+        string pipeName)
+    {
+        this.pipeName = string.IsNullOrWhiteSpace(pipeName)
+            ? throw new ArgumentException("Pipe name is required.", nameof(pipeName))
+            : pipeName;
         this.parentSid = parentSid;
         this.childSid = childSid;
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));

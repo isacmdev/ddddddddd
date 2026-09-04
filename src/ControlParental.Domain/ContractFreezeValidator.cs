@@ -53,7 +53,7 @@ public static class ContractFreezeValidator
             if (type is "wns.hint" or "realtime.hint")
             {
                 var keys = payload.EnumerateObject().Select(p => p.Name).ToHashSet(StringComparer.Ordinal);
-                if (!keys.IsSubsetOf(new[] { "hint_type", "correlation_hint" }) || keys.Count == 0) errors.Add("hint payload is not signal-only");
+                if (!keys.IsSubsetOf(new[] { "hint_type", "correlation_hint", "extensions" }) || keys.Count == 0) errors.Add("hint payload is not signal-only");
                 if (wireBytes > 1_024) errors.Add("hint exceeds 1024 UTF-8 bytes");
             }
             if (type == "create_time_request")

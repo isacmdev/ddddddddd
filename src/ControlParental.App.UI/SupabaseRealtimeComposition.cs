@@ -50,6 +50,15 @@ public sealed class UnavailableRealtimeIdentityAuthority : IRealtimeIdentityAuth
 /// </summary>
 public sealed class SupabaseRealtimeChannels : IDisposable
 {
+    private readonly object sync = new();
+    private IRealtimeChannel policy;
+    private IRealtimeChannel grants;
+    private string? deviceId;
+    private Action? disposeTransport;
+    private IRealtimeIdentityAuthority? identityAuthority;
+    private EventHandler? identityChanged;
+    private int disposed;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="SupabaseRealtimeChannels"/> class.
     /// </summary>
@@ -67,42 +76,136 @@ public sealed class SupabaseRealtimeChannels : IDisposable
         string? deviceId,
         Action? disposeTransport)
     {
-        this.Policy = policy ?? throw new ArgumentNullException(nameof(policy));
-        this.Grants = grants ?? throw new ArgumentNullException(nameof(grants));
+        this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        this.grants = grants ?? throw new ArgumentNullException(nameof(grants));
         this.disposeTransport = disposeTransport;
-        this.DeviceId = deviceId;
+        this.deviceId = deviceId;
     }
-
-    private readonly Action? disposeTransport;
-    private int disposed;
 
     /// <summary>
     /// Gets the device-scoped policy channel.
     /// </summary>
-    public IRealtimeChannel Policy { get; }
+    public IRealtimeChannel Policy
+    {
+        get { lock (this.sync) return this.policy; }
+    }
 
     /// <summary>
     /// Gets the device-scoped grants channel.
     /// </summary>
-    public IRealtimeChannel Grants { get; }
+    public IRealtimeChannel Grants
+    {
+        get { lock (this.sync) return this.grants; }
+    }
 
     /// <summary>
     /// Gets the device identity extracted from the validated backend-issued
     /// access token. It is null for fail-closed channels and test-only channel sets.
     /// </summary>
-    public string? DeviceId { get; }
+    public string? DeviceId
+    {
+        get { lock (this.sync) return this.deviceId; }
+    }
+
+    internal void ObserveIdentityChanges(
+        IRealtimeIdentityAuthority authority,
+        Func<SupabaseRealtimeChannels> replacementFactory)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        ArgumentNullException.ThrowIfNull(replacementFactory);
+
+        EventHandler handler = (_, _) =>
+        {
+            if (authority.Current is not null)
+            {
+                this.ReplaceWith(replacementFactory());
+            }
+        };
+        lock (this.sync)
+        {
+            ObjectDisposedException.ThrowIf(this.disposed != 0, this);
+            this.identityAuthority = authority;
+            this.identityChanged = handler;
+        }
+
+        authority.Changed += handler;
+    }
+
+    private void ReplaceWith(SupabaseRealtimeChannels replacement)
+    {
+        IRealtimeChannel? oldPolicy = null;
+        IRealtimeChannel? oldGrants = null;
+        Action? oldDisposeTransport = null;
+        var rejectReplacement = false;
+
+        lock (this.sync)
+        {
+            if (this.disposed != 0)
+            {
+                rejectReplacement = true;
+            }
+            else
+            {
+                lock (replacement.sync)
+                {
+                    replacement.disposed = 1;
+                    oldPolicy = this.policy;
+                    oldGrants = this.grants;
+                    oldDisposeTransport = this.disposeTransport;
+                    this.policy = replacement.policy;
+                    this.grants = replacement.grants;
+                    this.deviceId = replacement.deviceId;
+                    this.disposeTransport = replacement.disposeTransport;
+                    replacement.disposeTransport = null;
+                }
+            }
+        }
+
+        if (rejectReplacement)
+        {
+            replacement.Dispose();
+            return;
+        }
+
+        oldPolicy!.Dispose();
+        oldGrants!.Dispose();
+        oldDisposeTransport?.Invoke();
+    }
 
     /// <inheritdoc />
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref this.disposed, 1) != 0)
+        IRealtimeChannel policyToDispose;
+        IRealtimeChannel grantsToDispose;
+        Action? transportToDispose;
+        IRealtimeIdentityAuthority? authority;
+        EventHandler? handler;
+        lock (this.sync)
         {
-            return;
+            if (this.disposed != 0)
+            {
+                return;
+            }
+
+            this.disposed = 1;
+            policyToDispose = this.policy;
+            grantsToDispose = this.grants;
+            transportToDispose = this.disposeTransport;
+            this.disposeTransport = null;
+            authority = this.identityAuthority;
+            handler = this.identityChanged;
+            this.identityAuthority = null;
+            this.identityChanged = null;
         }
 
-        this.Policy.Dispose();
-        this.Grants.Dispose();
-        this.disposeTransport?.Invoke();
+        if (authority is not null && handler is not null)
+        {
+            authority.Changed -= handler;
+        }
+
+        policyToDispose.Dispose();
+        grantsToDispose.Dispose();
+        transportToDispose?.Invoke();
     }
 }
 
@@ -137,6 +240,20 @@ public static class SupabaseRealtimeComposition
     /// connection is attempted.
     /// </summary>
     public static SupabaseRealtimeChannels Create(
+        SupabaseRealtimeConfiguration configuration,
+        IRealtimeIdentityAuthority identityAuthority)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(identityAuthority);
+
+        var channels = CreateCurrent(configuration, identityAuthority);
+        channels.ObserveIdentityChanges(
+            identityAuthority,
+            () => CreateCurrent(configuration, identityAuthority));
+        return channels;
+    }
+
+    private static SupabaseRealtimeChannels CreateCurrent(
         SupabaseRealtimeConfiguration configuration,
         IRealtimeIdentityAuthority identityAuthority)
     {

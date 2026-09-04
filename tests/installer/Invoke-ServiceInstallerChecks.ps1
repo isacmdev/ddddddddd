@@ -119,6 +119,7 @@ function Write-MockSc([string]$dir) {
         'if "%CMD%"=="config" ( echo [mock-sc] config OK & goto :done )',
         'if "%CMD%"=="failure" ( echo [mock-sc] failure OK & goto :done )',
         'if "%CMD%"=="start" ( echo [mock-sc] start OK & goto :done )',
+        'if "%CMD%"=="stop" ( echo [mock-sc] stop OK & goto :done )',
         'echo [mock-sc] unhandled args: %* 1>&2',
         'exit /b 1',
         ':cmd_fail',

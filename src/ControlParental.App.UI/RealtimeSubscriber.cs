@@ -323,7 +323,8 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
         return identity is not null
             && identity.Generation > 0
             && !string.IsNullOrWhiteSpace(identity.AccessToken)
-            && string.Equals(identity.DeviceId, this.deviceId, StringComparison.Ordinal);
+            && (string.IsNullOrEmpty(this.deviceId)
+                || string.Equals(identity.DeviceId, this.deviceId, StringComparison.Ordinal));
     }
 
     private bool IsCurrentGenerationLocked(long currentGeneration, long? requestedEpoch = null) =>
@@ -511,6 +512,7 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
     private void OnIdentityChanged(object? sender, EventArgs e)
     {
         long epoch;
+        bool disposeTransport;
         lock (this.lockObj)
         {
             if (this.disposed)
@@ -518,12 +520,23 @@ public sealed class RealtimeSubscriber : IRealtimeSubscriber
                 return;
             }
 
+            var identity = this.identityAuthority?.Current;
+            disposeTransport = !string.IsNullOrEmpty(this.deviceId)
+                && (identity is null
+                    || !string.Equals(identity.DeviceId, this.deviceId, StringComparison.Ordinal));
             epoch = ++this.lifecycleEpoch;
         }
 
         // A changed lease is a hard generation fence. The existing channels
         // may only reconnect after the composition validates the current lease.
         this.InvalidateCurrentGeneration();
+        if (disposeTransport)
+        {
+            this.policyChannel.Dispose();
+            this.grantsChannel.Dispose();
+            return;
+        }
+
         if (this.lifecycleObserver.IsInForeground)
         {
             this.QueueLifecycleOperation(() => this.ConnectAsync(epoch));

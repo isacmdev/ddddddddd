@@ -334,11 +334,15 @@ public sealed class NamedPipeUIServerHostedAdapterTests : IDisposable
     [Fact]
     public async Task StartAsync_ExposesUiPipeBeforeClientConnects()
     {
+        var currentUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("The current Windows user does not expose a SID.");
+        var pipeName = $"ControlParental.UI.Tests.{Guid.NewGuid():N}";
         var adapter = new NamedPipeUIServerHostedAdapter(
             new NamedPipeUIServer(
+                currentUserSid,
                 null,
-                null,
-                new Mock<ILogger<NamedPipeUIServer>>().Object),
+                new Mock<ILogger<NamedPipeUIServer>>().Object,
+                pipeName),
             this.messageHandler,
             this.mockLogger.Object);
 
@@ -346,7 +350,7 @@ public sealed class NamedPipeUIServerHostedAdapterTests : IDisposable
 
         using var client = new NamedPipeClientStream(
             ".",
-            "ControlParental.UI",
+            pipeName,
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await client.ConnectAsync(1000);

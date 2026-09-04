@@ -21,6 +21,7 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
     private readonly CancellationTokenSource lifetime = new();
     private long refreshSequence;
     private RealtimeIdentitySnapshot? current;
+    private Task? startupTask;
     private Task? refreshLoop;
     private bool disposed;
 
@@ -47,12 +48,24 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
         get { lock (this.sync) return this.refreshLoop ?? Task.CompletedTask; }
     }
 
-    public async Task StartAsync(CancellationToken cancellationToken = default)
+    public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        await this.RefreshAsync(cancellationToken).ConfigureAwait(false);
         lock (this.sync)
         {
-            if (!this.disposed && this.refreshLoop is null)
+            ObjectDisposedException.ThrowIf(this.disposed, this);
+            return this.startupTask ??= this.StartCoreAsync(cancellationToken);
+        }
+    }
+
+    private async Task StartCoreAsync(CancellationToken cancellationToken)
+    {
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            this.lifetime.Token);
+        await this.RefreshAsync(linkedCancellation.Token).ConfigureAwait(false);
+        lock (this.sync)
+        {
+            if (!this.disposed && !this.lifetime.IsCancellationRequested && this.refreshLoop is null)
             {
                 this.refreshLoop = Task.Run(() => this.RefreshLoopAsync(this.lifetime.Token));
             }
@@ -62,11 +75,12 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
     public async Task RefreshAsync(CancellationToken cancellationToken = default)
     {
         var sequence = Interlocked.Increment(ref this.refreshSequence);
+        var request = new GetRealtimeIdentity();
         RealtimeIdentityResponse? response;
         try
         {
             response = await this.channel
-                .QueryAsync<GetRealtimeIdentity, RealtimeIdentityResponse>(new GetRealtimeIdentity(), cancellationToken)
+                .QueryAsync<GetRealtimeIdentity, RealtimeIdentityResponse>(request, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -80,7 +94,7 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
             return;
         }
 
-        RealtimeIdentitySnapshot? snapshot = response is not null && IsValid(response, this.clock())
+        RealtimeIdentitySnapshot? snapshot = response is not null && IsValid(response, request, this.clock())
             ? new RealtimeIdentitySnapshot(response.AccessToken!, response.DeviceId!, response.Generation)
             {
                 ExpiresAt = response.ExpiresAt,
@@ -99,6 +113,7 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
                 var interval = snapshot is null
                     ? TimeSpan.FromSeconds(5)
                     : snapshot.ExpiresAt - this.clock() - TimeSpan.FromMinutes(1);
+                interval = TimeSpan.FromTicks(Math.Min(interval.Ticks, TimeSpan.FromSeconds(30).Ticks));
                 if (interval < TimeSpan.FromMilliseconds(100)) interval = TimeSpan.FromMilliseconds(100);
                 await this.delay(interval, cancellationToken).ConfigureAwait(false);
                 if (cancellationToken.IsCancellationRequested) break;
@@ -127,13 +142,24 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
     /// <summary>Cancels and drains the bounded refresh loop before clearing credentials.</summary>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        Task startup;
         Task loop;
         lock (this.sync)
         {
+            startup = this.startupTask ?? Task.CompletedTask;
             loop = this.refreshLoop ?? Task.CompletedTask;
         }
 
         this.lifetime.Cancel();
+        try
+        {
+            await startup.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            this.lifetime.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+        }
+
         await loop.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
         lock (this.sync)
         {
@@ -143,9 +169,14 @@ public sealed class RealtimeIdentityBridge : IRealtimeIdentityAuthority, IDispos
         this.Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    private static bool IsValid(RealtimeIdentityResponse response, DateTimeOffset now)
+    private static bool IsValid(
+        RealtimeIdentityResponse response,
+        GetRealtimeIdentity request,
+        DateTimeOffset now)
     {
-        if (!response.Success || !string.Equals(response.ErrorCode, "none", StringComparison.Ordinal)
+        if (response.ContractVersion != request.ContractVersion
+            || !string.Equals(response.CorrelationId, request.CorrelationId, StringComparison.Ordinal)
+            || !response.Success || !string.Equals(response.ErrorCode, "none", StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(response.AccessToken) || response.AccessToken.Length > MaximumTokenLength
             || response.Generation <= 0 || string.IsNullOrWhiteSpace(response.DeviceId)
             || response.ExpiresAt <= now || response.DeviceId.Length > 128)

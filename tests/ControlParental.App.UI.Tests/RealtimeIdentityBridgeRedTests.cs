@@ -340,6 +340,16 @@ public sealed class RealtimeIdentityBridgeRedTests
         Assert.Equal("device-b", channels.DeviceId);
         Assert.NotSame(oldPolicy, channels.Policy);
         Assert.NotSame(oldGrants, channels.Grants);
+
+        var secondPolicy = channels.Policy;
+        var secondGrants = channels.Grants;
+        deviceId = "device-c";
+        generation = 6;
+        await bridge.RefreshAsync();
+
+        Assert.Equal("device-c", channels.DeviceId);
+        Assert.NotSame(secondPolicy, channels.Policy);
+        Assert.NotSame(secondGrants, channels.Grants);
     }
 
     [Fact]
@@ -648,18 +658,32 @@ public sealed class RealtimeIdentityBridgeRedTests
             where TResponse : class, ControlParental.Domain.IUIMessage
         {
             var query = Interlocked.Increment(ref this.queryCount);
+            RealtimeIdentityResponse? response;
             if (query == 1)
             {
                 this.FirstQueryStarted.TrySetResult(true);
-                return (TResponse?)(object?)await this.firstResponse.Task
+                response = await this.firstResponse.Task
+                    .WaitAsync(ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                this.SecondQueryStarted.TrySetResult(true);
+                response = await this.secondResponse.Task
                     .WaitAsync(ct)
                     .ConfigureAwait(false);
             }
 
-            this.SecondQueryStarted.TrySetResult(true);
-            return (TResponse?)(object?)await this.secondResponse.Task
-                .WaitAsync(ct)
-                .ConfigureAwait(false);
+            if (request is GetRealtimeIdentity identityRequest && response is not null)
+            {
+                response = response with
+                {
+                    ContractVersion = identityRequest.ContractVersion,
+                    CorrelationId = identityRequest.CorrelationId,
+                };
+            }
+
+            return (TResponse?)(object?)response;
         }
 
         public Task SendAsync<TMessage>(TMessage message, CancellationToken ct = default)

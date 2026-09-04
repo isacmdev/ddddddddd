@@ -29,9 +29,6 @@ EXT_RE = re.compile(r"^x-[a-z0-9][a-z0-9._-]{0,63}$")
 FORBIDDEN_TOKENS = ("authority", "identity", "secret", "credential", "token", "grant", "verdict", "password", "passwd", "api_key", "apikey", "private_key", "access_key")
 FORBIDDEN_TOKENS += ("jwt", "role")
 
-def reject_constant(value: str) -> None: raise ValueError(f"non-standard number: {value}")
-def load(path: Path) -> Any: return json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
-
 def _secret_token(value: str) -> bool:
     normalized = re.sub(r"[-_.]+", "_", value.lower())
     return any(
