@@ -5,7 +5,9 @@
 namespace ControlParental.Service.Tests;
 
 using System.Reflection;
+using System.Text.Json;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
 using FluentAssertions;
 using Moq;
 using Xunit;
@@ -793,7 +795,7 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     // ── Direct coverage for ExecutePolicySyncAsync ───────────────────────
 
     [Fact]
-    public async Task ExecutePolicySyncAsync_WhenNewerPolicyArrives_PersistsIt()
+    public async Task ExecutePolicySyncAsync_WhenLegacyPolicyArrives_RejectsBeforePersistence()
     {
         // Policy uses snake_case JSON property names and integer-valued enums
         // (PolicyJsonContext has no UseStringEnumConverter).
@@ -815,9 +817,27 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         this.mockBackendClient
             .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(PolicyFetchResult.Succeeded(7, policyJson));
+        await Assert.ThrowsAsync<JsonException>(() => this.service.ExecutePolicySyncAsync(CancellationToken.None));
+
+        this.mockPolicyRepository.Verify(
+            r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenVersionedPolicyEnvelopeArrives_PersistsPayload()
+    {
+        var policyWithoutHash = """{"device_id":"00000000-0000-4000-8000-000000000012","version":7,"device_state":"active","daily_screen_time_minutes":120,"schedules":[],"category_limits":[],"app_policies":[],"category_assignments":{},"grants":[]}""";
+        using var payloadDocument = JsonDocument.Parse(policyWithoutHash);
+        var policyJson = policyWithoutHash[..^1] + ",\"snapshot_hash\":\"" + CanonicalJson.Sha256Hex(payloadDocument.RootElement) + "\"}";
+        var envelope = """{"contract":"control-parental.windows","version":1,"message_type":"policy.snapshot","correlation_id":"00000000-0000-4000-8000-000000000001","payload":""" + policyJson + "}";
+
         this.mockPolicyRepository
-            .Setup(r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(3);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(7, envelope));
 
         await this.service.ExecutePolicySyncAsync(CancellationToken.None);
 
@@ -838,6 +858,24 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
 
         await this.service.ExecutePolicySyncAsync(CancellationToken.None);
 
+        this.mockPolicyRepository.Verify(
+            r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenEnvelopeHasUnknownMember_DoesNotPersist()
+    {
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(1, "{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"policy.snapshot\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"unexpected\":true,\"payload\":{}}"));
+
+        var act = async () => await this.service.ExecutePolicySyncAsync(CancellationToken.None);
+
+        await act.Should().ThrowAsync<System.Text.Json.JsonException>();
         this.mockPolicyRepository.Verify(
             r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
             Times.Never);
@@ -1105,7 +1143,7 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         {
             CreateEntry(43, "device_alerts", "{\"eventType\":\"warning\",\"detectedAt\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-43\"}"),
             CreateEntry(44, "behavioral_events", "{\"eventType\":\"blocked\",\"timestamp\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-44\"}"),
-            CreateEntry(45, "time_requests", "{\"requestId\":\"request-45\",\"minutes\":5,\"createdAt\":\"2026-07-23T12:00:00Z\"}"),
+            CreateEntry(45, "time_requests", "{\"requestId\":\"00000000-0000-4000-8000-000000000045\",\"minutes\":5,\"createdAt\":\"2026-07-23T12:00:00Z\"}"),
         };
         this.mockOutboxManager
             .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
@@ -1124,7 +1162,16 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
 
         this.mockOutboxManager.Verify(
             m => m.CompleteAsync(It.IsAny<OutboxEntry>(), It.IsAny<CancellationToken>()),
-            Times.Exactly(3));
+            Times.Exactly(2));
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.Is<OutboxEntry>(entry => entry.Id == 45),
+                "permanent",
+                null,
+                true,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]

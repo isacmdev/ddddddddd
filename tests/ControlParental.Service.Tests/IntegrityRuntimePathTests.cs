@@ -1,6 +1,8 @@
 namespace ControlParental.Service.Tests;
 
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
 using ControlParental.Service;
@@ -105,7 +107,15 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         var health = new Mock<IServiceHealthMonitor>(); health.Setup(value => value.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask); health.Setup(value => value.StopAsync()).Returns(Task.CompletedTask); return health;
     }
     private static IntegrityRuntimeFactory CreateFactory(IBackendIdentityCoordinator identity, IIntegrityEscalationStateStore store, IEnforcementLevelMonitor? enforcement = null)
-        => new(Mock.Of<ITimeProvider>(), Mock.Of<IOutboxManager>(), Mock.Of<IPrivilegeInspector>(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>()) == Task.FromResult(true)), enforcement ?? Mock.Of<IEnforcementLevelMonitor>(), Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(true, "hash", "agent.exe"))), Mock.Of<IBackendClient>(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityReportResult(false, null))), identity, store);
+    {
+        var privilege = new Mock<IPrivilegeInspector>();
+        privilege.Setup(value => value.IsChildStandardAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        var checker = new Mock<IIntegrityChecker>();
+        checker.Setup(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityCheckResult(true, "hash", "agent.exe"));
+        var backend = new Mock<IBackendClient>();
+        backend.Setup(value => value.ReportIntegrityAsync(It.IsAny<IntegrityReport>(), It.IsAny<CancellationToken>())).ReturnsAsync(new IntegrityReportResult(false, null));
+        return new(Mock.Of<ITimeProvider>(), Mock.Of<IOutboxManager>(), privilege.Object, enforcement ?? Mock.Of<IEnforcementLevelMonitor>(), checker.Object, backend.Object, identity, store);
+    }
     private static ControlParentalService CreateService(IServiceHealthMonitor health, IEnforcementLevelMonitor? enforcement = null, IntegrityRuntimeFactory? factory = null, IUsageAccumulator? usage = null, IUsageReconciler? reconciler = null)
         => new(Mock.Of<IScmController>(), Mock.Of<IPrivilegeInspector>(), Mock.Of<IAccountManager>(), usage ?? Mock.Of<IUsageAccumulator>(), reconciler ?? Mock.Of<IUsageReconciler>(), Mock.Of<IWorkstationLockManager>(), Mock.Of<IOverlayPersistenceManager>(), health, Mock.Of<IServiceRecoveryManager>(), Mock.Of<ITimeProvider>(), Mock.Of<IPolicyRepository>(), Mock.Of<IProcessTerminator>(), enforcementLevelMonitor: enforcement, integrityRuntimeFactory: factory);
     [Fact]
@@ -114,7 +124,10 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         var path = Path.Combine(this.directory, "issues.json");
         var now = DateTimeOffset.UtcNow;
         var localNow = now;
-        var body = "{\"verdict\":\"revoked\"}";
+        const string binaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        var reportHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{binaryHash}:agent.exe"))).ToLowerInvariant();
+        var evidenceId = GuidFromHashMaterial(reportHash);
+        var body = $"{{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"integrity.verdict\",\"correlation_id\":\"{evidenceId:D}\",\"payload\":{{\"verdict\":\"revoked\",\"evidence_id\":\"{evidenceId:D}\",\"evaluated_at\":\"2026-08-28T12:00:00Z\",\"verdict_version\":1,\"reason_code\":\"ok\"}}}}";
         var status = HttpStatusCode.Created;
         string? token = null;
         string? notificationKey = null;
@@ -134,7 +147,7 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         await coordinator.InitializeAsync();
         using var client = new HttpClient(handler.Object);
         var backend = new BackendClient(client, "https://example.test", coordinator);
-        var checker = Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(false, "hash", "agent.exe")));
+        var checker = Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(false, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "agent.exe")));
         using var policy = new IntegrityVerdictHandler(notifications.Object, clock: () => localNow);
         policy.SetServiceStartTime(now.AddMinutes(-10));
         using var metadataPolicy = new IntegrityVerdictHandler(clock: () => localNow);
@@ -264,7 +277,7 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         var key = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", "device-a");
         await enforcement.AddIssueAsync(key, EnforcementIssueSeverity.Severe, "existing");
         var before = JsonSerializer.Serialize(await new FileIssueStore(path).LoadAsync());
-        var run = RunOnce(backend, Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(true, "hash", "agent.exe"))), enforcement, policy, coordinator);
+        var run = RunOnce(backend, Mock.Of<IIntegrityChecker>(value => value.CheckLocalIntegrityAsync(It.IsAny<CancellationToken>()) == Task.FromResult(new IntegrityCheckResult(true, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "agent.exe"))), enforcement, policy, coordinator);
         await responseReady.Task;
         await coordinator.InvalidateAsync(4, BackendIdentityErrorV1.Revoked);
         release.SetResult();
@@ -294,7 +307,7 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         var fileStore = new FileIssueStore(path);
         await fileStore.UpsertActiveAsync(key, EnforcementIssueSeverity.Severe, "existing", DateTimeOffset.UtcNow);
         var before = JsonSerializer.Serialize(await new FileIssueStore(path).LoadAsync());
-        var request = backend.ReportIntegrityAsync(new IntegrityReport { ReportHash = "report", BinaryHash = "hash", SignatureValid = true, Timestamp = DateTimeOffset.UtcNow, AgentVersion = "test", Platform = "test" }, cancellation.Token);
+        var request = backend.ReportIntegrityAsync(new IntegrityReport { ReportHash = "report", BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", SignatureValid = true, Timestamp = DateTimeOffset.UtcNow, AgentVersion = "test", Platform = "test" }, cancellation.Token);
         await started.Task;
         cancellation.Cancel();
         await stopped.Task;
@@ -380,6 +393,14 @@ public sealed class IntegrityRuntimePathTests : IDisposable
         => instance.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(instance, value);
     private static T GetPrivateField<T>(object instance, string name)
         => (T)instance.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(instance)!;
+    private static Guid GuidFromHashMaterial(string material)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(material))[..16];
+        bytes[7] = (byte)((bytes[7] & 0x0f) | 0x40);
+        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
+        return new Guid(bytes);
+    }
+
     private static async Task RunOnce(IBackendClient backend, IIntegrityChecker checker, IEnforcementLevelMonitor enforcement, IIntegrityVerdictHandler policy, IBackendIdentityCoordinator identity, CancellationToken cancellationToken = default, Func<DateTimeOffset>? localClock = null, IOutboxManager? outbox = null)
     {
         var acceptedAt = localClock?.Invoke() ?? DateTimeOffset.UtcNow;

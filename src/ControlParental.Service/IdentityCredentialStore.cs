@@ -151,6 +151,7 @@ public sealed partial class SecretStore
         }
         catch (Exception ex)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             this.Quarantine([IdentitySecretName]);
             return new(IdentityStoreStatus.Corrupt, null, ex.GetType().Name);
         }
@@ -174,6 +175,7 @@ public sealed partial class SecretStore
                 return false;
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             this.Quarantine([IdentitySecretName]);
             return !File.Exists(path);
         }
@@ -310,10 +312,13 @@ public sealed partial class SecretStore
             {
                 await stream.WriteAsync(bytes, cancellationToken);
                 await stream.FlushAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 stream.Flush(flushToDisk: true);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             this.accessPolicy.Apply(temporary);
+            cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporary, destination, overwrite: true);
         }
         finally

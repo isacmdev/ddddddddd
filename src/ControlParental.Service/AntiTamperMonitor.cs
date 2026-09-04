@@ -780,6 +780,14 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
                 return;
             }
 
+            // A malformed or identity-mismatched envelope is an invalid input,
+            // not a transport failure. It must not reach any stateful handler,
+            // local-failure reaction, enforcement, or notification path.
+            if (reportResult.IsInvalidEnvelope)
+            {
+                return;
+            }
+
             // Local evidence is report-only. It cannot change durable enforcement.
             if (!result.IsSignatureValid)
             {

@@ -20,6 +20,15 @@ public sealed class PolicyDbEntity
     /// </summary>
     public int Version { get; set; }
 
+    /// <summary>Content hash used to distinguish replay from a same-version rewrite.</summary>
+    public string SnapshotHash { get; set; } = string.Empty;
+
+    /// <summary>Indicates that a same-version conflicting snapshot quarantined the device.</summary>
+    public bool IsQuarantined { get; set; }
+
+    /// <summary>Reason for quarantine, when present.</summary>
+    public string? QuarantineReason { get; set; }
+
     /// <summary>
     /// Full JSON of the policy (for debugging/audit).
     /// </summary>

@@ -37,6 +37,9 @@ public sealed class ControlParentalDbContext : DbContext
             entity.HasKey(e => e.DeviceId);
             entity.Property(e => e.DeviceId).HasColumnName("device_id");
             entity.Property(e => e.Version).HasColumnName("version");
+            entity.Property(e => e.SnapshotHash).HasColumnName("snapshot_hash");
+            entity.Property(e => e.IsQuarantined).HasColumnName("is_quarantined");
+            entity.Property(e => e.QuarantineReason).HasColumnName("quarantine_reason");
             entity.Property(e => e.PolicyJson).HasColumnName("policy_json");
             entity.Property(e => e.LastUpdated).HasColumnName("last_updated");
             entity.Property(e => e.CategoryAssignmentsJson).HasColumnName("category_assignments_json");

@@ -7,6 +7,8 @@ namespace ControlParental.Service;
 using System.Net.NetworkInformation;
 using System.Text.Json;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
+using ControlParental.Domain.WireContracts.Models;
 
 /// <summary>
 /// T20 — Implementation of IScheduledWorkService.
@@ -571,8 +573,62 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
                     ?? throw new JsonException("Invalid behavioral payload.");
                 return (await this.backendClient.PushBehavioralEventsAsync(new[] { behavioral }, cancellationToken)).Success;
             case "time_requests":
-                var request = JsonSerializer.Deserialize<TimeRequestEntry>(entry.PayloadJson, this.jsonOptions)
+                var request = JsonSerializer.Deserialize(
+                    entry.PayloadJson,
+                    SharedJsonContext.Default.TimeRequestEntry)
                     ?? throw new JsonException("Invalid time request payload.");
+                if (string.IsNullOrWhiteSpace(request.RequestId)
+                    || request.Minutes is < 1 or > 180
+                    || request.CreatedAt.Offset != TimeSpan.Zero
+                    || request.CreatedAt.Ticks % TimeSpan.TicksPerSecond != 0
+                    || (request.Reason is not null
+                        && (request.Reason.Length == 0 || System.Text.Encoding.UTF8.GetByteCount(request.Reason) > 256)))
+                {
+                    throw new JsonException("Invalid time request contract.");
+                }
+
+                var identity = this.identityCoordinator?.CurrentState;
+                var deviceId = Guid.Empty;
+                var hasDeviceIdentity = identity?.CanAuthorizeRemoteAccess == true
+                    && Guid.TryParse(identity.DeviceId, out deviceId)
+                    && deviceId != Guid.Empty;
+                if (this.identityCoordinator is not null && !hasDeviceIdentity)
+                {
+                    throw new JsonException("Remote identity is not authoritative.");
+                }
+
+                if (!Guid.TryParse(request.RequestId, out var requestId) || requestId == Guid.Empty)
+                {
+                    throw new JsonException("Invalid time request identifier.");
+                }
+
+                if (hasDeviceIdentity)
+                {
+                    if (request.Scope is null || request.Origin is null || request.PolicyVersion is null
+                        || request.DeviceId is null || request.DeviceId != deviceId)
+                    {
+                        throw new JsonException("Incomplete time request wire identity.");
+                    }
+
+                    var wireRequest = new CreateTimeRequestWire(
+                        requestId,
+                        request.Scope,
+                        request.Minutes,
+                        request.Origin,
+                        request.PolicyVersion.Value,
+                        request.DeviceId.Value,
+                        request.CreatedAt,
+                        request.Reason);
+                    if (!WireContractCodec.EncodeAndValidate(
+                            wireRequest,
+                            requestId,
+                            WireContractCatalog.CreateTimeRequest,
+                            DateTimeOffset.UtcNow).IsValid)
+                    {
+                        throw new JsonException("Invalid time request wire contract.");
+                    }
+                }
+
                 return await this.backendClient.CreateTimeRequestAsync(request, cancellationToken);
             default:
                 throw new JsonException("Unsupported outbox table.");
@@ -672,9 +728,38 @@ public sealed class ScheduledWorkService : IScheduledWorkService, IDisposable
 
             if (fetchResult.Success && !string.IsNullOrEmpty(fetchResult.PolicyJson))
             {
-                var policy = JsonSerializer.Deserialize<Policy>(fetchResult.PolicyJson, PolicyJsonContext.Default.Policy);
+                var policyJson = fetchResult.PolicyJson;
+                using var document = JsonDocument.Parse(policyJson);
+                var policyPayload = document.RootElement;
+
+                // Policy responses are admitted only through the frozen wire
+                // contract. Bare legacy JSON is never persisted.
+                var decoded = WireContractCodec.DecodeAndValidate(
+                    System.Text.Encoding.UTF8.GetBytes(policyJson),
+                    WireContractCatalog.PolicySnapshot,
+                    this.timeProvider.WallClockNow);
+                if (!decoded.IsValid)
+                {
+                    throw new JsonException("Invalid policy wire contract.");
+                }
+
+                policyPayload = document.RootElement.GetProperty("payload");
+                if (!WireContractCodec.ValidatePolicySnapshotHash(policyPayload))
+                {
+                    throw new JsonException("Invalid policy snapshot hash.");
+                }
+
+                var policy = JsonSerializer.Deserialize<Policy>(
+                    policyPayload.GetRawText(),
+                    new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true,
+                        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) },
+                    });
                 if (policy != null)
                 {
+                    policy = policy with { SnapshotHash = policyPayload.GetProperty("snapshot_hash").GetString() ?? string.Empty };
+                    policy.Validate();
                     await this.policyRepository.UpsertPolicyAsync(policy, cancellationToken);
                     System.Diagnostics.Debug.WriteLine($"[ScheduledWorkService] Policy synced: version {policy.Version}");
                 }

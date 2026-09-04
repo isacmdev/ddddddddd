@@ -120,7 +120,9 @@ public sealed class WnsRegistrationPageCompositionTests
         Assert.Contains("GetRequiredService<WnsRegistrationViewModel>", pageCodeBehind, StringComparison.Ordinal);
         Assert.DoesNotContain("new HttpClient", appSource, StringComparison.Ordinal);
         Assert.DoesNotContain("BackendClient", appSource, StringComparison.Ordinal);
-        Assert.DoesNotContain("Supabase", appSource, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("SupabaseRealtimeComposition.Create", appSource, StringComparison.Ordinal);
+        Assert.Contains("CreateFromEnvironment", appSource, StringComparison.Ordinal);
+        Assert.Contains("channels.DeviceId", appSource, StringComparison.Ordinal);
     }
 
     [Fact]

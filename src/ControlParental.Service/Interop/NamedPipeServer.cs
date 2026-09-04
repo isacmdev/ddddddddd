@@ -282,7 +282,9 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 return;
             }
 
-            var frame = IpcFrameCodec.Encode(JsonSerializer.Serialize(message));
+            var typeInfo = UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())
+                ?? throw new InvalidOperationException("Unsupported IPC message type.");
+            var frame = IpcFrameCodec.Encode(JsonSerializer.Serialize(message, typeInfo));
             await this.writeGate.WaitAsync(cancellationToken);
             try { await this.pipeServer.WriteAsync(frame, cancellationToken); }
             finally { this.writeGate.Release(); }
@@ -407,7 +409,8 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
 
-                if (!root.TryGetProperty("MessageType", out var typeElement))
+                if (!root.TryGetProperty("MessageType", out var typeElement)
+                    || typeElement.ValueKind != JsonValueKind.String)
                 {
                     return null;
                 }
@@ -417,13 +420,13 @@ public sealed class NamedPipeServer : IIpcChannel, IDisposable
                 // Route to the correct record type based on MessageType
                 return messageType switch
                 {
-                    nameof(ForegroundChanged) => JsonSerializer.Deserialize<ForegroundChanged>(json),
-                    nameof(AgentHeartbeat) => JsonSerializer.Deserialize<AgentHeartbeat>(json),
-                    nameof(AgentCommandCompleted) => JsonSerializer.Deserialize<AgentCommandCompleted>(json),
-                    nameof(StateSnapshot) => JsonSerializer.Deserialize<StateSnapshot>(json),
-                    nameof(Pong) => JsonSerializer.Deserialize<Pong>(json),
-                    nameof(GetUsageState) => JsonSerializer.Deserialize<GetUsageState>(json),
-                    nameof(UsageStateResponse) => JsonSerializer.Deserialize<UsageStateResponse>(json),
+                    nameof(ForegroundChanged) => root.Deserialize(UIMessagesJsonContext.Default.ForegroundChanged),
+                    nameof(AgentHeartbeat) => root.Deserialize(UIMessagesJsonContext.Default.AgentHeartbeat),
+                    nameof(AgentCommandCompleted) => root.Deserialize(UIMessagesJsonContext.Default.AgentCommandCompleted),
+                    nameof(StateSnapshot) => root.Deserialize(UIMessagesJsonContext.Default.StateSnapshot),
+                    nameof(Pong) => root.Deserialize(UIMessagesJsonContext.Default.Pong),
+                    nameof(GetUsageState) => root.Deserialize(UIMessagesJsonContext.Default.GetUsageState),
+                    nameof(UsageStateResponse) => root.Deserialize(UIMessagesJsonContext.Default.UsageStateResponse),
                     _ => null,
                 };
             }

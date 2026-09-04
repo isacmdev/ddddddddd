@@ -245,6 +245,33 @@ public class ProgramHardeningTests
     }
 
     [Fact]
+    public async Task RunBackupHostModeAsync_BoundsHostStopWhenAdmissionIgnoresCancellation()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IScheduledWorkService, BlockingScheduledWorkService>();
+        services.AddHostedService<BlockingStopHostedService>();
+        Program.ConfigureBackupAdmission(services);
+        using var host = Host.CreateDefaultBuilder()
+            .ConfigureServices(collection =>
+            {
+                foreach (var descriptor in services)
+                {
+                    collection.Add(descriptor);
+                }
+            })
+            .Build();
+
+        await host.StartAsync();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await Program.RunBackupHostModeAsync(host, BackupMode.Heartbeat, timeout: TimeSpan.FromMilliseconds(20));
+        stopwatch.Stop();
+
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1));
+        host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.IsCancellationRequested
+            .Should().BeTrue();
+    }
+
+    [Fact]
     public async Task ApplyHardeningAsync_InvokesAclAndSCMHardeningBoundaries()
     {
         var aclHardener = new Mock<IAclHardener>(MockBehavior.Strict);
@@ -364,6 +391,14 @@ public class ProgramHardeningTests
             this.Calls.Add((mode, cancellationToken));
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class BlockingStopHostedService : IHostedService
+    {
+        public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task StopAsync(CancellationToken cancellationToken) =>
+            Task.Delay(Timeout.InfiniteTimeSpan, CancellationToken.None);
     }
 
     private sealed class LifecycleProbe : IHostedService

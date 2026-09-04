@@ -19,7 +19,7 @@ namespace ControlParental.Service.CompiledModels
                 "ControlParental.Domain.PolicyDbEntity",
                 typeof(PolicyDbEntity),
                 baseEntityType,
-                propertyCount: 5,
+                propertyCount: 8,
                 unnamedIndexCount: 1,
                 keyCount: 1);
 
@@ -37,6 +37,21 @@ namespace ControlParental.Service.CompiledModels
                 propertyInfo: typeof(PolicyDbEntity).GetProperty("CategoryAssignmentsJson", BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly),
                 fieldInfo: typeof(PolicyDbEntity).GetField("<CategoryAssignmentsJson>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
             categoryAssignmentsJson.AddAnnotation("Relational:ColumnName", "category_assignments_json");
+
+            var isQuarantined = runtimeEntityType.AddProperty(
+                "IsQuarantined",
+                typeof(bool),
+                propertyInfo: typeof(PolicyDbEntity).GetProperty("IsQuarantined", BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly),
+                fieldInfo: typeof(PolicyDbEntity).GetField("<IsQuarantined>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
+            isQuarantined.AddAnnotation("Relational:ColumnName", "is_quarantined");
+
+            var quarantineReason = runtimeEntityType.AddProperty(
+                "QuarantineReason",
+                typeof(string),
+                propertyInfo: typeof(PolicyDbEntity).GetProperty("QuarantineReason", BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly),
+                fieldInfo: typeof(PolicyDbEntity).GetField("<QuarantineReason>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly),
+                nullable: true);
+            quarantineReason.AddAnnotation("Relational:ColumnName", "quarantine_reason");
 
             var lastUpdated = runtimeEntityType.AddProperty(
                 "LastUpdated",
@@ -60,6 +75,13 @@ namespace ControlParental.Service.CompiledModels
                 fieldInfo: typeof(PolicyDbEntity).GetField("<Version>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly),
                 sentinel: 0);
             version.AddAnnotation("Relational:ColumnName", "version");
+
+            var snapshotHash = runtimeEntityType.AddProperty(
+                "SnapshotHash",
+                typeof(string),
+                propertyInfo: typeof(PolicyDbEntity).GetProperty("SnapshotHash", BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly),
+                fieldInfo: typeof(PolicyDbEntity).GetField("<SnapshotHash>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
+            snapshotHash.AddAnnotation("Relational:ColumnName", "snapshot_hash");
 
             var key = runtimeEntityType.AddKey(
                 new[] { deviceId });

@@ -6,6 +6,8 @@ namespace ControlParental.Service.Tests;
 
 using System.Net;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
+using ControlParental.Domain.WireContracts.Models;
 using ControlParental.Service;
 using Xunit;
 
@@ -189,6 +191,49 @@ public sealed class AuthenticatedBackendClientTests
         Assert.Equal(1, sends);
     }
 
+    [Fact]
+    public async Task CreateTimeRequestAsync_AuthenticatedSuccess_SendsValidatedEnvelopeBytesOnce()
+    {
+        var requestId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+        var deviceId = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        var now = DateTimeOffset.UtcNow;
+        var createdAt = now.AddTicks(-(now.Ticks % TimeSpan.TicksPerSecond));
+        var request = new TimeRequestEntry
+        {
+            RequestId = requestId.ToString("D"),
+            Scope = "homework",
+            Minutes = 30,
+            Origin = "overlay",
+            PolicyVersion = 7,
+            DeviceId = deviceId,
+            CreatedAt = createdAt,
+            Reason = "Math assignment",
+        };
+        var expectedBytes = WireContractCodec.EncodeValidatedEnvelope(
+            new CreateTimeRequestWire(requestId, request.Scope!, request.Minutes, request.Origin!,
+                request.PolicyVersion.Value, deviceId, createdAt, request.Reason),
+            requestId,
+            WireContractCatalog.CreateTimeRequest,
+            createdAt);
+        var sends = 0;
+        byte[]? observedBytes = null;
+        string? observedContentType = null;
+        var sut = Client(new StubHandler(async (message, _) =>
+        {
+            sends++;
+            observedBytes = await message.Content!.ReadAsByteArrayAsync();
+            observedContentType = message.Content.Headers.ContentType?.ToString();
+            return Response(HttpStatusCode.Created);
+        }), Authority.Definitive("access-one", 7, deviceId.ToString("D")));
+
+        var result = await sut.CreateTimeRequestAsync(request);
+
+        Assert.True(result);
+        Assert.Equal(1, sends);
+        Assert.Equal("application/json", observedContentType);
+        Assert.Equal(expectedBytes, observedBytes);
+    }
+
     private static BackendClient Client(HttpMessageHandler handler, IBackendIdentityCoordinator authority, BackendReliabilityOptions? options = null)
         => new(new HttpClient(handler), "https://example.supabase.co", authority, options);
 
@@ -215,11 +260,11 @@ public sealed class AuthenticatedBackendClientTests
 
         public long? InvalidatedGeneration { get; private set; }
 
-        public static Authority Definitive(string token, long generation)
+        public static Authority Definitive(string token, long generation, string deviceId = "device-a")
         {
             var authority = new Authority { CurrentState = BackendIdentityState.Restore(
-                BackendIdentityPhase.DefinitiveSession, generation, "device-a") };
-            authority.result = BackendDefinitiveSessionResult.Authorized(new(generation, "device-a", token, Now.AddHours(1)));
+                BackendIdentityPhase.DefinitiveSession, generation, deviceId) };
+            authority.result = BackendDefinitiveSessionResult.Authorized(new(generation, deviceId, token, Now.AddHours(1)));
             return authority;
         }
 

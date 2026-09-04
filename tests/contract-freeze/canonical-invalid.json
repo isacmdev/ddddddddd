@@ -1,0 +1,16 @@
+[
+  {"name":"duplicate_root_member","input":"{\"a\":1,\"a\":2}"},
+  {"name":"duplicate_nested_member","input":"{\"items\":[{\"a\":1,\"a\":2}]}"},
+  {"name":"exponent_too_large","input":"{\"z\":1e1000001}"},
+  {"name":"exponent_too_small","input":"{\"z\":1e-1000001}"},
+  {"name":"exponent_compensated_large","input":"{\"z\":1.2300e1000001}"},
+  {"name":"exponent_compensated_small","input":"{\"z\":1.2300e-1000001}"},
+  {"name":"non_finite_nan","input":"{\"z\":NaN}"},
+  {"name":"non_finite_infinity","input":"{\"z\":Infinity}"},
+  {"name":"malformed_json","input":"{\"z\":}"},
+  {"name":"invalid_utf8","input_hex":"7b227a223a80 7d"},
+  {"name":"unpaired_high_surrogate_value","input":"{\"z\":\"\\uD800\"}"},
+  {"name":"unpaired_low_surrogate_value","input":"{\"z\":\"\\uDC00\"}"},
+  {"name":"unpaired_high_surrogate_name","input":"{\"\\uD800\":1}"},
+  {"name":"unpaired_low_surrogate_name","input":"{\"\\uDC00\":1}"}
+]

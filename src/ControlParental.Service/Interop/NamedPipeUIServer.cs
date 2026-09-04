@@ -10,6 +10,8 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
+using ControlParental.Domain.WireContracts.Models;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -250,21 +252,24 @@ public sealed class NamedPipeUIServer : IDisposable
                 this.IsReady = false;
                 try
                 {
-                    this.pipeServer = await this.pipeFactory(this.cancellationToken).ConfigureAwait(false);
-                    var connectionTask = this.pipeServer.WaitForConnectionAsync(this.cancellationToken);
+                    var connection = await this.pipeFactory(this.cancellationToken).ConfigureAwait(false);
+                    this.pipeServer = connection;
+                    var connectionTask = connection.WaitForConnectionAsync(this.cancellationToken);
                     this.IsReady = true;
                     await connectionTask.ConfigureAwait(false);
                     this.IsReady = false;
 
                     // Reject unauthorized clients before handing them off to message dispatch.
-                    if (!this.ValidateClient())
+                    if (!this.ValidateClient(connection))
                     {
                         this.ClosePipe();
                         continue;
                     }
 
-                    // Start reading messages in a background task
-                    _ = this.ReadMessagesAsync();
+                    // Own the accepted connection until its complete read/handle/write
+                    // lifecycle has drained. This also prevents responses from being
+                    // routed through a later accepted connection.
+                    await this.ReadMessagesAsync(connection).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -297,37 +302,58 @@ public sealed class NamedPipeUIServer : IDisposable
 
         public async Task SendAsync(IIpcMessage message, CancellationToken cancellationToken = default)
         {
-            if (this.pipeServer == null || !this.pipeServer.IsConnected)
+            var connection = this.pipeServer;
+            if (connection == null || !connection.IsConnected)
             {
                 return;
             }
 
-            // T26 PR #14 — source-gen dispatch by runtime type so we avoid
-            // the reflection-based JsonSerializer.Serialize(IIpcMessage) call.
-            // The App.UI mirror uses the same Domain-side UIMessagesJsonContext
-            // catalogue so the wire format is symmetric.
-            var typeInfo = UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())!;
-            var json = JsonSerializer.Serialize(message, typeInfo);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await this.pipeServer.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+            await SendAsync(connection, message, cancellationToken).ConfigureAwait(false);
         }
 
-        private async Task ReadMessagesAsync()
+        private static Task SendAsync(
+            IUiPipeServer connection,
+            IIpcMessage message,
+            CancellationToken cancellationToken)
+        {
+            // T26 PR #14 — source-gen dispatch by runtime type so we avoid
+            // the reflection-based JsonSerializer.Serialize(IIpcMessage) call.
+            var typeInfo = UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())!;
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, typeInfo));
+            return bytes.Length <= BufferSize
+                ? connection.WriteAsync(bytes, cancellationToken)
+                : Task.CompletedTask;
+        }
+
+        private async Task ReadMessagesAsync(IUiPipeServer connection)
         {
             var buffer = new byte[BufferSize];
+            var messageBytes = new MemoryStream();
 
             try
             {
-                while (this.pipeServer?.IsConnected ?? false)
+                while (connection.IsConnected)
                 {
-                    var bytesRead = await this.pipeServer.ReadAsync(buffer, this.cancellationToken).ConfigureAwait(false);
+                    var bytesRead = await connection.ReadAsync(buffer, this.cancellationToken).ConfigureAwait(false);
 
                     if (bytesRead == 0)
                     {
                         break;
                     }
 
-                    var json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    messageBytes.Write(buffer, 0, bytesRead);
+                    if (messageBytes.Length > BufferSize || !connection.IsMessageComplete)
+                    {
+                        if (messageBytes.Length > BufferSize)
+                        {
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    var json = Encoding.UTF8.GetString(messageBytes.GetBuffer(), 0, checked((int)messageBytes.Length));
+                    messageBytes.SetLength(0);
                     var message = this.DeserializeMessage(json);
 
                     if (message != null)
@@ -336,7 +362,7 @@ public sealed class NamedPipeUIServer : IDisposable
                         var response = await this.messageHandler.HandleAuthenticatedAsync(message, this.cancellationToken).ConfigureAwait(false);
                         if (response != null)
                         {
-                            await this.SendAsync(response, this.cancellationToken).ConfigureAwait(false);
+                            await SendAsync(connection, response, this.cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }
@@ -349,12 +375,20 @@ public sealed class NamedPipeUIServer : IDisposable
             {
                 // Cancellation requested
             }
+            finally
+            {
+                this.IsReady = false;
+                this.onDisconnected?.Invoke();
+                if (ReferenceEquals(this.pipeServer, connection))
+                {
+                    this.pipeServer = null;
+                }
 
-            this.IsReady = false;
-            this.onDisconnected?.Invoke();
+                connection.Dispose();
+            }
         }
 
-        private bool ValidateClient()
+        private bool ValidateClient(IUiPipeServer connection)
         {
             // If no explicit parent/child SIDs are configured, rely on the pipe ACL.
             if (this.parentSid == null && this.childSid == null)
@@ -364,7 +398,7 @@ public sealed class NamedPipeUIServer : IDisposable
 
             try
             {
-                var clientSid = this.pipeServer?.GetImpersonationUserSid();
+                var clientSid = connection.GetImpersonationUserSid();
                 if (clientSid == null)
                 {
                     System.Diagnostics.Debug.WriteLine(
@@ -411,12 +445,73 @@ public sealed class NamedPipeUIServer : IDisposable
                     return null;
                 }
 
-                if (!root.TryGetProperty("MessageType", out var typeElement))
+                // Versioned wire envelopes are not UI commands. Validate them at
+                // this boundary and never pass opaque hints, policy, or integrity
+                // data to the authenticated UI handler.
+                if (root.TryGetProperty("message_type", out var versionedType)
+                    || root.TryGetProperty("contract", out _))
+                {
+                    object? descriptor = versionedType.ValueKind == JsonValueKind.String
+                        ? versionedType.GetString() switch
+                        {
+                            "policy.snapshot" => (object)WireContractCatalog.PolicySnapshot,
+                            "integrity.verdict" => WireContractCatalog.IntegrityVerdict,
+                            "wns.hint" => WireContractCatalog.WnsHint,
+                            "realtime.hint" => WireContractCatalog.RealtimeHint,
+                            _ => null,
+                        }
+                        : null;
+                    if (descriptor is ContractDescriptor<PolicySnapshotWire> policyDescriptor)
+                    {
+                        _ = WireContractCodec.DecodeAndValidate(
+                            Encoding.UTF8.GetBytes(json), policyDescriptor).IsValid;
+                    }
+                    else if (descriptor is ContractDescriptor<IntegrityVerdictWire> integrityDescriptor)
+                    {
+                        _ = WireContractCodec.DecodeAndValidate(
+                            Encoding.UTF8.GetBytes(json), integrityDescriptor).IsValid;
+                    }
+                    else if (descriptor is ContractDescriptor<HintWire> hintDescriptor)
+                    {
+                        _ = WireContractCodec.DecodeAndValidate(
+                            Encoding.UTF8.GetBytes(json), hintDescriptor).IsValid;
+                    }
+
+                    return null;
+                }
+
+                if (!root.TryGetProperty("MessageType", out var typeElement)
+                    || typeElement.ValueKind != JsonValueKind.String)
                 {
                     return null;
                 }
 
                 var messageType = typeElement.GetString();
+
+                if (messageType == nameof(GetRealtimeIdentity)
+                    && (!root.TryGetProperty("ContractVersion", out var version)
+                        || version.ValueKind != JsonValueKind.Number
+                        || !version.TryGetInt32(out var contractVersion)
+                        || contractVersion != 1
+                        || !root.TryGetProperty("CorrelationId", out var correlation)
+                        || correlation.ValueKind != JsonValueKind.String
+                        || !Guid.TryParseExact(correlation.GetString(), "D", out var correlationId)
+                        || correlationId == Guid.Empty
+                        || !string.Equals(
+                            correlation.GetString(),
+                            correlationId.ToString("D"),
+                            StringComparison.Ordinal)))
+                {
+                    return null;
+                }
+
+                if (messageType == nameof(RegisterWnsChannel)
+                    && (!root.TryGetProperty("ChannelUri", out var channelUri)
+                        || channelUri.ValueKind != JsonValueKind.String
+                        || Encoding.UTF8.GetByteCount(channelUri.GetString() ?? string.Empty) > 2048))
+                {
+                    return null;
+                }
 
                 // T26 PR #14 — source-gen dispatch via UIMessagesJsonContext.
                 // Each branch hands the JSON to JsonSerializer.Deserialize<T>
@@ -436,6 +531,7 @@ public sealed class NamedPipeUIServer : IDisposable
                     nameof(GetUsageState) => root.Deserialize(UIMessagesJsonContext.Default.GetUsageState),
                     nameof(UsageStateResponse) => root.Deserialize(UIMessagesJsonContext.Default.UsageStateResponse),
                     nameof(TriggerSync) => root.Deserialize(UIMessagesJsonContext.Default.TriggerSync),
+                    nameof(GetRealtimeIdentity) => root.Deserialize(UIMessagesJsonContext.Default.GetRealtimeIdentity),
                     nameof(PairDevice) => root.Deserialize(UIMessagesJsonContext.Default.PairDevice),
                     nameof(PairDeviceResponse) => root.Deserialize(UIMessagesJsonContext.Default.PairDeviceResponse),
                     nameof(ListAccounts) => root.Deserialize(UIMessagesJsonContext.Default.ListAccounts),
@@ -505,6 +601,7 @@ public sealed class NamedPipeUIServer : IDisposable
     internal interface IUiPipeServer : IDisposable
     {
         bool IsConnected { get; }
+        bool IsMessageComplete => true;
         Task WaitForConnectionAsync(CancellationToken cancellationToken);
         Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
         Task WriteAsync(byte[] buffer, CancellationToken cancellationToken);
@@ -517,6 +614,7 @@ public sealed class NamedPipeUIServer : IDisposable
 
         public UiPipeServer(NamedPipeServerStream pipe) => this.pipe = pipe;
         public bool IsConnected => this.pipe.IsConnected;
+        public bool IsMessageComplete => this.pipe.IsMessageComplete;
         public Task WaitForConnectionAsync(CancellationToken token) => this.pipe.WaitForConnectionAsync(token);
         public Task<int> ReadAsync(byte[] buffer, CancellationToken token) => this.pipe.ReadAsync(buffer, token).AsTask();
         public Task WriteAsync(byte[] buffer, CancellationToken token) => this.pipe.WriteAsync(buffer, token).AsTask();

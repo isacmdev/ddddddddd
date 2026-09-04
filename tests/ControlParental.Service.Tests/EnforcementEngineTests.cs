@@ -117,6 +117,27 @@ public class EnforcementEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task EnforceForegroundChangeAsync_WhenPolicyIsQuarantined_FailsClosed()
+    {
+        this.mockPolicyRepository
+            .Setup(r => r.GetPolicyAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Policy?)null);
+        this.mockPolicyRepository
+            .SetupGet(r => r.IsPolicyQuarantined)
+            .Returns(true);
+        this.mockPolicyRepository
+            .SetupGet(r => r.PolicyQuarantineReason)
+            .Returns("same_version_snapshot_hash_mismatch");
+
+        var result = await this.engine.EnforceForegroundChangeAsync("com.example.app", CancellationToken.None);
+
+        result.Success.Should().BeFalse();
+        result.Blocked.Should().BeTrue();
+        result.IsDegraded.Should().BeTrue();
+        result.ErrorMessage.Should().Be("same_version_snapshot_hash_mismatch");
+    }
+
+    [Fact]
     public async Task EnforceForegroundChangeAsync_WhenDeviceLocked_BlocksAllApps()
     {
         // Arrange

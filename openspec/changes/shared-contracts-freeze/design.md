@@ -10,6 +10,30 @@ Every JSON message uses an explicit envelope:
 
 `version` is the major contract version. The wire limit is **65,536 UTF-8 bytes for the complete envelope** and **49,152 UTF-8 bytes for `payload`** (the smaller limit applies after canonical serialization, before transport framing). JSON nesting is limited to 16 levels, arrays to 256 items, and any string to 4,096 UTF-8 bytes unless a stricter field limit below applies. Readers MUST reject malformed envelopes, unknown required fields, unsupported major versions, invalid enum values, oversized payloads, and missing correlation/idempotency identifiers without applying side effects. Limits are inclusive; boundary values are accepted and the next byte/item/level is rejected.
 
+### Canonical JSON (normative)
+
+Policy hashes use the UTF-8 bytes emitted by the canonicalizer, with no BOM,
+whitespace, comments, or trailing data. Objects are ordered by ordinal UTF-16
+code units (the same ordering as .NET `StringComparer.Ordinal`); arrays retain
+their input order. Object member names are compared case-sensitively, and a
+duplicate name is invalid at every depth (including inside arrays). Strings
+escape quotation mark, reverse solidus, and control characters; JSON short escapes
+are used for backspace, form feed, line feed, carriage return, and tab, while all
+other controls use lowercase `\\u00xx`; paired surrogate code units are emitted as
+uppercase `\\uXXXX`, while unpaired surrogates are rejected. Supplementary Unicode
+scalars are emitted as their uppercase UTF-16 surrogate pair. No Unicode normalization
+is performed.
+
+Numbers are parsed without binary floating-point conversion. `-0` and every
+zero with a fractional or exponent spelling canonicalize to `0`; integral
+values use decimal notation without a decimal point, and other finite values
+use expanded decimal notation with no exponent and no trailing fractional
+zeroes. The sign is preserved for non-zero values. Exponents must be in the
+inclusive range -1,000,000..1,000,000; non-finite values (`NaN` and
+`Infinity`), malformed numbers, invalid UTF-8, and duplicate members are
+rejected. Implementations MUST fail before allocating unbounded output and
+MUST produce identical UTF-8 bytes for the same valid input.
+
 Required envelope members are exactly `contract`, `version`, `message_type`, `correlation_id`, and `payload`; their types are string, integer, string, UUID string, and object respectively. `contract` MUST equal `control-parental.windows`, `version` MUST equal `1`, and `correlation_id` MUST be a non-zero UUID. Unknown members outside `extensions` are rejected (including a member that a newer peer treats as required). The optional `extensions` object MAY occur at envelope or payload level, is capped at 8 keys and 8,192 UTF-8 bytes, and its keys MUST match `^x-[a-z0-9][a-z0-9._-]{0,63}$`; v1 readers ignore its values without side effects. `extensions` is the only forward-compatible extension point. It MUST NOT contain authority, identity, grant, verdict, or secret material. Serialization uses System.Text.Json source generation and stable snake_case wire names. Enums are strings, never numeric ordinals.
 
 All timestamps are RFC 3339 UTC (`Z`) with seconds precision (fractional seconds are rejected). The following table is exhaustive: the field's origin determines its validation window, and no generic future-skew rule overrides it.

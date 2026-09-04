@@ -5,6 +5,8 @@
 namespace ControlParental.Service.Tests;
 
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
 using Moq;
@@ -674,7 +676,7 @@ public class BackendClientTests
         var result = await sut.CreateTimeRequestAsync(request, CancellationToken.None);
 
         // Assert
-        Assert.True(result);
+        Assert.False(result);
     }
 
     [Fact]
@@ -708,6 +710,31 @@ public class BackendClientTests
     }
 
     [Fact]
+    public async Task ReportIntegrityAsync_WithMatchingTypedVerdict_ReturnsDefinitiveVerdict()
+    {
+        var correlation = GuidFromHashMaterial("abc123");
+        var responseJson = $"{{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"integrity.verdict\",\"correlation_id\":\"{correlation:D}\",\"payload\":{{\"verdict\":\"trust\",\"evidence_id\":\"{correlation:D}\",\"evaluated_at\":\"2026-08-28T12:00:00Z\",\"verdict_version\":1,\"reason_code\":\"ok\"}}}}";
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        handlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent(responseJson) });
+        var sut = new BackendClient(new HttpClient(handlerMock.Object), "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        var report = new IntegrityReport
+        {
+            ReportHash = "abc123",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+
+        var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("trust", result.Verdict);
+    }
+
+    [Fact]
     public async Task ReportIntegrityAsync_WhenSuccess_ReturnsTrue()
     {
         // Arrange
@@ -729,13 +756,14 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
         var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
 
         // Assert
-        Assert.True(result.Success);
+        Assert.False(result.Success);
     }
 
     [Fact]
@@ -760,6 +788,7 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
@@ -767,6 +796,62 @@ public class BackendClientTests
 
         // Assert
         Assert.False(result.Success);
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_WithMalformedBinaryHash_DoesNotSend()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Strict);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        var report = new IntegrityReport
+        {
+            ReportHash = "abc123",
+            BinaryHash = "not-a-sha256",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        };
+
+        var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
+
+        Assert.False(result.Success);
+        handlerMock.Protected().Verify(
+            "SendAsync",
+            Times.Never(),
+            ItExpr.IsAny<HttpRequestMessage>(),
+            ItExpr.IsAny<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_WithMalformedTypedVerdict_DoesNotManufactureVerdict()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.Created)
+            {
+                Content = new StringContent("{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"integrity.verdict\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"payload\":{\"verdict\":\"revoked\",\"evidence_id\":\"00000000-0000-4000-8000-000000000002\",\"evaluated_at\":\"2026-08-28T12:00:00Z\",\"verdict_version\":1,\"reason_code\":\"unknown\",\"unexpected\":true}}"),
+            });
+
+        var result = await sut.ReportIntegrityAsync(new IntegrityReport
+        {
+            ReportHash = "abc123",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        }, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Null(result.Verdict);
     }
 
     // ── T18: Idempotency header verification ─────────────────────────────────
@@ -1138,6 +1223,7 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
@@ -1744,5 +1830,13 @@ public class BackendClientTests
         // Assert
         Assert.False(result.Success);
         Assert.Equal(PairingHttpStatus.NetworkError, result.Status);
+    }
+
+    private static Guid GuidFromHashMaterial(string material)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(material))[..16];
+        bytes[7] = (byte)((bytes[7] & 0x0f) | 0x40);
+        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
+        return new Guid(bytes);
     }
 }

@@ -42,8 +42,25 @@ using ControlParental.Domain;
 [JsonSerializable(typeof(List<DeviceAlertEntry>))]
 [JsonSerializable(typeof(List<BehavioralEventEntry>))]
 [JsonSerializable(typeof(List<TimeRequestEntry>))]
+[JsonSerializable(typeof(TimeRequestPostPayload))]
 public sealed partial class SharedJsonContext : JsonSerializerContext
 {
+}
+
+/// <summary>
+/// Typed request sent to the time_requests endpoint. Keeping this DTO explicit
+/// prevents anonymous payloads from bypassing the wire contract at this boundary.
+/// </summary>
+public sealed record TimeRequestPostPayload
+{
+    [JsonPropertyName("request_id")] public required string RequestId { get; init; }
+    [JsonPropertyName("minutes")] public required int Minutes { get; init; }
+    [JsonPropertyName("reason")] public string? Reason { get; init; }
+    [JsonPropertyName("created_at")] public required string CreatedAt { get; init; }
+    [JsonPropertyName("scope")] public string? Scope { get; init; }
+    [JsonPropertyName("origin")] public string? Origin { get; init; }
+    [JsonPropertyName("policy_version")] public ulong? PolicyVersion { get; init; }
+    [JsonPropertyName("device_id")] public string? DeviceId { get; init; }
 }
 
 /// <summary>
