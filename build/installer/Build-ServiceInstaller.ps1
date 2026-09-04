@@ -35,6 +35,12 @@ param(
 
     [string]$InstallerScript = 'build/installer/Install-ControlParentalService.ps1',
 
+    [string]$BootstrapperScript = 'build/installer/Invoke-ControlParentalBootstrapper.ps1',
+
+    [string]$MsixScript = 'Build-MSIX.ps1',
+
+    [switch]$SkipMsixBuild,
+
     # Skip the dotnet publish step (use the existing bin/Release output).
     [switch]$SkipPublish
 )
@@ -56,7 +62,9 @@ $absoluteOutputRoot = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
 $serviceStage = Join-Path $absoluteOutputRoot 'payload/service'
 $agentStage = Join-Path $absoluteOutputRoot 'payload/agent'
 $installerDest = Join-Path $absoluteOutputRoot 'Install-ControlParentalService.ps1'
+$bootstrapperDest = Join-Path $absoluteOutputRoot 'Invoke-ControlParentalBootstrapper.ps1'
 $manifestPath = Join-Path $absoluteOutputRoot 'build-manifest.json'
+$msixDest = Join-Path $absoluteOutputRoot 'ControlParental.App.msix'
 
 Write-Host "[Build-ServiceInstaller] Output root: $absoluteOutputRoot"
 
@@ -77,11 +85,26 @@ $absoluteInstallerScript = if ([System.IO.Path]::IsPathRooted($InstallerScript))
     Join-Path $repoRoot $InstallerScript
 }
 
-foreach ($p in @($absoluteServiceProject, $absoluteAgentProject, $absoluteInstallerScript)) {
+if ([System.IO.Path]::IsPathRooted($BootstrapperScript)) {
+    $absoluteBootstrapperScript = $BootstrapperScript
+} else {
+    $absoluteBootstrapperScript = Join-Path $repoRoot $BootstrapperScript
+}
+$absoluteMsixScript = if ([System.IO.Path]::IsPathRooted($MsixScript)) { $MsixScript } else { Join-Path $repoRoot $MsixScript }
+foreach ($p in @($absoluteServiceProject, $absoluteAgentProject, $absoluteInstallerScript, $absoluteBootstrapperScript, $absoluteMsixScript)) {
     if (-not (Test-Path -LiteralPath $p)) {
         Fail "Required input not found: $p"
     }
 }
+
+if (-not $SkipMsixBuild) {
+    Write-Host "[Build-ServiceInstaller] Building UI MSIX"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $absoluteMsixScript -Configuration $Configuration
+    if ($LASTEXITCODE -ne 0) { Fail "MSIX build failed (exit $LASTEXITCODE)" }
+}
+$builtMsix = Join-Path $repoRoot 'ControlParental.App.msix'
+if (-not (Test-Path -LiteralPath $builtMsix)) { Fail "Required UI MSIX not found: $builtMsix" }
+Copy-Item -LiteralPath $builtMsix -Destination $msixDest -Force
 
 function Publish-Project([string]$csproj, [string]$output) {
     Write-Host "[Build-ServiceInstaller] Publishing $csproj -> $output"
@@ -135,16 +158,38 @@ foreach ($binary in $expectedBinaries) {
 
 # 3) Copy the installer script into the bundle root.
 Copy-Item -LiteralPath $absoluteInstallerScript -Destination $installerDest -Force
+Copy-Item -LiteralPath $absoluteBootstrapperScript -Destination $bootstrapperDest -Force
 
 # 4) Write a deterministic build manifest the install step can reference.
 $manifest = [ordered]@{
     schema          = 't00-build-manifest/v1'
+    version         = '1.0.0.0'
     configuration   = $Configuration
     runtime         = $Runtime
     serviceBinary   = 'payload/service/ControlParental.Service.exe'
     agentBinary     = 'payload/agent/ControlParental.SessionAgent.exe'
     installerScript = 'Install-ControlParentalService.ps1'
+    bootstrapperScript = 'Invoke-ControlParentalBootstrapper.ps1'
+    msixPackage     = 'ControlParental.App.msix'
+    componentVersions = [ordered]@{
+        service = $null
+        agent = $null
+        ui = $null
+    }
     builtAtUtc      = (Get-Date).ToUniversalTime().ToString('o')
+}
+$serviceVersion = (Get-Item (Join-Path $serviceStage 'ControlParental.Service.exe')).VersionInfo.ProductVersion
+$agentVersion = (Get-Item (Join-Path $agentStage 'ControlParental.SessionAgent.exe')).VersionInfo.ProductVersion
+if ([string]::IsNullOrWhiteSpace($serviceVersion) -or [string]::IsNullOrWhiteSpace($agentVersion)) {
+    Fail 'Published payload is missing component versions'
+}
+$manifest.componentVersions.service = $serviceVersion
+$manifest.componentVersions.agent = $agentVersion
+$manifest.componentVersions.ui = $manifest.version
+$manifest.checksums = [ordered]@{}
+foreach ($path in @($serviceStage + '/ControlParental.Service.exe', $agentStage + '/ControlParental.SessionAgent.exe', $installerDest, $bootstrapperDest, $msixDest)) {
+    $relative = $path.Substring($absoluteOutputRoot.Length + 1).Replace('\', '/')
+    $manifest.checksums[$relative] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 $manifest | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $manifestPath -Encoding utf8
 

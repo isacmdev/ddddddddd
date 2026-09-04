@@ -1,5 +1,12 @@
 # T00 Service Installer — Script Contract Harness
 
+The release bundle also contains `Invoke-ControlParentalBootstrapper.ps1`.
+It is the single lab/release entry point for the UI MSIX plus the
+Service/SessionAgent payload (`Install`, `Repair`, `Upgrade`, `Uninstall`).
+It validates the build manifest SHA-256 entries and accepts `Valid` or
+`NotSigned` Authenticode status; it makes no EV, SmartScreen, or public
+distribution claim.
+
 This harness exercises the **Install-ControlParentalService.ps1** script
 contract without requiring elevation, a real SCM, or `sc.exe` on a clean
 Windows machine. It exists so that the installer's fail-loud branches are
@@ -26,6 +33,15 @@ contents (`status`, `scmState`, `authenticodeStatus`, paths).
 
 The mock `sc.cmd` lives only inside the harness's temp directory; it never
 replaces the real `sc.exe`.
+
+## Service configuration
+
+The service installer accepts `-ConfigFile <path>` (a file path only, never a
+secret value on the command line) and writes only `SUPABASE_URL` and
+`SUPABASE_ANON_KEY` to `%ProgramData%\ControlParental\.env`. The file and its
+parent are ACL-restricted to LocalSystem and Administrators. Existing
+configuration is reused when `-ConfigFile` is omitted. Invalid, missing, or
+`service_role` credentials fail closed without printing the key.
 
 ## Running it
 

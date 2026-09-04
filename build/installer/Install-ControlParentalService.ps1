@@ -51,7 +51,15 @@ param(
     # Override sc.exe path (used by the script-contract test harness).
     [string]$ScExe = 'sc.exe',
 
+    [string]$AclExe = 'icacls.exe',
+
     [string]$ReceiptPath,
+
+    # File containing SUPABASE_URL and SUPABASE_ANON_KEY. Never pass secrets
+    # as command-line values. If omitted, an existing DataRoot\\.env is reused.
+    [string]$ConfigFile,
+
+    [string]$DataRoot,
 
     # Reinstall even if the service already exists (config + failure actions reapplied).
     [switch]$Force,
@@ -64,6 +72,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$createdService = $false
+$installBackup = $null
+$configBackup = $null
+$configExisted = $false
+$serviceWasRunning = $false
 
 function Write-Receipt(
     [string]$Status,
@@ -94,12 +107,112 @@ function Write-Receipt(
 
 function Fail([string]$message, [string]$step) {
     [Console]::Error.WriteLine("[Install-ControlParentalService] $step`: $message")
+    if ($createdService -and (Get-Command Invoke-Sc -ErrorAction SilentlyContinue)) {
+        try {
+            $stopResult = Invoke-Sc "stop $quotedServiceName"
+            $deleteResult = Invoke-Sc "delete $quotedServiceName"
+            if ($stopResult.ExitCode -ne 0 -or $deleteResult.ExitCode -ne 0) {
+                throw 'SCM cleanup returned a nonzero exit code'
+            }
+        } catch {
+            [Console]::Error.WriteLine('[Install-ControlParentalService] rollback: service cleanup failed')
+        }
+    }
+    if ($serviceWasRunning -and (Get-Command Invoke-Sc -ErrorAction SilentlyContinue)) {
+        try { $null = Invoke-Sc "start $quotedServiceName" } catch { }
+    }
+    try {
+        if ($installBackup -and (Test-Path -LiteralPath $installBackup)) {
+            if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force }
+            Copy-Item -LiteralPath $installBackup -Destination $InstallRoot -Recurse -Force
+        }
+        $configDestination = Join-Path $script:DataRoot '.env'
+        if ($script:configExisted -and $script:configBackup -and (Test-Path -LiteralPath $script:configBackup)) {
+            Copy-Item -LiteralPath $script:configBackup -Destination $configDestination -Force
+        } elseif (-not $script:configExisted -and (Test-Path -LiteralPath $configDestination)) {
+            Remove-Item -LiteralPath $configDestination -Force
+        }
+        if ($script:configBackup -and (Test-Path -LiteralPath $script:configBackup)) { Remove-Item -LiteralPath $script:configBackup -Force }
+    } catch {
+        [Console]::Error.WriteLine('[Install-ControlParentalService] rollback: previous payload/config restore failed')
+    }
     try {
         Write-Receipt -Status 'Failed' -State $step -AuthenticodeStatus 'UnknownError' -Notes $message -BestEffort
     } catch {
         # Best-effort: do not let a receipt write mask the original failure.
     }
     exit 1
+}
+
+function Provision-Configuration {
+    if (-not $DataRoot) {
+        $script:DataRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ControlParental'
+    }
+    if (-not $script:DataRoot) { $script:DataRoot = $DataRoot }
+    if (-not (Test-Path -LiteralPath $script:DataRoot)) {
+        New-Item -ItemType Directory -Path $script:DataRoot -Force | Out-Null
+    }
+    $destination = Join-Path $script:DataRoot '.env'
+    if (Test-Path -LiteralPath $destination) {
+        $script:configExisted = $true
+        $script:configBackup = Join-Path $script:DataRoot '.env.rollback'
+        Copy-Item -LiteralPath $destination -Destination $script:configBackup -Force
+    }
+    $source = if ($ConfigFile) { $ConfigFile } else { $destination }
+    if (-not (Test-Path -LiteralPath $source)) {
+        Fail 'Configuration file was not supplied and no existing service configuration was found.' 'configuration'
+    }
+    try {
+        $contents = Get-Content -LiteralPath $source -Raw -ErrorAction Stop
+    } catch {
+        Fail 'Configuration file could not be read.' 'configuration'
+    }
+    $urlMatch = [regex]::Match($contents, '(?m)^\s*SUPABASE_URL\s*=\s*(\S+)\s*$')
+    $keyMatch = [regex]::Match($contents, '(?m)^\s*SUPABASE_ANON_KEY\s*=\s*(\S+)\s*$')
+    if (-not $urlMatch.Success -or -not $keyMatch.Success) {
+        Fail 'Configuration must contain SUPABASE_URL and SUPABASE_ANON_KEY.' 'configuration'
+    }
+    $url = $urlMatch.Groups[1].Value.Trim('"')
+    $key = $keyMatch.Groups[1].Value.Trim('"')
+    $parsedUrl = $null
+    $pinMatch = [regex]::Match($contents, '(?m)^\s*(SUPABASE_CERT_PINS|SUPABASE_CERT_PIN)\s*=\s*(\S+)\s*$')
+    $pins = if ($pinMatch.Success) { $pinMatch.Groups[2].Value.Trim('"') } else { $null }
+    $pinsValid = $true
+    if ($pins) {
+        foreach ($pin in $pins.Split(';')) {
+            try {
+                $bytes = [Convert]::FromBase64String($pin.Trim().Substring(7))
+                if (-not $pin.Trim().StartsWith('sha256/') -or $bytes.Length -ne 32) { $pinsValid = $false }
+            } catch { $pinsValid = $false }
+        }
+    }
+    $keyLooksPublishable = $key -match '^sb_(publishable|anon)_[A-Za-z0-9._~-]{5,}$'
+    $jwtParts = $key.Split('.')
+    if (-not $keyLooksPublishable -and $jwtParts.Count -eq 3) {
+        try {
+            $payload = $jwtParts[1].Replace('-', '+').Replace('_', '/')
+            $payload = $payload.PadRight($payload.Length + ((4 - $payload.Length % 4) % 4), '=')
+            $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            $keyLooksPublishable = $claims.role -eq 'anon'
+        } catch { $keyLooksPublishable = $false }
+    }
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUrl) -or
+        $parsedUrl.Scheme -ne 'https' -or [string]::IsNullOrWhiteSpace($parsedUrl.Host) -or
+        -not $keyLooksPublishable -or $key -match '(?i)^sb_secret_|YOUR-' -or -not $pinsValid) {
+        Fail 'Configuration is invalid; expected an HTTPS URL and publishable key.' 'configuration'
+    }
+    try {
+        $outputLines = @("SUPABASE_URL=$url", "SUPABASE_ANON_KEY=$key")
+        if ($pins) { $outputLines += "SUPABASE_CERT_PINS=$pins" }
+        $outputLines |
+            Set-Content -LiteralPath $destination -Encoding utf8 -Force -ErrorAction Stop
+        & $AclExe $script:DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'directory ACL failed' }
+        & $AclExe $destination /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'file ACL failed' }
+    } catch {
+        Fail 'Configuration could not be written with a restricted ACL.' 'configuration'
+    }
 }
 
 # --- Determine bundle root ---------------------------------------------------
@@ -157,9 +270,15 @@ if (-not (Get-Command $ScExe -ErrorAction SilentlyContinue) -and -not (Test-Path
     Fail "sc.exe not found at path: $ScExe" 'preflight'
 }
 
+Provision-Configuration
+
 # --- Copy payload ------------------------------------------------------------
 Write-Host "[Install-ControlParentalService] Copying payload to $InstallRoot"
 try {
+    if (Test-Path -LiteralPath $InstallRoot) {
+        $installBackup = Join-Path ([IO.Path]::GetTempPath()) ('ControlParental-install-' + [Guid]::NewGuid().ToString('N'))
+        Copy-Item -LiteralPath $InstallRoot -Destination $installBackup -Recurse -Force
+    }
     Copy-Item -Path "$servicePayload/*" -Destination $InstallRoot -Recurse -Force -ErrorAction Stop
 } catch {
     Fail "Failed to copy service payload: $($_.Exception.Message)" 'copy'
@@ -200,12 +319,31 @@ function Invoke-Sc {
     }
 }
 
+function Get-ScState {
+    $result = Invoke-Sc "query $quotedServiceName"
+    if ($result.ExitCode -ne 0) { return 'ABSENT' }
+    if ($result.Output -match 'RUNNING') { return 'RUNNING' }
+    if ($result.Output -match 'STOP_PENDING') { return 'STOP_PENDING' }
+    if ($result.Output -match 'START_PENDING') { return 'START_PENDING' }
+    if ($result.Output -match 'STOPPED') { return 'STOPPED' }
+    return 'UNKNOWN'
+}
+
+function Wait-ForRunning([int]$TimeoutSeconds = 30) {
+    for ($attempt = 0; $attempt -lt $TimeoutSeconds; $attempt++) {
+        if ((Get-ScState) -eq 'RUNNING') { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
 # --- Idempotent create -------------------------------------------------------
 $quotedServiceName = '"' + $ServiceName + '"'
 $quotedBinaryPath = '"' + $installedServiceExe + '"'
 
-$query = Invoke-Sc "query $quotedServiceName"
-$exists = $query.ExitCode -eq 0
+$initialState = Get-ScState
+$exists = $initialState -ne 'ABSENT'
+$serviceWasRunning = $initialState -eq 'RUNNING'
 
 if (-not $exists) {
     Write-Host "[Install-ControlParentalService] Creating service $ServiceName -> $installedServiceExe"
@@ -213,6 +351,7 @@ if (-not $exists) {
     if ($create.ExitCode -ne 0) {
         Fail "sc.exe create failed (exit $($create.ExitCode)): $($create.Output)" 'sc-create'
     }
+    $createdService = $true
 } elseif ($Force) {
     Write-Host "[Install-ControlParentalService] Service already exists; -Force set, leaving create idempotent."
 } else {
@@ -234,9 +373,15 @@ if ($failure.ExitCode -ne 0) {
 }
 
 # --- start -------------------------------------------------------------------
+if ($serviceWasRunning) {
+    Write-Host "[Install-ControlParentalService] Restarting the existing service after payload replacement"
+    $stop = Invoke-Sc "stop $quotedServiceName"
+    if ($stop.ExitCode -ne 0) {
+        Fail "sc.exe stop failed (exit $($stop.ExitCode)): $($stop.Output)" 'sc-stop'
+    }
+}
 Write-Host "[Install-ControlParentalService] Starting service"
 $start = Invoke-Sc "start $quotedServiceName"
-# sc.exe start returns 0 on a START_PENDING outcome; treat as success.
 if ($start.ExitCode -ne 0) {
     Fail "sc.exe start failed (exit $($start.ExitCode)): $($start.Output)" 'sc-start'
 }
@@ -244,22 +389,11 @@ if ($start.ExitCode -ne 0) {
 # --- query RUNNING -----------------------------------------------------------
 $queriedState = 'UNKNOWN'
 if (-not $SkipRunningCheck) {
-    Start-Sleep -Seconds 2
-    $runningQuery = Invoke-Sc "query $quotedServiceName"
-    $queriedState = if ($runningQuery.Output -match 'RUNNING') {
-        'RUNNING'
-    } elseif ($runningQuery.Output -match 'STOP_PENDING') {
-        'STOP_PENDING'
-    } elseif ($runningQuery.Output -match 'START_PENDING') {
-        'START_PENDING'
-    } elseif ($runningQuery.Output -match 'STOPPED') {
-        'STOPPED'
-    } else {
-        'UNKNOWN'
+    if (-not (Wait-ForRunning)) {
+        $queriedState = Get-ScState
+        Fail "Service did not reach RUNNING state. SCM reports: $queriedState." 'sc-query'
     }
-    if ($queriedState -ne 'RUNNING') {
-        Fail "Service did not reach RUNNING state. SCM reports: $queriedState. Output: $($runningQuery.Output)" 'sc-query'
-    }
+    $queriedState = 'RUNNING'
 } else {
     $queriedState = 'SKIPPED'
 }
@@ -276,6 +410,8 @@ try {
 }
 
 Write-Receipt -Status 'Installed' -State $queriedState -AuthenticodeStatus $authenticodeStatus -Notes 'Install completed successfully.'
+if ($installBackup -and (Test-Path -LiteralPath $installBackup)) { Remove-Item -LiteralPath $installBackup -Recurse -Force -ErrorAction SilentlyContinue }
+if ($script:configBackup -and (Test-Path -LiteralPath $script:configBackup)) { Remove-Item -LiteralPath $script:configBackup -Force -ErrorAction SilentlyContinue }
 
 Write-Host "[Install-ControlParentalService] OK: $ServiceName is $queriedState (Authenticode = $authenticodeStatus)"
 exit 0

@@ -105,6 +105,16 @@ public sealed class CertificatePinningPolicyTests
     }
 
     [Fact]
+    public void Constructor_AcceptsCanonicalSha256Pins()
+    {
+        var pin = "sha256/" + Convert.ToBase64String(new byte[32]);
+
+        var policy = new CertificatePinningPolicy(pin, () => Now);
+
+        Assert.NotNull(policy);
+    }
+
+    [Fact]
     public void Validate_NonHttpsRequest_IsRejected()
     {
         using var certificate = CreateCertificate(Now.AddHours(-1), Now.AddHours(1));
