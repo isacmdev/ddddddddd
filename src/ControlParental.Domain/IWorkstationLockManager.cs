@@ -41,17 +41,18 @@ public interface IWorkstationLockManager
 public sealed record LockResult(
     bool Success,
     DateTimeOffset Timestamp,
-    string? ErrorMessage)
+    string? ErrorMessage,
+    ActionStatus Status)
 {
     /// <summary>
     /// Creates a successful result.
     /// </summary>
     public static LockResult Succeeded(DateTimeOffset timestamp)
-        => new(true, timestamp, null);
+        => new(true, timestamp, null, ActionStatus.Confirmed);
 
     /// <summary>
     /// Creates a failed result.
     /// </summary>
-    public static LockResult Failed(DateTimeOffset timestamp, string error)
-        => new(false, timestamp, error);
+    public static LockResult Failed(DateTimeOffset timestamp, string error, ActionStatus status)
+        => new(false, timestamp, error, status);
 }

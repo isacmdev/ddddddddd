@@ -23,8 +23,8 @@ public interface IUIChannel
     Task<TResponse?> QueryAsync<TQuery, TResponse>(
         TQuery query,
         CancellationToken ct = default)
-        where TQuery : IUIMessage
-        where TResponse : class, IUIMessage;
+        where TQuery : ControlParental.Domain.IUIMessage
+        where TResponse : class, ControlParental.Domain.IUIMessage;
 
     /// <summary>
     /// Sends a message to the Service without waiting for a response. Transport
@@ -35,5 +35,5 @@ public interface IUIChannel
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
     Task SendAsync<T>(T message, CancellationToken ct = default)
-        where T : IUIMessage;
+        where T : ControlParental.Domain.IUIMessage;
 }

@@ -25,6 +25,7 @@ public class ScheduledWorkServiceTests : IDisposable
     private readonly Mock<IServiceHealthMonitor> mockHealthMonitor;
     private readonly Mock<IServiceRecoveryManager> mockRecoveryManager;
     private readonly Mock<IPolicyRepository> mockPolicyRepository;
+    private readonly Mock<IBackendIdentityCoordinator> mockIdentityCoordinator;
     private readonly ScheduledWorkService service;
 
     public ScheduledWorkServiceTests()
@@ -37,12 +38,15 @@ public class ScheduledWorkServiceTests : IDisposable
         this.mockHealthMonitor = new Mock<IServiceHealthMonitor>();
         this.mockRecoveryManager = new Mock<IServiceRecoveryManager>();
         this.mockPolicyRepository = new Mock<IPolicyRepository>();
+        this.mockIdentityCoordinator = new Mock<IBackendIdentityCoordinator>();
 
         // Default setups
         this.mockUsageReconciler.SetupGet(r => r.IsRunning).Returns(false);
         this.mockEnforcementLevelMonitor.SetupGet(m => m.CurrentLevel).Returns(EnforcementLevel.Standard);
         this.mockHealthMonitor.SetupGet(m => m.IsAgentHealthy).Returns(true);
         this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(DateTimeOffset.UtcNow);
+        this.mockIdentityCoordinator.SetupGet(c => c.CurrentState).Returns(
+            BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
 
         this.service = new ScheduledWorkService(
             backendClient: this.mockBackendClient.Object,
@@ -52,7 +56,8 @@ public class ScheduledWorkServiceTests : IDisposable
             timeProvider: this.mockTimeProvider.Object,
             healthMonitor: this.mockHealthMonitor.Object,
             recoveryManager: this.mockRecoveryManager.Object,
-            policyRepository: this.mockPolicyRepository.Object);
+            policyRepository: this.mockPolicyRepository.Object,
+            identityCoordinator: this.mockIdentityCoordinator.Object);
     }
 
     public void Dispose()
@@ -631,6 +636,7 @@ public class ScheduledWorkServiceBackupPollingTests : IDisposable
     private readonly Mock<IServiceHealthMonitor> mockHealthMonitor;
     private readonly Mock<IServiceRecoveryManager> mockRecoveryManager;
     private readonly Mock<IPolicyRepository> mockPolicyRepository;
+    private readonly Mock<IBackendIdentityCoordinator> mockIdentityCoordinator;
     private readonly ScheduledWorkService service;
 
     public ScheduledWorkServiceBackupPollingTests()
@@ -643,11 +649,14 @@ public class ScheduledWorkServiceBackupPollingTests : IDisposable
         this.mockHealthMonitor = new Mock<IServiceHealthMonitor>();
         this.mockRecoveryManager = new Mock<IServiceRecoveryManager>();
         this.mockPolicyRepository = new Mock<IPolicyRepository>();
+        this.mockIdentityCoordinator = new Mock<IBackendIdentityCoordinator>();
 
         this.mockUsageReconciler.SetupGet(r => r.IsRunning).Returns(false);
         this.mockEnforcementLevelMonitor.SetupGet(m => m.CurrentLevel).Returns(EnforcementLevel.Standard);
         this.mockHealthMonitor.SetupGet(m => m.IsAgentHealthy).Returns(true);
         this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(DateTimeOffset.UtcNow);
+        this.mockIdentityCoordinator.SetupGet(c => c.CurrentState).Returns(
+            BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
 
         // Setup policy sync mocks
         this.mockPolicyRepository
@@ -665,7 +674,8 @@ public class ScheduledWorkServiceBackupPollingTests : IDisposable
             timeProvider: this.mockTimeProvider.Object,
             healthMonitor: this.mockHealthMonitor.Object,
             recoveryManager: this.mockRecoveryManager.Object,
-            policyRepository: this.mockPolicyRepository.Object);
+            policyRepository: this.mockPolicyRepository.Object,
+            identityCoordinator: this.mockIdentityCoordinator.Object);
     }
 
     public void Dispose()

@@ -1,0 +1,126 @@
+# SDD6 task 4.1 immutable child numstat manifest
+# Generated from committed Git objects in worktree HEAD 6b48044a1b07163480bdba60cd08c67dfea7ca6d.
+# Command for each section: git diff --numstat <exact-parent> <child-commit>
+# Classification is exhaustive per section: CODE, TEST, DOC/EVIDENCE, GENERATED/BINARY.
+
+[1.1A, 1.1B1, 1.1B2a, 1.1B2b]
+authority=audited foundation anchor 7b74a0a4b6430610b344cea0afa9da7493e1a084
+parent=not recoverable per verify-report-foundation-baseline-accepted.md
+child=not individually committed; governance-accepted baseline
+numstat=NOT CLAIMED; no per-unit patch or child numstat fabricated
+classification=NOT CLAIMED; approved warning retained
+approval=verify-report-foundation-baseline-accepted.md (PASS WITH WARNINGS)
+
+[1.2]
+authority=WARNING under explicit user-authorized historical predecessor-boundary exception; historical external remediation chain inspected read-only
+required_prior=audited foundation terminal `7b74a0a4b6430610b344cea0afa9da7493e1a084`
+required_target=exact next-child base `8fdfb895ccf1ad6411902724d3a636ed4831ed90`
+target_tree_files=both task-1.2 files are identical at 7b and 8f: Git blobs `e87b2499d863aac882200d1548436b70f0f3a1bb`, `0d124f895563a981947baf4eb565a3280ddfa1d0`
+historical_chain=external pre 10397/21978 bytes -> 12748/29765 -> 13723/34425 -> target 15471/36046 bytes
+patch_0=remediation-only-final2.patch; size=20761; sha256=1AC341044000456A0BB98136CBD72418C3A3CBFA733A0B9278A985EBA14828FC; pre hashes recorded in task-4.1-task1.2-boundary-audit.md
+patch_1=remediation-only-final.patch; size=10670; sha256=370A0E61941BAD7ABA6747A4957F317B1C4D4F580AF3C717B29069CD4132B2D3
+patch_2=remediation-only-final.patch; size=8252; sha256=34FC5A79C4BEBC464D017FC53A90CD15953D135341857BC4D6EF905B2AE7873F
+whole_child_numstat=UNKNOWN under authorized historical boundary exception; do not substitute 94, 76, 194, or any partial patch total
+classification=WARNING only for the missing predecessor link; internal chain/final blob equality/runtime evidence remain required and preserved
+approval=verify-report-task-1.2-approved-v2.md (behavior approval only; insufficient for task 4.1)
+missing_link=accepted foundation terminal -> first external pre-state / task-1.2 child start; explicitly excepted by user, and nowhere else
+exception_scope=only this predecessor link; no waiver for internal chain, final blobs, runtime, coverage, <=800, future children, or classifications
+runtime_support=41 focused green; 1111/1111 slice regression; 100% changed-scope lines/branches; later integrated 1156/1156 regression (approved reports)
+
+[2.1]
+parent=8fdfb895ccf1ad6411902724d3a636ed4831ed90
+child=0c671fa8ad937231be73dc19a93d37cac59c760c
+branch=feat/sdd6-2-1-failure-classification; worktree task-2-1
+tree=15aa1c62c394df71c8347979809329dd7a3c0cb4
+patch_bytes=82901; patch_sha256=9343f6b85115c9b52d702bf185c83d1fe47d404db3d51479506e8932926846e5
+patch_id=7b2e903a82adcb73b9132cd01dd266819f800a54
+CODE+TEST=313; size_exception=NO
+DOC/EVIDENCE=586; GENERATED/BINARY=0
+8fdfb895..0c671fa8 raw numstat:
+116 1 openspec/changes/offline-sync-recovery/apply-progress.md
+1 1 openspec/changes/offline-sync-recovery/tasks.md
+176 0 openspec/changes/offline-sync-recovery/verify-report-task-2.1-approved-v2.md
+155 0 openspec/changes/offline-sync-recovery/verify-report-task-2.1-approved.md
+136 0 openspec/changes/offline-sync-recovery/verify-report-task-2.1.md
+42 25 src/ControlParental.Service/BackendClient.cs
+47 0 tests/ControlParental.Service.Tests/AuthenticatedBackendClientTests.cs
+199 0 tests/ControlParental.Service.Tests/BackendClientTests.cs
+approval=verify-report-task-2.1-approved-v2.md (PASS WITH WARNINGS)
+
+[2.2]
+parent=0c671fa8ad937231be73dc19a93d37cac59c760c
+child=7e0a173b248cab7b3e42d568efd9cf629e65ab09
+branch=feat/sdd6-2-2-scheduled-delivery; worktree task-2-2
+tree=129193cd4fbbc6176ff967b6427d6887637716f2
+patch_bytes=108141; patch_sha256=65d3a8a986d8059c81234954b5064ffab72723d824707a7ed9075c2d4889b1db
+patch_id=a4734aa06eaeeb86e9a49dda7e3b91aedd950f02
+CODE=303; TEST=258; CODE+TEST=561; size_exception=ACCEPTED (401-800)
+DOC/EVIDENCE=726; GENERATED/BINARY=0
+0c671fa..7e0a173 raw numstat:
+156 3 openspec/changes/offline-sync-recovery/apply-progress.md
+14 12 openspec/changes/offline-sync-recovery/tasks.md
+189 0 openspec/changes/offline-sync-recovery/verify-report-task-2.2-approved-v2.md
+170 0 openspec/changes/offline-sync-recovery/verify-report-task-2.2-approved.md
+182 0 openspec/changes/offline-sync-recovery/verify-report-task-2.2.md
+147 156 src/ControlParental.Service/ScheduledWorkService.cs
+10 2 tests/ControlParental.Service.Tests/OutboxBridgeIntegrationTests.cs
+225 4 tests/ControlParental.Service.Tests/ScheduledWorkServiceAsyncDispatchTests.cs
+17 0 tests/ControlParental.Service.Tests/ScheduledWorkServiceIdentityTests.cs
+approval=verify-report-task-2.2-approved-v2.md (PASS WITH WARNINGS)
+
+[3.1]
+parent=7e0a173b248cab7b3e42d568efd9cf629e65ab09
+child=3ef873100f7d800e35032558136039367e741a42
+branch=feat/sdd6-3-1-usage-reconciliation; worktree task-3-1
+tree=not independently recorded in prior report; commit object authoritative
+patch_bytes=75777; patch_sha256=a59077039553041449008dab3ed6ced53ca2133a5c7b70b5efdabe45ef468fa2
+patch_id=51374a294ec68d69fa41e52b187c6ea6bc07560a
+CODE=302; TEST=323; CODE+TEST=625; size_exception=ACCEPTED (401-800)
+DOC/EVIDENCE=413; GENERATED/BINARY=0
+7e0a173..3ef8731 raw numstat:
+49 1 openspec/changes/offline-sync-recovery/apply-progress.md
+1 1 openspec/changes/offline-sync-recovery/tasks.md
+183 0 openspec/changes/offline-sync-recovery/verify-report-task-3.1-approved.md
+178 0 openspec/changes/offline-sync-recovery/verify-report-task-3.1.md
+3 1 src/ControlParental.Domain/IUsageReconciler.cs
+210 88 src/ControlParental.Service/UsageReconciler.cs
+323 0 tests/ControlParental.Service.Tests/UsageReconcilerTests.cs
+approval=verify-report-task-3.1-approved.md (PASS WITH WARNINGS)
+
+[3.2]
+parent=3ef873100f7d800e35032558136039367e741a42
+child=6b48044a1b07163480bdba60cd08c67dfea7ca6d
+branch=feat/sdd6-3-2-backup-admission; worktree task-3-2
+tree=not independently recorded in prior report; commit object authoritative
+patch_bytes=141275; patch_sha256=722b47bbfcef060ffa8358804d7115157f88c39cec139d2db255c662ec2535aa
+patch_id=19c2f71fc3192d68451790ede6bbf9aa6e8f2051
+external_authority=stale historical external patch/manifest hashes are not used; committed diff is sole authority
+CODE=197; TEST=531; CODE+TEST=728; size_exception=ACCEPTED (401-800)
+DOC/EVIDENCE=1167; GENERATED/BINARY=0
+3ef8731..6b48044 raw numstat:
+150 0 openspec/changes/offline-sync-recovery/apply-progress.md
+2 2 openspec/changes/offline-sync-recovery/tasks.md
+151 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2-authoritative-fresh-final-fail.md
+165 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2-authoritative-fresh-post-global-hook.md
+155 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2-final-reverification.md
+159 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2-reverification.md
+177 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2-third-independent.md
+206 0 openspec/changes/offline-sync-recovery/verify-report-task-3.2.md
+7 0 src/ControlParental.Domain/IScheduledWorkService.cs
+7 0 src/ControlParental.Domain/ITaskSchedulerBackup.cs
+118 6 src/ControlParental.Service/Program.cs
+1 1 src/ControlParental.Service/ScheduledWorkService.cs
+55 2 src/ControlParental.Service/TaskSchedulerBackupService.cs
+62 0 tests/ControlParental.Service.Tests/ProgramBackupArgsTests.cs
+319 0 tests/ControlParental.Service.Tests/ProgramHardeningTests.cs
+75 75 tests/ControlParental.Service.Tests/TaskSchedulerBackupServiceTests.cs
+approval=verify-report-task-3.2-authoritative-fresh-post-global-hook.md (PASS WITH WARNINGS)
+
+[Reconciliation]
+formal_children_through_3.2=9
+approved_formal_state_before_4.1=9/11
+task_3.2_exact_parent=6b48044a1b07163480bdba60cd08c67dfea7ca6d
+task_4.1_base=6b48044a1b07163480bdba60cd08c67dfea7ca6d
+task_4.2=not included
+generated_or_binary_paths=none in actual child ranges
+double_count_rule=each raw numstat path is classified once; patch hashes are authority metadata, never added to totals

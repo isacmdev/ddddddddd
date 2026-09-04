@@ -22,7 +22,8 @@ public sealed class UIMessageHandlerConsentTests : IDisposable
         var dbOptions = new DbContextOptionsBuilder<ControlParentalDbContext>()
             .UseInMemoryDatabase($"ipc-consent-{Guid.NewGuid():N}")
             .Options;
-        services.AddSingleton(new ControlParentalDbContext(dbOptions));
+        services.AddSingleton<IDbContextFactory<ControlParentalDbContext>>(new TrackingDbContextFactory(dbOptions));
+        services.AddSingleton<ITimeProvider, TimeProvider>();
         services.AddScoped<IConsentService, ConsentService>();
         this.provider = services.BuildServiceProvider();
 

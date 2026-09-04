@@ -19,19 +19,48 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     private readonly IIntegrityChecker integrityChecker;
     private readonly IBackendClient backendClient;
     private readonly IIntegrityVerdictHandler verdictHandler;
+    private readonly IIntegrityEscalationStateStore? stateStore;
     private readonly Action<TamperEvent>? onTamperDetected;
 
-    private Timer? monitorTimer;
-    private Timer? timezoneTimer;
-    private bool isRunning;
     private bool disposed;
     private readonly object lockObject = new();
+    private Generation? generation;
+    private int generationAllocations;
+    private readonly Func<CancellationToken, ValueTask<bool>>? tickSource;
+    private readonly IBackendIdentityCoordinator? identityCoordinator;
     private readonly List<TamperEvent> detectedEvents = new();
     private string currentTimezone;
     private long lastMonotonicTick;
     private DateTimeOffset lastWallClockTime;
     private bool clockJumpDetected;
     private bool timezoneChangedDetected;
+    private readonly AsyncLocal<Generation?> callbackGeneration = new();
+    internal Func<Task>? AdmissionCompletionRemovalGapForTesting { get; set; }
+    private sealed class Generation
+    {
+        internal readonly CancellationTokenSource Cancellation;
+        internal readonly SemaphoreSlim Gate = new(1, 1);
+        internal readonly TaskCompletionSource InitialCheck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource Lifecycle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<Exception> EffectFault = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal Task? InitialOperation;
+        internal readonly HashSet<Task> OwnedTasks = new();
+        internal readonly Func<CancellationToken, ValueTask<bool>>? TickSource;
+        internal Timer? TimezoneTimer; internal Timer? DeadlineTimer; internal PeriodicTimer? TickTimer; internal Task? Loop; internal Task? Drain;
+        internal long DeadlineVersion; internal bool DeadlineArmed;
+        internal int CancellationDisposals; internal int GateDisposals; internal int TickTimerDisposals; internal int TimezoneTimerDisposals; internal int DeadlineTimerDisposals;
+        internal bool AdmissionOpen = true; internal string Timezone = TimeZoneInfo.Local.Id;
+        internal EffectProgress? ReactionProgress;
+        internal EffectProgress? NotificationProgress;
+        internal PendingRetry? PendingRetry;
+        internal IntegrityEscalationState? DurableState;
+        internal bool Rehydrated;
+        internal Generation(CancellationToken cancellationToken, Func<CancellationToken, ValueTask<bool>>? tickSource) { this.TickSource = tickSource; this.Cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); }
+    }
+    private sealed record EffectProgress(DecisionShape Shape, string Key);
+    private sealed record DecisionShape(string Scope, long Epoch, long Sequence, string ReactionKey, string ReactionKind, bool HasNotification, string? NotificationKey, string? NotificationKind);
+    private sealed record PendingRetry(bool ReactionDomain, DecisionShape Shape);
+    private sealed record Admission(Task Task, TaskCompletionSource Gate);
 
     // Thresholds
     private const double MaxAllowedClockDriftSeconds = 300; // 5 minutes
@@ -50,7 +79,10 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         IIntegrityChecker integrityChecker,
         IBackendClient backendClient,
         IIntegrityVerdictHandler verdictHandler,
-        Action<TamperEvent>? onTamperDetected = null)
+        Action<TamperEvent>? onTamperDetected = null,
+        IBackendIdentityCoordinator? identityCoordinator = null,
+        Func<CancellationToken, ValueTask<bool>>? tickSource = null,
+        IIntegrityEscalationStateStore? stateStore = null)
     {
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.outboxManager = outboxManager ?? throw new ArgumentNullException(nameof(outboxManager));
@@ -60,7 +92,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         this.backendClient = backendClient ?? throw new ArgumentNullException(nameof(backendClient));
         this.verdictHandler = verdictHandler ?? throw new ArgumentNullException(nameof(verdictHandler));
         this.onTamperDetected = onTamperDetected ?? (_ => { });
-
+        this.identityCoordinator = identityCoordinator;
+        this.tickSource = tickSource;
+        this.stateStore = stateStore;
         this.currentTimezone = TimeZoneInfo.Local.Id;
         this.lastMonotonicTick = timeProvider.MonotonicNow;
         this.lastWallClockTime = timeProvider.WallClockNow;
@@ -114,6 +148,8 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
+    internal Task LifecycleTask => this.generation?.Lifecycle.Task ?? Task.CompletedTask;
+
     /// <inheritdoc />
     public event EventHandler<TamperEventArgs>? TamperDetected;
 
@@ -126,51 +162,369 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
     /// <inheritdoc />
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (this.disposed)
+        while (true)
         {
-            throw new ObjectDisposedException(nameof(AntiTamperMonitor));
+            Task initialization; Task? stopping = null; Admission? release = null;
+            lock (this.lockObject)
+            {
+                if (this.disposed) throw new ObjectDisposedException(nameof(AntiTamperMonitor));
+                var current = this.generation;
+                if (current is not null && current.AdmissionOpen) initialization = current.InitialCheck.Task;
+                else if (current is not null) { stopping = current.Drain!; initialization = Task.CompletedTask; }
+                else
+                {
+                    current = new Generation(cancellationToken, this.tickSource)
+                    {
+                        TimezoneTimer = new Timer(_ => this.AdmitTimezoneCheck(current), null, TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds), TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds)),
+                        TickTimer = this.tickSource is null ? new PeriodicTimer(TimeSpan.FromSeconds(MonitorIntervalSeconds)) : null,
+                    };
+                    this.generation = current; this.generationAllocations++; this.currentTimezone = current.Timezone;
+                    this.lastMonotonicTick = this.timeProvider.MonotonicNow; this.lastWallClockTime = this.timeProvider.WallClockNow;
+                    var initial = this.AdmitLocked(current, () => this.RunOwnedStartupAsync(current), default); current.InitialOperation = initial.Task; current.Loop = this.RunMonitorLoopAsync(current); initialization = current.InitialCheck.Task; release = initial;
+                }
+            }
+            release?.Gate.TrySetResult(); if (stopping is not null) { await stopping.ConfigureAwait(false); continue; }
+            await initialization.ConfigureAwait(false); break;
         }
-
-        if (this.isRunning)
-        {
-            return;
-        }
-
-        this.isRunning = true;
-
-        // Initialize timezone
-        this.currentTimezone = TimeZoneInfo.Local.Id;
-        this.lastMonotonicTick = this.timeProvider.MonotonicNow;
-        this.lastWallClockTime = this.timeProvider.WallClockNow;
-
-        // Start periodic integrity checks
-        this.monitorTimer = new Timer(
-            _ => _ = this.PerformIntegrityCheckAsync(CancellationToken.None),
-            null,
-            TimeSpan.FromSeconds(MonitorIntervalSeconds),
-            TimeSpan.FromSeconds(MonitorIntervalSeconds));
-
-        // Start timezone monitoring
-        this.timezoneTimer = new Timer(
-            _ => this.CheckTimezone(),
-            null,
-            TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds),
-            TimeSpan.FromSeconds(TimezoneCheckIntervalSeconds));
-
-        // Initial check
-        await this.PerformIntegrityCheckAsync(cancellationToken);
-
         System.Diagnostics.Debug.WriteLine("[AntiTamperMonitor] Started.");
     }
 
     /// <inheritdoc />
-    public Task StopAsync()
+    public async Task StopAsync()
     {
-        this.isRunning = false;
-        this.monitorTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-        this.timezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        var callbackOwner = this.callbackGeneration.Value;
+        Task task; TaskCompletionSource? startDrain = null;
+        lock (this.lockObject)
+        {
+            var current = this.generation;
+            if (current is null) task = Task.CompletedTask;
+            else
+            {
+                current.AdmissionOpen = false; current.Cancellation.Cancel(); this.CancelDeadlineLocked(current);
+                current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                task = this.BeginDrainLocked(current, out startDrain);
+            }
+        }
+        startDrain?.TrySetResult();
+        if (!ReferenceEquals(callbackOwner, this.generation)) await task.ConfigureAwait(false);
+
         System.Diagnostics.Debug.WriteLine("[AntiTamperMonitor] Stopped.");
-        return Task.CompletedTask;
+    }
+
+    private Task BeginDrainLocked(Generation current, out TaskCompletionSource? start)
+    {
+        if (current.Drain is not null) { start = null; return current.Drain; }
+        start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        current.Drain = this.DrainAfterAdmissionAsync(current, start.Task);
+        return current.Drain;
+    }
+    private async Task DrainAfterAdmissionAsync(Generation current, Task start)
+    {
+        await start.ConfigureAwait(false);
+        await this.DrainGenerationAsync(current).ConfigureAwait(false);
+    }
+    internal Task TriggerIntegrityCheckAsync(bool cancelWithOwner = false)
+        => this.TriggerIntegrityCheckAsync(cancelWithOwner, default);
+
+    internal Task TriggerIntegrityCheckAsync(CancellationToken cancellationToken)
+        => this.TriggerIntegrityCheckAsync(false, cancellationToken);
+
+    private Task TriggerIntegrityCheckAsync(bool cancelWithOwner, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested) return Task.FromCanceled(cancellationToken);
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (this.disposed) return Task.CompletedTask;
+            var current = this.generation;
+            if (current is null || !current.AdmissionOpen) return Task.CompletedTask;
+            admission = this.AdmitCheckLocked(current, cancelWithOwner, cancellationToken);
+        }
+        admission.Gate.TrySetResult(); return admission.Task;
+    }
+
+    private Admission AdmitCheckLocked(Generation current, bool cancelWithOwner, CancellationToken cancellationToken = default)
+        => this.AdmitLocked(current, () => this.RunOwnedCheckAsync(current, cancelWithOwner, cancellationToken), cancellationToken);
+    private Admission AdmitLocked(Generation current, Func<Task> work)
+    {
+        return this.AdmitLocked(current, work, default);
+    }
+    private Admission AdmitLocked(Generation current, Func<Task> work, CancellationToken callerToken)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var owned = new TaskCompletionSource(); var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var execution = RunAfterGateAsync(gate.Task, acquired, callerToken, work); var removalCompleted = this.AdmissionCompletionRemovalGapForTesting is null ? null : new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _ = CompleteAdmissionAsync(current, execution, completion, owned, removalCompleted, this.AdmissionCompletionRemovalGapForTesting, callerToken);
+        this.AdmitTask(current, owned.Task, removalCompleted); return new(completion.Task, gate);
+    }
+    private static async Task CompleteAdmissionAsync(Generation current, Task execution, TaskCompletionSource completion, TaskCompletionSource owned, TaskCompletionSource? removalCompleted, Func<Task>? removalGap, CancellationToken callerToken)
+    {
+        using var registration = callerToken.Register(() => completion.TrySetCanceled(callerToken));
+        try { await execution.ConfigureAwait(false); completion.TrySetResult(); owned.TrySetResult(); }
+        catch (OperationCanceledException exception) { var token = exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : current.Cancellation.Token; completion.TrySetCanceled(token); owned.TrySetCanceled(token); }
+        catch (Exception exception) { current.EffectFault.TrySetResult(exception); completion.TrySetException(exception); owned.TrySetException(exception); if (removalGap is not null) { await removalCompleted!.Task.ConfigureAwait(false); await removalGap().ConfigureAwait(false); } }
+    }
+    private Task RunAdmittedStageAsync(Generation current, Func<Task> work)
+    {
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen)
+            {
+                admission = this.AdmitLocked(current, work);
+            }
+        }
+
+        if (admission is null) return Task.CompletedTask;
+        admission.Gate.TrySetResult();
+        return admission.Task;
+    }
+    private Task RunAdmittedSynchronousStageAsync(Generation current, Action work)
+        => this.RunAdmittedStageAsync(current, () =>
+        {
+            var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = current;
+            try { work(); } finally { this.callbackGeneration.Value = previous; }
+            return Task.CompletedTask;
+        });
+    private static async Task RunAfterGateAsync(Task gate, TaskCompletionSource acquired, CancellationToken callerToken, Func<Task> work)
+    {
+        await gate.ConfigureAwait(false);
+        if (callerToken.IsCancellationRequested) throw new OperationCanceledException(callerToken);
+        acquired.TrySetResult();
+        await work().ConfigureAwait(false);
+    }
+    private void AdmitTimezoneCheck(Generation current)
+    {
+        Admission? admission = null; lock (this.lockObject) if (!this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen) admission = this.AdmitLocked(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }); admission?.Gate.TrySetResult();
+    }
+    private void AdmitDeadlineCheck(Generation current) => this.AdmitDeadlineCheck(current, current.DeadlineVersion, false);
+    private void AdmitDeadlineCheck(Generation current, long version, bool elapsed)
+    {
+        Admission? admission = null;
+        lock (this.lockObject)
+        {
+            if (!this.IsGenerationActiveLocked(current) || !current.DeadlineArmed || current.DeadlineVersion != version) return;
+            admission = this.AdmitLocked(current, () => this.RunDeadlineAsync(current, version, elapsed));
+        }
+        admission?.Gate.TrySetResult();
+    }
+    private async Task RunDeadlineAsync(Generation owner, long version, bool elapsed)
+    {
+        await owner.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!this.IsGenerationActive(owner) || !owner.DeadlineArmed || owner.DeadlineVersion != version) return;
+            var now = this.timeProvider.WallClockNow;
+            var state = owner.DurableState;
+            if (state is null || state.Phase != EscalationPhase.Pending) return;
+            var failClosed = now < state.MaxWallClockSeenUtc;
+            var decision = this.verdictHandler is IntegrityVerdictHandler pureHandler
+                ? pureHandler.EvaluateDeadlineDecision(elapsed || failClosed ? state.DeadlineDueUtc!.Value : now, state.IdentityScope)
+                : null;
+            if (decision is null || decision.Reaction.Action != VerdictAction.Degrade)
+            {
+                return;
+            }
+            await this.ExecuteDecisionChainAsync(owner, decision, this.identityCoordinator?.CurrentState).ConfigureAwait(false);
+        }
+        finally { owner.Gate.Release(); }
+    }
+    private bool IsGenerationActiveLocked(Generation current)
+        => !this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen;
+    private void ArmDeadline(Generation owner, IntegrityEscalationState state)
+    {
+        lock (this.lockObject)
+        {
+            if (!this.IsGenerationActiveLocked(owner) || state.Phase != EscalationPhase.Pending) return;
+            var now = this.timeProvider.WallClockNow;
+            if (now < state.MaxWallClockSeenUtc) return;
+            this.CancelDeadlineLocked(owner);
+            var version = ++owner.DeadlineVersion;
+            var delay = state.DeadlineDueUtc!.Value <= now ? TimeSpan.Zero : state.DeadlineDueUtc.Value - now;
+            owner.DeadlineArmed = true;
+            owner.DeadlineTimer = new Timer(_ => this.AdmitDeadlineCheck(owner, version, true), null, delay, Timeout.InfiniteTimeSpan);
+        }
+    }
+    private void CancelDeadlineLocked(Generation owner)
+    {
+        owner.DeadlineArmed = false;
+        owner.DeadlineVersion++;
+        if (owner.DeadlineTimer is not null)
+        {
+            owner.DeadlineTimer.Dispose(); owner.DeadlineTimer = null; owner.DeadlineTimerDisposals++;
+        }
+    }
+    private void AdmitTask(Generation current, Task task, TaskCompletionSource? removalCompleted = null)
+    {
+        current.OwnedTasks.Add(task);
+        _ = task.ContinueWith(completed => { var fault = completed.Exception?.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException); if (fault is not null) current.Lifecycle.TrySetException(fault); lock (this.lockObject) current.OwnedTasks.Remove(completed); removalCompleted?.TrySetResult(); }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+    private async Task RunOwnedCheckAsync(Generation current, bool cancelWithOwner, CancellationToken callerToken = default)
+    {
+        var ownerToken = current.Cancellation.Token; var gate = current.Gate; using var gateCancellation = CancellationTokenSource.CreateLinkedTokenSource(ownerToken, callerToken); var acquired = false;
+        try { await gate.WaitAsync(gateCancellation.Token).ConfigureAwait(false); acquired = true; var workToken = cancelWithOwner ? ownerToken : CancellationToken.None; await this.PerformIntegrityCheckAsync(current, workToken, true).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested) { throw new OperationCanceledException(callerToken); }
+        catch (OperationCanceledException) { throw; }
+        finally { if (acquired) gate.Release(); }
+    }
+
+    private async Task RunOwnedStartupAsync(Generation current)
+    {
+        await current.Gate.WaitAsync(current.Cancellation.Token).ConfigureAwait(false);
+        try
+        {
+            try
+            {
+                await this.RehydrateAsync(current).ConfigureAwait(false);
+            }
+            catch (Exception) when (!this.IsGenerationActive(current))
+            {
+                return;
+            }
+            if (!this.IsGenerationActive(current)) return;
+            await this.PerformIntegrityCheckAsync(current, current.Cancellation.Token, true).ConfigureAwait(false);
+        }
+        finally
+        {
+            current.Gate.Release();
+        }
+    }
+
+    private async Task RehydrateAsync(Generation owner)
+    {
+        if (this.stateStore is null)
+        {
+            owner.Rehydrated = true;
+            return;
+        }
+
+        var identity = this.identityCoordinator?.CurrentState.DeviceId ?? "local";
+        var state = await this.stateStore.LoadAsync(identity, owner.Cancellation.Token).ConfigureAwait(false);
+        if (!this.IsGenerationActive(owner)) return;
+        if (state is not null)
+        {
+            var now = this.timeProvider.WallClockNow;
+            var timingDefect = state.Phase == EscalationPhase.Pending
+                && (!state.TimingValid || state.MaxWallClockSeenUtc > now);
+            if (timingDefect)
+            {
+                state = state with { MaxWallClockSeenUtc = now, TimingValid = true };
+            }
+            state.Validate();
+            if (this.verdictHandler is IntegrityVerdictHandler pureHandler)
+            {
+                pureHandler.Restore(state);
+            }
+
+            owner.DurableState = state;
+            await this.ReconcileDurableEffectsAsync(owner, state).ConfigureAwait(false);
+            state = owner.DurableState ?? state;
+            if (!this.IsGenerationActive(owner)) return;
+            if (state.Phase == EscalationPhase.Pending)
+            {
+                if (timingDefect || this.timeProvider.WallClockNow < state.MaxWallClockSeenUtc)
+                {
+                    var decision = ((IntegrityVerdictHandler)this.verdictHandler).EvaluateDeadlineDecision(state.DeadlineDueUtc!.Value, state.IdentityScope);
+                    await this.ExecuteDecisionChainAsync(owner, decision, this.identityCoordinator?.CurrentState).ConfigureAwait(false);
+                    state = owner.DurableState ?? state;
+                }
+                else
+                {
+                    this.ArmDeadline(owner, state);
+                }
+            }
+            if (!this.IsGenerationActive(owner)) return;
+        }
+
+        owner.Rehydrated = true;
+    }
+
+    private async Task ReconcileDurableEffectsAsync(Generation owner, IntegrityEscalationState state)
+    {
+        var descriptor = state.PendingEffectDescriptor;
+        if (state.PendingReactionId is not null && state.PendingReactionId != state.CompletedReactionId)
+        {
+            if (descriptor is null)
+            {
+                throw new IntegrityEscalationStateException(
+                    IntegrityEscalationStateError.MissingEffectDescriptor,
+                    "A pending escalation reaction is missing its durable descriptor.");
+            }
+            var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", state.IdentityScope);
+            if (descriptor.ReactionKind == IntegrityEscalationReactionKind.ResolveIssue)
+            {
+                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, descriptor.Reason, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                await this.enforcementLevelMonitor.AddIssueAsync(
+                    issue,
+                    descriptor.Severity!.Value,
+                    descriptor.Reason,
+                    state.PendingReactionId,
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+
+            if (!this.IsGenerationActive(owner)) return;
+            state = state with { CompletedReactionId = state.PendingReactionId };
+            await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
+        }
+
+        if (state.PendingNotificationId is not null && state.PendingNotificationId != state.CompletedNotificationId)
+        {
+            if (descriptor?.NotificationType is null || descriptor.NotificationTitle is null || descriptor.NotificationBody is null || descriptor.NotificationTimestamp is null)
+            {
+                throw new IntegrityEscalationStateException(
+                    IntegrityEscalationStateError.InvalidEffectDescriptor,
+                    "A pending escalation notification is missing its durable payload.");
+            }
+            await this.outboxManager.EnqueueIntegrityNotificationAsync(
+                descriptor.NotificationType,
+                descriptor.NotificationTitle,
+                descriptor.NotificationBody,
+                descriptor.NotificationTimestamp.Value,
+                state.PendingNotificationId,
+                CancellationToken.None).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
+            state = state with { CompletedNotificationId = state.PendingNotificationId };
+            await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+            if (!this.IsGenerationActive(owner)) return;
+        }
+
+        owner.DurableState = state;
+    }
+    private async Task DrainGenerationAsync(Generation current)
+    {
+        var failure = await CaptureFailureAsync(current.Loop, current.Cancellation.IsCancellationRequested).ConfigureAwait(false);
+        if (current.Loop?.IsFaulted == true && current.Lifecycle.Task.IsFaulted) failure = null;
+        while (true) { Task[] owned; lock (this.lockObject) owned = current.OwnedTasks.ToArray(); if (owned.Length == 0) break; failure ??= await CaptureFailureAsync(Task.WhenAll(owned), true).ConfigureAwait(false); }
+        if (failure is null && current.EffectFault.Task.Status == TaskStatus.RanToCompletion) failure = current.EffectFault.Task.Result;
+
+        lock (this.lockObject) { this.CancelDeadlineLocked(current); if (current.TimezoneTimer is not null) { current.TimezoneTimer.Dispose(); current.TimezoneTimerDisposals++; } if (current.TickTimer is not null) { current.TickTimer.Dispose(); current.TickTimerDisposals++; } current.Gate.Dispose(); current.GateDisposals++; if (ReferenceEquals(this.generation, current)) this.generation = null; }
+
+        current.Cancellation.Dispose(); current.CancellationDisposals++;
+        if (failure is not null) throw failure;
+    }
+    private static async Task<Exception?> CaptureFailureAsync(Task? task, bool ignoreCancellation)
+    {
+        if (task is null) return null;
+        try { await task.ConfigureAwait(false); return null; }
+        catch (OperationCanceledException) when (ignoreCancellation) { return null; } catch (Exception exception) { return exception; }
+    }
+    private async Task RunMonitorLoopAsync(Generation current)
+    {
+        var cancellationToken = current.Cancellation.Token;
+        try
+        {
+            await current.InitialOperation!.ConfigureAwait(false); cancellationToken.ThrowIfCancellationRequested(); current.InitialCheck.TrySetResult();
+            if (current.TickSource is not null) while (await current.TickSource(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
+            else while (await current.TickTimer!.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false)) this.AdmitPeriodicCheck(current);
+            current.Lifecycle.TrySetResult();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { current.InitialCheck.TrySetCanceled(cancellationToken); current.Lifecycle.TrySetCanceled(cancellationToken); } catch (Exception exception) { current.InitialCheck.TrySetException(exception); current.Lifecycle.TrySetException(exception); throw; }
+    }
+    private void AdmitPeriodicCheck(Generation current)
+    {
+        Admission? admission = null; lock (this.lockObject) if (current.AdmissionOpen && ReferenceEquals(this.generation, current)) admission = this.AdmitCheckLocked(current, false); admission?.Gate.TrySetResult();
     }
 
     /// <inheritdoc />
@@ -245,37 +599,37 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private async Task PerformIntegrityCheckAsync(CancellationToken cancellationToken)
+    private async Task PerformIntegrityCheckAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
-        if (this.disposed || !this.isRunning)
+        if (!this.IsGenerationActive(current))
         {
             return;
         }
 
         try
         {
-            // Check for clock jumps
-            await this.CheckClockIntegrityAsync(cancellationToken);
-
-            // Check timezone changes
-            this.CheckTimezone();
+            await this.CheckClockIntegrityAsync(current, cancellationToken); if (!this.IsGenerationActive(current)) return;
+            await this.RunAdmittedStageAsync(current, () => { this.CheckTimezone(current); return Task.CompletedTask; }).ConfigureAwait(false);
+            if (!this.IsGenerationActive(current)) return;
 
             // Check if child became admin
-            await this.CheckPrivilegeStatusAsync(cancellationToken);
+            await this.CheckPrivilegeStatusAsync(current, cancellationToken, propagateFailure); if (!this.IsGenerationActive(current)) return;
 
             // T23: Check binary integrity (Authenticode + SHA256)
-            await this.PerformBinaryIntegrityCheckAsync(cancellationToken);
+            await this.PerformBinaryIntegrityCheckAsync(current, cancellationToken, propagateFailure);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            if (propagateFailure) throw;
             System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Integrity check failed: {ex.Message}");
         }
     }
 
-    private async Task CheckClockIntegrityAsync(CancellationToken cancellationToken)
+    private async Task CheckClockIntegrityAsync(Generation current, CancellationToken cancellationToken)
     {
         var currentMonotonic = this.timeProvider.MonotonicNow;
         var currentWallClock = this.timeProvider.WallClockNow;
+        double jump = 0; var direction = 0;
 
         lock (this.lockObject)
         {
@@ -288,54 +642,70 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             // If wall clock went backwards more than a small threshold, it's suspicious
             if (wallClockDelta < -MaxAllowedClockJumpSeconds && monotonicDelta > 0)
             {
-                this.FireClockJump(wallClockDelta, -1);
+                jump = wallClockDelta; direction = -1;
             }
             // If wall clock jumped forward significantly without monotonic increase, suspicious
             else if (wallClockDelta > MaxAllowedClockJumpSeconds && monotonicDelta < wallClockDelta * 1000)
             {
-                this.FireClockJump(wallClockDelta, 1);
+                jump = wallClockDelta; direction = 1;
             }
 
             this.lastMonotonicTick = currentMonotonic;
             this.lastWallClockTime = currentWallClock;
         }
 
+        if (direction != 0)
+        {
+            await this.RunAdmittedStageAsync(current, () =>
+            {
+                this.FireClockJump(jump, direction, current);
+                return Task.CompletedTask;
+            }).ConfigureAwait(false);
+            if (direction > 0) this.AdmitDeadlineCheck(current);
+        }
+
         await Task.CompletedTask;
     }
 
-    private void CheckTimezone()
+    private bool IsGenerationActive(Generation current) { lock (this.lockObject) return !this.disposed && ReferenceEquals(this.generation, current) && current.AdmissionOpen; }
+
+    private void CheckTimezone(Generation current)
     {
-        if (this.disposed || !this.isRunning)
+        if (!this.IsGenerationActive(current))
         {
             return;
         }
 
         var newTimezone = TimeZoneInfo.Local.Id;
 
+        string? oldTimezone = null;
         lock (this.lockObject)
         {
-            if (!string.Equals(this.currentTimezone, newTimezone, StringComparison.OrdinalIgnoreCase))
+            if (current.AdmissionOpen && ReferenceEquals(this.generation, current) && !string.Equals(current.Timezone, newTimezone, StringComparison.OrdinalIgnoreCase))
             {
-                var oldTimezone = this.currentTimezone;
+                oldTimezone = current.Timezone;
+                current.Timezone = newTimezone;
                 this.currentTimezone = newTimezone;
                 this.timezoneChangedDetected = true;
-
-                this.RecordTamperEvent(
-                    TamperEventType.TimezoneChanged,
-                    $"Timezone changed from '{oldTimezone}' to '{newTimezone}'",
-                    TamperSeverity.Warning);
-
-                this.FireTimezoneChanged(oldTimezone, newTimezone);
-
-                System.Diagnostics.Debug.WriteLine(
-                    $"[AntiTamperMonitor] Timezone changed: {oldTimezone} -> {newTimezone}");
             }
+        }
+
+        if (oldTimezone is not null)
+        {
+            this.RecordTamperEvent(
+                TamperEventType.TimezoneChanged,
+                $"Timezone changed from '{oldTimezone}' to '{newTimezone}'",
+                TamperSeverity.Warning,
+                current);
+            this.FireTimezoneChanged(oldTimezone, newTimezone, current);
+            System.Diagnostics.Debug.WriteLine(
+                $"[AntiTamperMonitor] Timezone changed: {oldTimezone} -> {newTimezone}");
         }
     }
 
-    private async Task CheckPrivilegeStatusAsync(CancellationToken cancellationToken)
+    private async Task CheckPrivilegeStatusAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
-        if (this.disposed || !this.isRunning)
+        if (this.disposed)
         {
             return;
         }
@@ -356,23 +726,27 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
 
                 if (!alreadyDetected)
                 {
-                    this.RecordTamperEvent(
-                        TamperEventType.ChildIsAdminDetected,
-                        "Child account detected with administrator privileges",
-                        TamperSeverity.Critical);
+                    await this.RunAdmittedSynchronousStageAsync(current, () =>
+                    {
+                        this.RecordTamperEvent(
+                            TamperEventType.ChildIsAdminDetected,
+                            "Child account detected with administrator privileges",
+                            TamperSeverity.Critical,
+                            current);
+                    }).ConfigureAwait(false);
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AntiTamperMonitor] Privilege check failed: {ex.Message}");
+            if (propagateFailure) throw;
+            System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Privilege check failed: {ex.Message}");
         }
     }
 
-    private async Task PerformBinaryIntegrityCheckAsync(CancellationToken cancellationToken)
+    private async Task PerformBinaryIntegrityCheckAsync(Generation current, CancellationToken cancellationToken, bool propagateFailure = false)
     {
-        if (this.disposed || !this.isRunning)
+        if (this.disposed)
         {
             return;
         }
@@ -380,6 +754,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         try
         {
             var result = await this.integrityChecker.CheckLocalIntegrityAsync(cancellationToken);
+            if (!this.IsGenerationActive(current)) return;
 
             // Build IntegrityReport with binary integrity data
             var report = new IntegrityReport
@@ -396,36 +771,317 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             };
 
             // R3: Report to backend
-            var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken);
+            var identity = this.identityCoordinator?.CurrentState;
+            var reportResult = await this.backendClient.ReportIntegrityAsync(report, cancellationToken) ?? new(false, null);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!this.IsGenerationActive(current)) return;
+            if (identity is not null && identity != this.identityCoordinator!.CurrentState)
+            {
+                return;
+            }
 
-            // T23: Handle local integrity failure via verdict handler
+            // A malformed or identity-mismatched envelope is an invalid input,
+            // not a transport failure. It must not reach any stateful handler,
+            // local-failure reaction, enforcement, or notification path.
+            if (reportResult.IsInvalidEnvelope)
+            {
+                return;
+            }
+
+            // Local evidence is report-only. It cannot change durable enforcement.
             if (!result.IsSignatureValid)
             {
+                if (!this.IsGenerationActive(current)) return;
                 var timestamp = this.timeProvider.WallClockNow;
-                var reaction = this.verdictHandler.HandleLocalFailure(
-                    $"Signature invalid for {result.ExecutablePath}",
-                    timestamp);
-
-                this.ProcessVerdictReaction(reaction, "local failure");
+                    await this.RunAdmittedSynchronousStageAsync(current, () =>
+                    {
+                        _ = this.verdictHandler is IntegrityVerdictHandler pureHandler
+                            ? pureHandler.HandleLocalFailureDecision($"Signature invalid for {result.ExecutablePath}", timestamp, identity?.DeviceId).Reaction
+                            : this.verdictHandler.HandleLocalFailure($"Signature invalid for {result.ExecutablePath}", timestamp);
+                    }).ConfigureAwait(false);
             }
 
             // T23: Handle server verdict via verdict handler
-            var verdictReaction = this.verdictHandler.HandleVerdict(
-                reportResult.Verdict,
-                reportResult.Success,
-                this.timeProvider.WallClockNow);
+            if (!this.IsGenerationActive(current)) return;
+            VerdictDecision? decision = null;
+            VerdictReaction? verdictReaction = null;
+            if (this.verdictHandler is IntegrityVerdictHandler pureHandler)
+            {
+                var decisionTimestamp = this.timeProvider.WallClockNow;
+                lock (this.lockObject)
+                {
+                    if (!this.IsCurrentDecisionLocked(current, identity)) return;
+                    decision = pureHandler.HandleVerdictDecision(reportResult.Verdict, reportResult.Success, decisionTimestamp, identity?.DeviceId);
+                }
+                try { await this.ExecuteDecisionChainAsync(current, decision!, identity).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is not OperationCanceledException) { current.EffectFault.TrySetResult(exception); throw; }
+                return;
+            }
 
-            this.ProcessVerdictReaction(verdictReaction, $"server verdict: {reportResult.Verdict}");
+            await this.RunAdmittedSynchronousStageAsync(current, () => verdictReaction = this.verdictHandler.HandleVerdict(reportResult.Verdict, reportResult.Success, this.timeProvider.WallClockNow)).ConfigureAwait(false);
+            verdictReaction ??= new(VerdictAction.None, null, null);
+
+            if (reportResult.Success
+                && reportResult.Verdict is "trust" or "revoked")
+            {
+                await this.ProcessVerdictReactionAsync(
+                    verdictReaction,
+                    $"server verdict: {reportResult.Verdict}",
+                    cancellationToken,
+                    identity,
+                    current);
+            }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AntiTamperMonitor] Binary integrity check failed: {ex.Message}");
+            if (propagateFailure) throw;
+            System.Diagnostics.Debug.WriteLine($"[AntiTamperMonitor] Binary integrity check failed: {ex.Message}");
         }
     }
 
-    private void ProcessVerdictReaction(VerdictReaction reaction, string context)
+    private bool IsCurrentDecisionLocked(Generation owner, BackendIdentityState? identity)
+        => !this.disposed && ReferenceEquals(this.generation, owner) && owner.AdmissionOpen
+            && (this.identityCoordinator is null || Equals(identity, this.identityCoordinator.CurrentState));
+
+    private async Task ExecuteDecisionChainAsync(Generation owner, VerdictDecision decision, BackendIdentityState? identity)
     {
+        var issue = new IssueKey(0, EnforcementIssueType.BinaryIntegrityFailure, "integrity/binary", decision.IdentityScope);
+        var reaction = decision.Reaction;
+        var shape = this.GetDecisionShape(decision);
+        var decisionDescriptor = CreateEffectDescriptor(decision);
+        this.ValidateAdmission(owner, shape);
+        await this.PrepareDurableStateAsync(owner, decision, decisionDescriptor).ConfigureAwait(false);
+        var effectDescriptor = owner.DurableState?.PendingEffectDescriptor ?? decisionDescriptor;
+        if (reaction.IsAuthoritativeRecovery && this.ShouldExecute(owner, shape, decision.ReactionIdempotencyKey, true))
+        {
+            try
+            {
+                await this.enforcementLevelMonitor.ResolveIssueAsync(issue, effectDescriptor!.Reason, CancellationToken.None).ConfigureAwait(false);
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
+            }
+            catch
+            {
+                owner.PendingRetry = new(true, shape);
+                throw;
+            }
+        }
+        else if (reaction.Action is VerdictAction.Limit or VerdictAction.Degrade
+            && this.ShouldExecute(owner, shape, decision.ReactionIdempotencyKey, true))
+        {
+            try
+            {
+                if (this.stateStore is null)
+                {
+                    await this.enforcementLevelMonitor.AddIssueAsync(
+                        issue,
+                        effectDescriptor!.Severity!.Value,
+                        effectDescriptor.Reason,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                else
+                {
+                    await this.enforcementLevelMonitor.AddIssueAsync(
+                        issue,
+                        effectDescriptor!.Severity!.Value,
+                        effectDescriptor.Reason,
+                        decision.ReactionIdempotencyKey,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: true).ConfigureAwait(false);
+            }
+            catch
+            {
+                owner.PendingRetry = new(true, shape);
+                throw;
+            }
+        }
+
+        if (decision.Notification is not null && decision.NotificationIdempotencyKey is not null
+            && this.ShouldExecute(owner, shape, decision.NotificationIdempotencyKey, false))
+        {
+            try
+            {
+                await this.outboxManager.EnqueueIntegrityNotificationAsync(
+                    effectDescriptor!.NotificationType!,
+                    effectDescriptor.NotificationTitle!,
+                    effectDescriptor.NotificationBody!,
+                    effectDescriptor.NotificationTimestamp!.Value,
+                    decision.NotificationIdempotencyKey,
+                    CancellationToken.None).ConfigureAwait(false);
+                await this.SaveEffectProgressAsync(owner, shape, reactionDomain: false).ConfigureAwait(false);
+                if (owner.PendingRetry is { ReactionDomain: false }) owner.PendingRetry = null;
+            }
+            catch
+            {
+                owner.PendingRetry = new(false, shape);
+                throw;
+            }
+        }
+
+        if (owner.PendingRetry is not null && owner.PendingRetry.Shape == shape) owner.PendingRetry = null;
+    }
+
+    internal Task ExecuteDecisionAsync(VerdictDecision decision)
+    {
+        Generation? owner;
+        lock (this.lockObject)
+        {
+            owner = !this.disposed && this.generation is { AdmissionOpen: true } current ? current : null;
+            if (owner is null) return Task.CompletedTask;
+        }
+
+        return this.RunAdmittedStageAsync(owner, async () =>
+        {
+            await owner.Gate.WaitAsync().ConfigureAwait(false);
+            try { await this.ExecuteDecisionChainAsync(owner, decision, null).ConfigureAwait(false); }
+            catch (Exception exception) when (exception is not OperationCanceledException) { owner.EffectFault.TrySetResult(exception); throw; }
+            finally { owner.Gate.Release(); }
+        });
+    }
+
+    private DecisionShape GetDecisionShape(VerdictDecision decision)
+        => new(
+            decision.IdentityScope,
+            decision.Epoch,
+            decision.Sequence,
+            decision.ReactionIdempotencyKey,
+            decision.Reaction.IsAuthoritativeRecovery ? "recovery" : decision.Reaction.Action.ToString(),
+            decision.Notification is not null,
+            decision.NotificationIdempotencyKey,
+            decision.Notification?.Type);
+
+    private void ValidateAdmission(Generation owner, DecisionShape shape)
+    {
+        var pending = owner.PendingRetry;
+        if (pending is not null && pending.Shape != shape)
+        {
+            throw new InvalidOperationException("A failed integrity effect must be retried before another decision can execute.");
+        }
+
+        foreach (var progress in new[] { owner.ReactionProgress, owner.NotificationProgress })
+        {
+            if (progress is null) continue;
+            if (!string.Equals(progress.Shape.Scope, shape.Scope, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("A generation cannot contain multiple identity scopes.");
+            }
+
+            if (progress.Shape.Epoch == shape.Epoch && progress.Shape.Sequence == shape.Sequence && progress.Shape != shape)
+            {
+                throw new InvalidOperationException("Conflicting effect identity at the same decision position.");
+            }
+        }
+    }
+
+    private bool ShouldExecute(Generation owner, DecisionShape shape, string key, bool reactionDomain)
+    {
+        var durableCompleted = reactionDomain ? owner.DurableState?.CompletedReactionId : owner.DurableState?.CompletedNotificationId;
+        if (string.Equals(durableCompleted, key, StringComparison.Ordinal)) return false;
+        var progress = reactionDomain ? owner.ReactionProgress : owner.NotificationProgress;
+        if (progress is null) return true;
+        if (shape.Epoch > progress.Shape.Epoch || shape.Epoch == progress.Shape.Epoch && shape.Sequence > progress.Shape.Sequence) return true;
+        if (shape.Epoch < progress.Shape.Epoch || shape.Epoch == progress.Shape.Epoch && shape.Sequence < progress.Shape.Sequence) return false;
+        if (string.Equals(progress.Key, key, StringComparison.Ordinal)) return false;
+        throw new InvalidOperationException("Conflicting effect identity at the same decision position.");
+    }
+
+    private static IntegrityEscalationEffectDescriptor? CreateEffectDescriptor(VerdictDecision decision)
+    {
+        var reaction = decision.Reaction;
+        var recovery = reaction.IsAuthoritativeRecovery;
+        if (!recovery && reaction.Action is not (VerdictAction.Limit or VerdictAction.Degrade)) return null;
+
+        return new IntegrityEscalationEffectDescriptor(
+            IntegrityEscalationEffectDescriptor.CurrentVersion,
+            recovery ? IntegrityEscalationReactionKind.ResolveIssue : IntegrityEscalationReactionKind.AddIssue,
+            recovery ? null : reaction.Severity ?? (reaction.Action == VerdictAction.Degrade ? EnforcementIssueSeverity.Severe : EnforcementIssueSeverity.Warning),
+            reaction.Reason ?? (recovery ? "authoritative backend trust verdict" : "Integrity reaction"),
+            decision.Notification?.Type,
+            decision.Notification?.Title,
+            decision.Notification?.Body,
+            decision.Notification?.Timestamp);
+    }
+
+    private async Task PrepareDurableStateAsync(
+        Generation owner,
+        VerdictDecision decision,
+        IntegrityEscalationEffectDescriptor? decisionDescriptor)
+    {
+        if (this.stateStore is null || this.verdictHandler is not IntegrityVerdictHandler pureHandler) return;
+        var prior = owner.DurableState;
+        var snapshot = pureHandler.Snapshot() ?? throw new InvalidOperationException("Handler snapshot was null.");
+        var pendingReaction = decisionDescriptor is not null ? decision.ReactionIdempotencyKey : prior?.PendingReactionId;
+        var samePendingKey = prior?.PendingReactionId is not null && prior.PendingReactionId == pendingReaction;
+        var pendingNotification = decision.NotificationIdempotencyKey ??
+            (samePendingKey ? prior!.PendingNotificationId : null);
+        var durableDescriptor = samePendingKey ? prior!.PendingEffectDescriptor : decisionDescriptor;
+        var state = snapshot with
+        {
+            PendingReactionId = pendingReaction,
+            CompletedReactionId = samePendingKey ? prior!.CompletedReactionId : null,
+            PendingNotificationId = pendingNotification,
+            CompletedNotificationId = samePendingKey && prior!.PendingNotificationId == pendingNotification ? prior.CompletedNotificationId : null,
+            PendingEffectDescriptor = durableDescriptor,
+        };
+        await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+    }
+
+    private async Task SaveEffectProgressAsync(Generation owner, DecisionShape shape, bool reactionDomain)
+    {
+        if (this.stateStore is null)
+        {
+            if (reactionDomain) owner.ReactionProgress = new(shape, shape.ReactionKey);
+            else if (shape.NotificationKey is not null) owner.NotificationProgress = new(shape, shape.NotificationKey);
+            return;
+        }
+        if (owner.DurableState is null) return;
+        var state = owner.DurableState;
+        state = reactionDomain
+            ? state with { CompletedReactionId = state.PendingReactionId }
+            : state with { CompletedNotificationId = state.PendingNotificationId };
+        await this.SaveStateAsync(owner, state).ConfigureAwait(false);
+        if (reactionDomain) owner.ReactionProgress = new(shape, state.PendingReactionId!);
+        else owner.NotificationProgress = new(shape, state.PendingNotificationId!);
+    }
+
+    private async Task SaveStateAsync(Generation owner, IntegrityEscalationState state)
+    {
+        if (this.stateStore is null) return;
+        var envelope = new IntegrityEscalationStateEnvelope(
+            IntegrityEscalationStateEnvelope.CurrentDocumentVersion,
+            IntegrityEscalationState.CurrentSchemaVersion,
+            state);
+        envelope.Validate();
+        await this.stateStore.SaveAsync(envelope, owner.Cancellation.Token).ConfigureAwait(false);
+        var phaseChanged = owner.DurableState?.Phase != state.Phase;
+        owner.DurableState = state;
+        if (phaseChanged)
+        {
+            if (state.Phase == EscalationPhase.Pending) this.ArmDeadline(owner, state);
+            else lock (this.lockObject) this.CancelDeadlineLocked(owner);
+        }
+    }
+
+    private async Task ProcessVerdictReactionAsync(
+        VerdictReaction reaction,
+        string context,
+        CancellationToken cancellationToken,
+        BackendIdentityState? identity,
+        Generation current)
+    {
+        var integrityIssueKey = new IssueKey(
+            0,
+            EnforcementIssueType.BinaryIntegrityFailure,
+            "integrity/binary",
+            identity?.DeviceId);
+        if (reaction.IsAuthoritativeRecovery)
+        {
+            if (!this.IsGenerationActive(current)) return;
+            await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.ResolveIssueAsync(
+                integrityIssueKey, reaction.Reason ?? "authoritative backend trust verdict", cancellationToken)).ConfigureAwait(false);
+            return;
+        }
+
         switch (reaction.Action)
         {
             case VerdictAction.None:
@@ -440,19 +1096,19 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             case VerdictAction.Limit:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity limit ({context}): {reaction.Reason}");
-                this.enforcementLevelMonitor.AddIssue(
-                    EnforcementIssueType.BinaryIntegrityFailure,
-                    reaction.Severity ?? EnforcementIssueSeverity.Warning,
-                    reaction.Reason ?? "Integrity limit reached");
+                if (!this.IsGenerationActive(current)) return;
+                await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey, reaction.Severity ?? EnforcementIssueSeverity.Warning,
+                    reaction.Reason ?? "Integrity limit reached", cancellationToken)).ConfigureAwait(false);
                 break;
 
             case VerdictAction.Degrade:
                 System.Diagnostics.Debug.WriteLine(
                     $"[AntiTamperMonitor] Integrity degrade ({context}): {reaction.Reason}");
-                this.enforcementLevelMonitor.AddIssue(
-                    EnforcementIssueType.BinaryIntegrityFailure,
-                    reaction.Severity ?? EnforcementIssueSeverity.Severe,
-                    reaction.Reason ?? "Integrity degradation triggered");
+                if (!this.IsGenerationActive(current)) return;
+                await this.RunAdmittedStageAsync(current, () => this.enforcementLevelMonitor.AddIssueAsync(
+                    integrityIssueKey, reaction.Severity ?? EnforcementIssueSeverity.Severe,
+                    reaction.Reason ?? "Integrity degradation triggered", cancellationToken)).ConfigureAwait(false);
                 break;
 
             case VerdictAction.ShadowWarn:
@@ -462,8 +1118,9 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private void RecordTamperEvent(TamperEventType type, string description, TamperSeverity severity)
+    private void RecordTamperEvent(TamperEventType type, string description, TamperSeverity severity, Generation? owner = null)
     {
+        Admission? outbox = null;
         var tamperEvent = new TamperEvent
         {
             Type = type,
@@ -475,14 +1132,23 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         lock (this.lockObject)
         {
             this.detectedEvents.Add(tamperEvent);
+            if (owner is not null && owner.AdmissionOpen && ReferenceEquals(this.generation, owner))
+            {
+                outbox = this.AdmitLocked(owner, () => this.EnqueueToOutboxAsync(tamperEvent, owner.Cancellation.Token));
+            }
         }
 
-        // Enqueue to outbox (T03)
-        this.EnqueueToOutboxAsync(tamperEvent, CancellationToken.None).ConfigureAwait(false);
+        outbox?.Gate.TrySetResult();
 
-        // Fire events
-        this.TamperDetected?.Invoke(this, new TamperEventArgs { Event = tamperEvent });
-        this.onTamperDetected(tamperEvent);
+        // Enqueue to outbox (T03)
+        if (owner is null)
+        {
+            _ = this.EnqueueToOutboxAsync(tamperEvent, CancellationToken.None);
+        }
+
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.TamperDetected?.Invoke(this, new TamperEventArgs { Event = tamperEvent }); this.onTamperDetected(tamperEvent); }
+        finally { this.callbackGeneration.Value = previous; }
 
         System.Diagnostics.Debug.WriteLine(
             $"[AntiTamperMonitor] Tamper detected: {type} - {description}");
@@ -526,7 +1192,7 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
         }
     }
 
-    private void FireClockJump(double offsetSeconds, int direction)
+    private void FireClockJump(double offsetSeconds, int direction, Generation? owner = null)
     {
         lock (this.lockObject)
         {
@@ -540,10 +1206,12 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             DetectedAt = this.timeProvider.WallClockNow,
         };
 
-        this.OnClockJumpDetected?.Invoke(this, args);
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.OnClockJumpDetected?.Invoke(this, args); }
+        finally { this.callbackGeneration.Value = previous; }
     }
 
-    private void FireTimezoneChanged(string? oldTimezone, string newTimezone)
+    private void FireTimezoneChanged(string? oldTimezone, string newTimezone, Generation? owner = null)
     {
         var args = new TimezoneChangedEventArgs
         {
@@ -552,21 +1220,35 @@ public sealed class AntiTamperMonitor : IAntiTamperMonitor, IDisposable
             ChangedAt = this.timeProvider.WallClockNow,
         };
 
-        this.TimezoneChanged?.Invoke(this, args);
+        var previous = this.callbackGeneration.Value; this.callbackGeneration.Value = owner;
+        try { this.TimezoneChanged?.Invoke(this, args); }
+        finally { this.callbackGeneration.Value = previous; }
     }
 
     public void Dispose()
     {
-        if (!this.disposed)
+        var callbackOwner = this.callbackGeneration.Value;
+        Task drain; TaskCompletionSource? startDrain = null;
+        lock (this.lockObject)
         {
             this.disposed = true;
-            this.isRunning = false;
-            this.monitorTimer?.Dispose();
-            this.timezoneTimer?.Dispose();
-            this.monitorTimer = null;
-            this.timezoneTimer = null;
+            var current = this.generation;
+            if (current is null)
+            {
+                drain = Task.CompletedTask;
+            }
+            else
+            {
+                current.AdmissionOpen = false;
+                current.Cancellation.Cancel(); this.CancelDeadlineLocked(current);
+                current.TimezoneTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                drain = this.BeginDrainLocked(current, out startDrain);
+            }
         }
+        startDrain?.TrySetResult();
 
+        if (!ReferenceEquals(callbackOwner, this.generation)) drain.GetAwaiter().GetResult();
         GC.SuppressFinalize(this);
     }
+
 }

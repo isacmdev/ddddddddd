@@ -91,15 +91,15 @@ internal sealed class RecordingUIChannel : IUIChannel
     public List<object> SentMessages { get; } = new();
 
     public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
-        where TQuery : AppUI.IUIMessage
-        where TResponse : class, AppUI.IUIMessage
+        where TQuery : ControlParental.Domain.IUIMessage
+        where TResponse : class, ControlParental.Domain.IUIMessage
     {
         this.QueriedMessages.Add(query!);
         return Task.FromResult(this.queryHandler(query!) as TResponse);
     }
 
     public Task SendAsync<T>(T message, CancellationToken ct = default)
-        where T : AppUI.IUIMessage
+        where T : ControlParental.Domain.IUIMessage
     {
         if (this.SendException is not null)
         {

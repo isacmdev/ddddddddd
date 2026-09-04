@@ -66,6 +66,16 @@ public sealed partial class OnboardingViewModel : ObservableObject
     [ObservableProperty]
     private string? errorMessage;
 
+    /// <summary>
+    /// Gets a value indicating whether the onboarding surface currently has a recoverable error.
+    /// </summary>
+    public bool HasError => !string.IsNullOrWhiteSpace(this.ErrorMessage);
+
+    /// <summary>
+    /// Gets the visibility state for the retry banner.
+    /// </summary>
+    public Visibility ErrorVisibility => this.HasError ? Visibility.Visible : Visibility.Collapsed;
+
     private readonly IEnforcementLevelMonitor? enforcementLevelMonitor;
 
     /// <summary>
@@ -116,13 +126,10 @@ public sealed partial class OnboardingViewModel : ObservableObject
         try
         {
             this.state = await this.onboardingClient.GetOnboardingStateAsync(ct).ConfigureAwait(false);
-            if (this.enforcementLevelMonitor is not null)
-            {
-                await this.enforcementLevelMonitor.StartAsync(ct).ConfigureAwait(false);
-                await this.enforcementLevelMonitor.EvaluateAsync(ct).ConfigureAwait(false);
-            }
 
-            this.ErrorMessage = null;
+            await this.RefreshProgressMonitorAsync(ct).ConfigureAwait(false);
+
+            this.ApplyCanonicalSnapshot(this.state);
         }
         catch (ConsentServiceUnavailableException ex)
         {
@@ -133,9 +140,6 @@ public sealed partial class OnboardingViewModel : ObservableObject
             this.UpdateButtonState();
             return;
         }
-
-        this.IsCompleted = this.state.IsCompleted;
-        this.IsAbandoned = this.state.IsAbandoned;
 
         if (this.IsCompleted || this.IsAbandoned)
         {
@@ -192,7 +196,7 @@ public sealed partial class OnboardingViewModel : ObservableObject
     [RelayCommand]
     private async Task GoNextAsync(CancellationToken ct = default)
     {
-        if (this.CurrentStep == null || !this.CanGoNext)
+        if (this.CurrentStep == null)
         {
             return;
         }
@@ -218,12 +222,7 @@ public sealed partial class OnboardingViewModel : ObservableObject
         }
 
         // Refresh observable surface from the canonical snapshot.
-        this.state = snapshot;
-        this.IsCompleted = snapshot.IsCompleted;
-        this.IsAbandoned = snapshot.IsAbandoned;
-        this.CurrentStep = snapshot.Steps.FirstOrDefault(s => s.Index == snapshot.CurrentStepIndex)
-            ?? snapshot.Steps.LastOrDefault();
-        this.ErrorMessage = null;
+        this.ApplyCanonicalSnapshot(snapshot);
 
         if (snapshot.IsCompleted)
         {
@@ -270,12 +269,9 @@ public sealed partial class OnboardingViewModel : ObservableObject
         // back is modelled by calling ResetAsync (the only operation that
         // re-anchors CurrentStepIndex). To keep the UI flow symmetric we
         // simply re-read after a small index nudge through the IPC channel.
-        this.state = snapshot;
-        this.IsCompleted = snapshot.IsCompleted;
-        this.IsAbandoned = snapshot.IsAbandoned;
+        this.ApplyCanonicalSnapshot(snapshot);
         this.CurrentStep = snapshot.Steps.FirstOrDefault(s => s.Index == targetIndex)
             ?? snapshot.Steps.LastOrDefault();
-        this.ErrorMessage = null;
         this.UpdateProgressBar();
         this.UpdateButtonState();
     }
@@ -299,10 +295,31 @@ public sealed partial class OnboardingViewModel : ObservableObject
             return;
         }
 
-        this.state = snapshot with { IsAbandoned = true };
-        this.IsAbandoned = true;
-        this.ErrorMessage = null;
+        this.ApplyCanonicalSnapshot(snapshot with { IsAbandoned = true });
         await this.RecordFunnelEventAsync(FunnelEventType.OnboardingAbandoned, this.CurrentStep?.Id ?? "unknown", ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Re-reads the canonical Service snapshot after an onboarding failure and refreshes the surface on success.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    [RelayCommand]
+    private async Task RetryAsync(CancellationToken ct = default)
+    {
+        OnboardingState snapshot;
+        try
+        {
+            snapshot = await this.onboardingClient.GetOnboardingStateAsync(ct).ConfigureAwait(false);
+            await this.RefreshProgressMonitorAsync(ct).ConfigureAwait(false);
+        }
+        catch (ConsentServiceUnavailableException ex)
+        {
+            this.ErrorMessage = ex.Message;
+            return;
+        }
+
+        this.ApplyCanonicalSnapshot(snapshot);
     }
 
     private async Task ExecutePairingStepAsync(CancellationToken ct)
@@ -352,6 +369,35 @@ public sealed partial class OnboardingViewModel : ObservableObject
             // surfacing the error here does not regress the route transition.
             this.ErrorMessage = ex.Message;
         }
+    }
+
+    private async Task RefreshProgressMonitorAsync(CancellationToken ct)
+    {
+        if (this.enforcementLevelMonitor is null || this.enforcementLevelMonitor.LastEvaluationTime is not null)
+        {
+            return;
+        }
+
+        await this.enforcementLevelMonitor.StartAsync(ct).ConfigureAwait(false);
+        await this.enforcementLevelMonitor.EvaluateAsync(ct).ConfigureAwait(false);
+    }
+
+    private void ApplyCanonicalSnapshot(OnboardingState snapshot)
+    {
+        this.state = snapshot;
+        this.IsCompleted = snapshot.IsCompleted;
+        this.IsAbandoned = snapshot.IsAbandoned;
+        this.CurrentStep = snapshot.Steps.FirstOrDefault(s => s.Index == snapshot.CurrentStepIndex)
+            ?? snapshot.Steps.LastOrDefault();
+        this.ErrorMessage = null;
+        this.UpdateProgressBar();
+        this.UpdateButtonState();
+    }
+
+    partial void OnErrorMessageChanged(string? value)
+    {
+        this.OnPropertyChanged(nameof(HasError));
+        this.OnPropertyChanged(nameof(ErrorVisibility));
     }
 
     private void UpdateProgressBar()
@@ -409,8 +455,7 @@ public sealed partial class OnboardingViewModel : ObservableObject
 
     private void UpdateButtonState()
     {
-        this.CanGoNext = this.CurrentStep?.Status == OnboardingStepStatus.Completed
-            || this.CurrentStep?.Status == OnboardingStepStatus.InProgress;
+        this.CanGoNext = this.CurrentStep?.Status == OnboardingStepStatus.Completed;
         this.CanGoBack = this.CurrentStep?.Index > 0;
     }
 

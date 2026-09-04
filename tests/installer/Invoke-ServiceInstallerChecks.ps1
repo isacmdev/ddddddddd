@@ -82,6 +82,11 @@ function Write-Stub-Binary([string]$path) {
     [System.IO.File]::WriteAllBytes($path, @(0x00))
 }
 
+function Write-TestConfiguration([string]$path) {
+    @('SUPABASE_URL=https://example.supabase.co', 'SUPABASE_ANON_KEY=sb_publishable_test-key') |
+        Set-Content -LiteralPath $path -Encoding utf8
+}
+
 function Write-MockSc([string]$dir) {
     # A .cmd shim that simulates sc.exe behavior. Which step fails is
     # controlled by the MOCK_SC_FAIL_STEP environment variable and only
@@ -114,6 +119,7 @@ function Write-MockSc([string]$dir) {
         'if "%CMD%"=="config" ( echo [mock-sc] config OK & goto :done )',
         'if "%CMD%"=="failure" ( echo [mock-sc] failure OK & goto :done )',
         'if "%CMD%"=="start" ( echo [mock-sc] start OK & goto :done )',
+        'if "%CMD%"=="stop" ( echo [mock-sc] stop OK & goto :done )',
         'echo [mock-sc] unhandled args: %* 1>&2',
         'exit /b 1',
         ':cmd_fail',
@@ -137,12 +143,20 @@ function Write-MockSc([string]$dir) {
     return $cmdPath
 }
 
+function Write-MockAcl([string]$dir) {
+    $cmdPath = Join-Path $dir 'icacls.cmd'
+    "@echo off`r`nexit /b 0" | Out-File -LiteralPath $cmdPath -Encoding ascii
+    return $cmdPath
+}
+
 function Invoke-Installer {
     param(
         [string]$BundleRoot,
         [string]$InstallRoot,
         [string]$ScCmdPath,
+        [string]$AclCmdPath,
         [string]$ReceiptPath,
+        [string]$DataRoot,
         [hashtable]$Env,
         [switch]$RunRunningCheck
     )
@@ -167,7 +181,10 @@ function Invoke-Installer {
             '-BundleRoot', $BundleRoot,
             '-InstallRoot', $InstallRoot,
             '-ScExe', $ScCmdPath,
+            '-AclExe', $AclCmdPath,
             '-ReceiptPath', $ReceiptPath,
+            '-DataRoot', $DataRoot,
+            '-ConfigFile', (Join-Path $DataRoot 'input.env'),
             '-SkipElevationCheck',
             '-Force'
         )
@@ -278,8 +295,12 @@ try {
     $tempRoot = New-TempBundle
     $installRoot = Join-Path $tempRoot 'install'
     New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+    $dataRoot = Join-Path $tempRoot 'data'
+    New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
+    Write-TestConfiguration (Join-Path $dataRoot 'input.env')
     $receiptPath = Join-Path $tempRoot 'install-receipt.json'
     $scCmdPath = Write-MockSc $tempRoot
+    $aclCmdPath = Write-MockAcl $tempRoot
 
     $serviceExe = Join-Path $tempRoot 'payload/service/ControlParental.Service.exe'
     $agentExe = Join-Path $tempRoot 'payload/agent/ControlParental.SessionAgent.exe'
@@ -288,31 +309,31 @@ try {
         'Happy' {
             Write-Stub-Binary $serviceExe
             Write-Stub-Binary $agentExe
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{}
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{}
             Assert-Happy-Path $run $receiptPath (Join-Path $installRoot 'ControlParental.Service.exe')
         }
         'MissingServiceExe' {
             # Service exe intentionally NOT staged.
             Write-Stub-Binary $agentExe
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{}
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{}
             Assert-Failure $run 'preflight: Staged payload missing' $Scenario $receiptPath
         }
         'MissingAgentExe' {
             Write-Stub-Binary $serviceExe
             # Agent exe intentionally NOT staged.
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{}
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{}
             Assert-Failure $run 'preflight: Staged payload missing' $Scenario $receiptPath
         }
         'ScCreateFailure' {
             Write-Stub-Binary $serviceExe
             Write-Stub-Binary $agentExe
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{ 'MOCK_SC_FAIL_STEP' = 'create' }
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{ 'MOCK_SC_FAIL_STEP' = 'create' }
             Assert-Failure $run 'sc-create: sc.exe create failed' $Scenario $receiptPath
         }
         'ScStartFailure' {
             Write-Stub-Binary $serviceExe
             Write-Stub-Binary $agentExe
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{ 'MOCK_SC_FAIL_STEP' = 'start' }
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{ 'MOCK_SC_FAIL_STEP' = 'start' }
             Assert-Failure $run 'sc-start: sc.exe start failed' $Scenario $receiptPath
         }
         'ScQueryFailure' {
@@ -320,7 +341,7 @@ try {
             Write-Stub-Binary $agentExe
             # ScQueryFailure deliberately exercises the RUNNING query gate:
             # do NOT pass -SkipRunningCheck; let the installer probe state.
-            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -ReceiptPath $receiptPath -Env @{ 'MOCK_SC_FAIL_STEP' = 'query' } -RunRunningCheck
+            $run = Invoke-Installer -BundleRoot $tempRoot -InstallRoot $installRoot -ScCmdPath $scCmdPath -AclCmdPath $aclCmdPath -ReceiptPath $receiptPath -DataRoot $dataRoot -Env @{ 'MOCK_SC_FAIL_STEP' = 'query' } -RunRunningCheck
             Assert-Failure $run 'sc-query: Service did not reach RUNNING state' $Scenario $receiptPath
         }
     }

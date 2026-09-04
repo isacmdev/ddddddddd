@@ -1,0 +1,1 @@
+{"contract":"control-parental.windows","version":1,"message_type":"runtime_activation.state","correlation_id":"00000000-0000-4000-8000-000000000009","payload":{"activation_state":"degraded","reason_code":"acl_pending","observed_at":"2026-08-28T12:00:00Z","state_version":3}}

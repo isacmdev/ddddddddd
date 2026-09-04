@@ -64,7 +64,7 @@ public class WorkstationLockManagerTests : IDisposable
     // ── LockNowAsync Tests ───────────────────────────────────────────
 
     [Fact]
-    public async Task LockNowAsync_WhenIpcConnected_SendsLockWorkstationMessage()
+    public async Task LockNowAsync_WhenOnlyLegacyIpcConnected_DoesNotClaimSuccess()
     {
         // Arrange
         var sentMessages = new ConcurrentQueue<IIpcMessage>();
@@ -77,9 +77,9 @@ public class WorkstationLockManagerTests : IDisposable
         var result = await this.lockManager.LockNowAsync();
 
         // Assert
-        result.Should().BeTrue();
-        sentMessages.Should().ContainSingle()
-            .Which.Should().BeOfType<LockWorkstation>();
+        result.Should().BeFalse();
+        sentMessages.Should().BeEmpty();
+        this.lockManager.LastLockResult!.Status.Should().Be(ActionStatus.InvalidState);
     }
 
     [Fact]
@@ -95,17 +95,20 @@ public class WorkstationLockManagerTests : IDisposable
         result.Should().BeFalse();
         this.lockManager.LastLockResult.Should().NotBeNull();
         this.lockManager.LastLockResult!.Success.Should().BeFalse();
-        this.lockManager.LastLockResult.ErrorMessage.Should().Contain("IPC not connected");
+        this.lockManager.LastLockResult.ErrorMessage.Should().Contain("Typed command authority");
     }
 
     [Fact]
     public async Task LockNowAsync_WhenAlreadyLocked_ReturnsFalse()
     {
-        // Arrange
-        var sendTask = Task.Delay(1000); // Simulate delay
-        this.mockIpcChannel
-            .Setup(c => c.SendAsync(It.IsAny<IIpcMessage>(), It.IsAny<CancellationToken>()))
-            .Returns((IIpcMessage _, CancellationToken _) => sendTask);
+        var completion = new TaskCompletionSource<AgentActionResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        AgentCommandEnvelope? pendingCommand = null;
+        this.lockManager.SetCommandExecutor(7, 3, (command, _) =>
+        {
+            pendingCommand = command;
+            return new ValueTask<AgentActionResult>(completion.Task);
+        });
 
         // Start first lock
         var firstLock = this.lockManager.LockNowAsync();
@@ -114,17 +117,20 @@ public class WorkstationLockManagerTests : IDisposable
         var secondLock = await this.lockManager.LockNowAsync();
 
         // Assert
-        firstLock.Result.Should().BeTrue();
         secondLock.Should().BeFalse();
+        completion.SetResult(new AgentActionResult(
+            pendingCommand!.CommandId, pendingCommand.SessionId,
+            pendingCommand.ConnectionGeneration, pendingCommand.IntentVersion,
+            ActionStatus.Confirmed, null));
+        (await firstLock).Should().BeTrue();
     }
 
     [Fact]
     public async Task LockNowAsync_WhenSendThrows_ReturnsFalseAndRecordsError()
     {
         // Arrange
-        this.mockIpcChannel
-            .Setup(c => c.SendAsync(It.IsAny<IIpcMessage>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new InvalidOperationException("Send failed"));
+        this.lockManager.SetCommandExecutor(7, 3, (_, _) =>
+            ValueTask.FromException<AgentActionResult>(new InvalidOperationException("Send failed")));
 
         // Act
         var result = await this.lockManager.LockNowAsync();
@@ -139,10 +145,14 @@ public class WorkstationLockManagerTests : IDisposable
     [Fact]
     public async Task LockNowAsync_AfterSuccess_SetsLastLockResultToSuccess()
     {
-        // Arrange
-        this.mockIpcChannel
-            .Setup(c => c.SendAsync(It.IsAny<IIpcMessage>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+        AgentCommandEnvelope? sent = null;
+        this.lockManager.SetCommandExecutor(7, 3, (command, _) =>
+        {
+            sent = command;
+            return ValueTask.FromResult(new AgentActionResult(
+                command.CommandId, command.SessionId, command.ConnectionGeneration,
+                command.IntentVersion, ActionStatus.Confirmed, null));
+        });
 
         // Act
         await this.lockManager.LockNowAsync();
@@ -150,7 +160,43 @@ public class WorkstationLockManagerTests : IDisposable
         // Assert
         this.lockManager.LastLockResult.Should().NotBeNull();
         this.lockManager.LastLockResult!.Success.Should().BeTrue();
+        this.lockManager.LastLockResult.Status.Should().Be(ActionStatus.Confirmed);
         this.lockManager.LastLockResult.ErrorMessage.Should().BeNull();
+        sent.Should().NotBeNull();
+        sent!.SessionId.Should().Be(7);
+        sent.ConnectionGeneration.Should().Be(3);
+        sent.Command.Should().Be(AgentCommandKind.LockWorkstation);
+    }
+
+    [Theory]
+    [InlineData(ActionStatus.TimedOut)]
+    [InlineData(ActionStatus.ConnectionReplaced)]
+    [InlineData(ActionStatus.NativeFailure)]
+    public async Task LockNowAsync_NonConfirmedTypedResultCannotBecomeSuccess(ActionStatus status)
+    {
+        this.lockManager.SetCommandExecutor(7, 3, (command, _) =>
+            ValueTask.FromResult(new AgentActionResult(
+                command.CommandId, command.SessionId, command.ConnectionGeneration,
+                command.IntentVersion, status, null)));
+
+        var result = await this.lockManager.LockNowAsync();
+
+        result.Should().BeFalse();
+        this.lockManager.LastLockResult!.Status.Should().Be(status);
+    }
+
+    [Fact]
+    public async Task LockNowAsync_MismatchedTypedResultCannotBecomeSuccess()
+    {
+        this.lockManager.SetCommandExecutor(7, 3, (command, _) =>
+            ValueTask.FromResult(new AgentActionResult(
+                command.CommandId, command.SessionId, command.ConnectionGeneration + 1,
+                command.IntentVersion, ActionStatus.Confirmed, null)));
+
+        var result = await this.lockManager.LockNowAsync();
+
+        result.Should().BeFalse();
+        this.lockManager.LastLockResult!.Status.Should().Be(ActionStatus.Stale);
     }
 
     [Fact]
@@ -175,12 +221,15 @@ public class WorkstationLockManagerTests : IDisposable
     {
         // Arrange
         var tcs = new TaskCompletionSource();
-        this.mockIpcChannel
-            .Setup(c => c.SendAsync(It.IsAny<IIpcMessage>(), It.IsAny<CancellationToken>()))
-            .Returns((IIpcMessage msg, CancellationToken ct) =>
-            {
-                return tcs.Task;
-            });
+        AgentCommandEnvelope? pendingCommand = null;
+        this.lockManager.SetCommandExecutor(7, 3, (command, _) =>
+        {
+            pendingCommand = command;
+            return new ValueTask<AgentActionResult>(tcs.Task.ContinueWith(_ =>
+                new AgentActionResult(
+                    command.CommandId, command.SessionId, command.ConnectionGeneration,
+                    command.IntentVersion, ActionStatus.Confirmed, null)));
+        });
 
         var lockTask = this.lockManager.LockNowAsync();
 

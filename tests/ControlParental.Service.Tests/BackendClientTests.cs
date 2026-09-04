@@ -5,6 +5,8 @@
 namespace ControlParental.Service.Tests;
 
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using ControlParental.Domain;
 using Moq;
@@ -121,6 +123,50 @@ public class BackendClientTests
         // Assert
         Assert.False(result.Success);
         Assert.Contains("Network error", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task FetchPolicyAsync_WhenNetworkError_RedactsTransportDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new HttpRequestException("Authorization=secret-token at https://private.example"));
+
+        var result = await sut.FetchPolicyAsync("device-123", 0, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Network error", result.ErrorMessage);
+        Assert.DoesNotContain("secret-token", result.ErrorMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("private.example", result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchPolicyAsync_WhenCallerCancellationIsRequested_PropagatesCancellation()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new OperationCanceledException("caller-cancelled", cancellation.Token));
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            sut.FetchPolicyAsync("device-123", 0, cancellation.Token));
     }
 
     [Fact]
@@ -280,6 +326,47 @@ public class BackendClientTests
     }
 
     [Fact]
+    public async Task PushDeviceAlertsAsync_WhenUnexpectedError_RedactsExceptionDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("payload=private-alert-data"));
+
+        var result = await sut.PushDeviceAlertsAsync(
+            [new DeviceAlertEntry { EventType = "warning", DetectedAt = DateTimeOffset.UtcNow, DedupKey = "alert1" }],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Unexpected error", result.ErrorMessage);
+        Assert.DoesNotContain("private-alert-data", result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PushDeviceAlertsAsync_WhenNetworkError_RedactsTransportDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var sut = new BackendClient(new HttpClient(handlerMock.Object), "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        handlerMock.Protected().Setup<Task<HttpResponseMessage>>(
+            "SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new HttpRequestException("Authorization=secret-alert"));
+
+        var result = await sut.PushDeviceAlertsAsync(
+            [new DeviceAlertEntry { EventType = "warning", DetectedAt = DateTimeOffset.UtcNow, DedupKey = "alert1" }],
+            CancellationToken.None);
+
+        Assert.Equal("Network error", result.ErrorMessage);
+        Assert.DoesNotContain("secret-alert", result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PushBehavioralEventsAsync_WhenSuccess_ReturnsItemsSent()
     {
         // Arrange
@@ -312,6 +399,47 @@ public class BackendClientTests
         // Assert
         Assert.True(result.Success);
         Assert.Equal(1, result.ItemsSent);
+    }
+
+    [Fact]
+    public async Task PushBehavioralEventsAsync_WhenUnexpectedError_RedactsExceptionDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("payload=private-event-data"));
+
+        var result = await sut.PushBehavioralEventsAsync(
+            [new BehavioralEventEntry { EventType = "launch", Timestamp = DateTimeOffset.UtcNow, DedupKey = "event1" }],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Unexpected error", result.ErrorMessage);
+        Assert.DoesNotContain("private-event-data", result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PushBehavioralEventsAsync_WhenNetworkError_RedactsTransportDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var sut = new BackendClient(new HttpClient(handlerMock.Object), "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        handlerMock.Protected().Setup<Task<HttpResponseMessage>>(
+            "SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new HttpRequestException("Authorization=secret-event"));
+
+        var result = await sut.PushBehavioralEventsAsync(
+            [new BehavioralEventEntry { EventType = "launch", Timestamp = DateTimeOffset.UtcNow, DedupKey = "event1" }],
+            CancellationToken.None);
+
+        Assert.Equal("Network error", result.ErrorMessage);
+        Assert.DoesNotContain("secret-event", result.ErrorMessage, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -382,6 +510,79 @@ public class BackendClientTests
         // Assert
         Assert.False(result.Success);
         Assert.Contains("Network error", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task SendHeartbeatAsync_WhenNetworkError_RedactsExceptionDetails()
+    {
+        const string sentinel = "heartbeat-secret-token";
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new HttpRequestException($"Authorization={sentinel}"));
+
+        var result = await sut.SendHeartbeatAsync(
+            new HeartbeatData { Enforcement = EnforcementLevel.Standard },
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Network error", result.ErrorMessage);
+        Assert.DoesNotContain(sentinel, result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PushUsageLogsAsync_WhenUnexpectedError_RedactsExceptionDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("payload=private-usage-data"));
+
+        var result = await sut.PushUsageLogsAsync(
+            [new UsageLogEntry { AppId = "app1", Minutes = 1, ServerDate = DateTimeOffset.UtcNow, DedupKey = "key1" }],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Unexpected error", result.ErrorMessage);
+        Assert.DoesNotContain("private-usage-data", result.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SendHeartbeatAsync_WhenUnexpectedError_RedactsExceptionDetails()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("payload=private-child-data"));
+
+        var result = await sut.SendHeartbeatAsync(
+            new HeartbeatData { Enforcement = EnforcementLevel.Standard },
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("Unexpected error", result.ErrorMessage);
+        Assert.DoesNotContain("private-child-data", result.ErrorMessage, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -475,7 +676,7 @@ public class BackendClientTests
         var result = await sut.CreateTimeRequestAsync(request, CancellationToken.None);
 
         // Assert
-        Assert.True(result);
+        Assert.False(result);
     }
 
     [Fact]
@@ -509,6 +710,31 @@ public class BackendClientTests
     }
 
     [Fact]
+    public async Task ReportIntegrityAsync_WithMatchingTypedVerdict_ReturnsDefinitiveVerdict()
+    {
+        var correlation = GuidFromHashMaterial("abc123");
+        var responseJson = $"{{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"integrity.verdict\",\"correlation_id\":\"{correlation:D}\",\"payload\":{{\"verdict\":\"trust\",\"evidence_id\":\"{correlation:D}\",\"evaluated_at\":\"2026-08-28T12:00:00Z\",\"verdict_version\":1,\"reason_code\":\"ok\"}}}}";
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        handlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent(responseJson) });
+        var sut = new BackendClient(new HttpClient(handlerMock.Object), "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        var report = new IntegrityReport
+        {
+            ReportHash = "abc123",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+
+        var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("trust", result.Verdict);
+    }
+
+    [Fact]
     public async Task ReportIntegrityAsync_WhenSuccess_ReturnsTrue()
     {
         // Arrange
@@ -530,13 +756,14 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
         var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
 
         // Assert
-        Assert.True(result.Success);
+        Assert.False(result.Success);
     }
 
     [Fact]
@@ -561,6 +788,7 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
@@ -568,6 +796,62 @@ public class BackendClientTests
 
         // Assert
         Assert.False(result.Success);
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_WithMalformedBinaryHash_DoesNotSend()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Strict);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+
+        var report = new IntegrityReport
+        {
+            ReportHash = "abc123",
+            BinaryHash = "not-a-sha256",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        };
+
+        var result = await sut.ReportIntegrityAsync(report, CancellationToken.None);
+
+        Assert.False(result.Success);
+        handlerMock.Protected().Verify(
+            "SendAsync",
+            Times.Never(),
+            ItExpr.IsAny<HttpRequestMessage>(),
+            ItExpr.IsAny<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ReportIntegrityAsync_WithMalformedTypedVerdict_DoesNotManufactureVerdict()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Loose);
+        var httpClient = new HttpClient(handlerMock.Object);
+        var sut = new BackendClient(httpClient, "https://example.supabase.co", this._deviceAuthenticatorMock.Object);
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.Created)
+            {
+                Content = new StringContent("{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"integrity.verdict\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"payload\":{\"verdict\":\"revoked\",\"evidence_id\":\"00000000-0000-4000-8000-000000000002\",\"evaluated_at\":\"2026-08-28T12:00:00Z\",\"verdict_version\":1,\"reason_code\":\"unknown\",\"unexpected\":true}}"),
+            });
+
+        var result = await sut.ReportIntegrityAsync(new IntegrityReport
+        {
+            ReportHash = "abc123",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Timestamp = DateTimeOffset.UtcNow,
+            AgentVersion = "1.0.0",
+            Platform = "windows",
+        }, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Null(result.Verdict);
     }
 
     // ── T18: Idempotency header verification ─────────────────────────────────
@@ -939,6 +1223,7 @@ public class BackendClientTests
             Timestamp = DateTimeOffset.UtcNow,
             AgentVersion = "1.0.0",
             Platform = "windows",
+            BinaryHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
 
         // Act
@@ -1545,5 +1830,13 @@ public class BackendClientTests
         // Assert
         Assert.False(result.Success);
         Assert.Equal(PairingHttpStatus.NetworkError, result.Status);
+    }
+
+    private static Guid GuidFromHashMaterial(string material)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(material))[..16];
+        bytes[7] = (byte)((bytes[7] & 0x0f) | 0x40);
+        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
+        return new Guid(bytes);
     }
 }

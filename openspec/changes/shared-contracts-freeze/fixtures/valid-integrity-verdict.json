@@ -1,0 +1,1 @@
+{"contract":"control-parental.windows","version":1,"message_type":"integrity.verdict","correlation_id":"00000000-0000-4000-8000-000000000018","payload":{"verdict":"unknown","evidence_id":"00000000-0000-4000-8000-000000000017","evaluated_at":"2026-08-28T12:00:00Z","verdict_version":2,"reason_code":"temporarily_unavailable"}}

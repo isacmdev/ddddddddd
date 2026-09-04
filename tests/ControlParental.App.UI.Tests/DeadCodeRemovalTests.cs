@@ -69,7 +69,7 @@ public sealed class DeadCodeRemovalTests
             @"src/ControlParental.App.UI/ServiceInstallStepViewModel.cs",
         };
 
-        var repoRoot = LocateRepoRoot();
+        var repoRoot = RepositoryRootLocator.Locate(typeof(DeadCodeRemovalTests));
         foreach (var relativePath in deleted)
         {
             var fullPath = Path.Combine(repoRoot, relativePath);
@@ -96,7 +96,7 @@ public sealed class DeadCodeRemovalTests
         // Defense in depth: the source file must stay absent from the working
         // tree so future diffs cannot silently re-introduce the legacy path.
         var fullPath = Path.Combine(
-            LocateRepoRoot(),
+            RepositoryRootLocator.Locate(typeof(DeadCodeRemovalTests)),
             "src",
             "ControlParental.App.UI",
             "ConsentDialog.cs");
@@ -125,16 +125,4 @@ public sealed class DeadCodeRemovalTests
         return null;
     }
 
-    private static string LocateRepoRoot()
-    {
-        // Walk up from the test assembly's location until we find the
-        // .git directory — the working tree root for PR #8b's deletions.
-        var current = new DirectoryInfo(Path.GetDirectoryName(typeof(DeadCodeRemovalTests).Assembly.Location)!);
-        while (current != null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return current?.FullName ?? throw new InvalidOperationException("Could not locate repository root (no .git ancestor).");
-    }
 }

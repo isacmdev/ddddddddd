@@ -33,7 +33,9 @@ public interface IServiceToAgentMessage : IIpcMessage
 /// <summary>
 /// Agent → Service: notifies when the foreground app changes.
 /// </summary>
-public sealed record ForegroundChanged(string AppId) : IAgentToServiceMessage
+public sealed record ForegroundChanged(
+    string AppId,
+    ObservedProcessTarget? Target = null) : IAgentToServiceMessage
 {
     /// <inheritdoc />
     public string MessageType => nameof(ForegroundChanged);
@@ -45,10 +47,27 @@ public sealed record ForegroundChanged(string AppId) : IAgentToServiceMessage
 public sealed record AgentHeartbeat(
     string AgentId,
     long UpTimeMs,
-    bool IsOverlayVisible) : IAgentToServiceMessage
+    bool IsOverlayVisible,
+    int SessionId = -1,
+    long ConnectionGeneration = -1) : IAgentToServiceMessage
 {
     /// <inheritdoc />
     public string MessageType => nameof(AgentHeartbeat);
+}
+
+public sealed record AgentAuthority(int SessionId, long ConnectionGeneration) : IServiceToAgentMessage
+{
+    public string MessageType => nameof(AgentAuthority);
+}
+
+public sealed record AgentCommandRequest(AgentCommandEnvelope Envelope) : IServiceToAgentMessage
+{
+    public string MessageType => nameof(AgentCommandRequest);
+}
+
+public sealed record AgentCommandCompleted(AgentActionResult Result) : IAgentToServiceMessage
+{
+    public string MessageType => nameof(AgentCommandCompleted);
 }
 
 /// <summary>
@@ -131,6 +150,36 @@ public sealed record Pong() : IAgentToServiceMessage
 /// </summary>
 public interface IUIMessage : IIpcMessage
 {
+}
+
+/// <summary>UI request to durably register the current WNS channel through Service authority.</summary>
+public sealed record RegisterWnsChannel(
+    string OperationId,
+    string ChannelUri,
+    string Channel,
+    DateTimeOffset ExpiresAt) : IUIMessage
+{
+    /// <inheritdoc />
+    public string MessageType => nameof(RegisterWnsChannel);
+}
+
+/// <summary>Credential-free WNS registration outcome returned over IPC.</summary>
+public sealed record WnsRegistrationResult(
+    string OperationId,
+    WnsRegistrationStatus Status,
+    string CorrelationId) : IUIMessage
+{
+    /// <inheritdoc />
+    public string MessageType => nameof(WnsRegistrationResult);
+}
+
+/// <summary>Bounded WNS registration states visible to App.UI.</summary>
+public enum WnsRegistrationStatus
+{
+    Accepted,
+    PendingOffline,
+    Denied,
+    Retryable,
 }
 
 /// <summary>

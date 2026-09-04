@@ -5,15 +5,17 @@
 namespace ControlParental.Service;
 
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Net.Http;
-using System.Net.Security;
 using System.Runtime.InteropServices;
-using System.Security.Authentication;
-using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using ControlParental.Domain;
+using ControlParental.Service.Interop;
+using ControlParental.Service.CompiledModels;
 
 /// <summary>
 /// T19 — WNS configuration loaded from environment variables.
@@ -73,47 +75,222 @@ public static class Program
     /// </summary>
     public const string IpcPipeName = "SessionAgent";
 
+    internal static readonly TimeSpan DefaultBackupAdmissionTimeout = TimeSpan.FromSeconds(30);
+
+    internal static bool TryParseBackupMode(string[]? args, out BackupMode mode)
+    {
+        mode = default;
+        if (args == null || args.Length != 1)
+        {
+            return false;
+        }
+
+        switch (args[0])
+        {
+            case "--backup-heartbeat":
+                mode = BackupMode.Heartbeat;
+                return true;
+            case "--backup-outbox":
+                mode = BackupMode.Outbox;
+                return true;
+            case "--backup-reconcile":
+                mode = BackupMode.Reconciliation;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    internal static bool TryParseBackupRequest(
+        string[]? args,
+        out bool isBackupMode,
+        out BackupMode mode)
+    {
+        var hasBackupArgument = args?.Any(arg => arg.StartsWith("--backup", StringComparison.Ordinal)) == true;
+        isBackupMode = TryParseBackupMode(args, out mode);
+        return !hasBackupArgument || isBackupMode;
+    }
+
     /// <summary>
-    /// T22 — Creates an HttpClient configured with TLS 1.3 and optional SPKI certificate pinning.
+    /// T22 — Creates an HttpClient with platform trust, revocation, and optional rotating SPKI pins.
     /// </summary>
     /// <param name="certPin">
-    /// Optional SPKI pin (Base64 SHA-256 of the certificate's SubjectPublicKeyInfo).
-    /// If null or empty, no pinning is enforced but TLS 1.3 is still applied.
+    /// Optional semicolon-delimited current and next SPKI pins.
+    /// If null or empty, platform certificate and hostname validation remains mandatory.
     /// </param>
     /// <returns>A configured <see cref="HttpClient"/> instance.</returns>
     private static HttpClient CreateSupabaseHttpClient(string? certPin)
     {
-        var handler = new SocketsHttpHandler
+        var policy = new CertificatePinningPolicy(certPin);
+        return new HttpClient(policy.ConfigureHandler())
         {
-            SslOptions = new SslClientAuthenticationOptions
-            {
-                // T22: Force TLS 1.3 — supported on Windows 10 1903+ (target: Win10 19041+)
-                EnabledSslProtocols = SslProtocols.Tls13,
-                // T22: Certificate pinning validation using SPKI
-                RemoteCertificateValidationCallback = certPin != null && certPin.Length > 0
-                    ? (RemoteCertificateValidationCallback)((sender, certificate, chain, errors) =>
-                        {
-                            if (certificate == null)
-                            {
-                                // No certificate presented — reject unless pin is not configured
-                                return false;
-                            }
-
-                            // When pin is configured, always validate (errors ignored if cert is valid)
-                            _ = CertificatePinningValidator.Validate(certPin, new X509Certificate2(certificate));
-                            return true;
-                        })
-                    : null,
-                // Skip revocation check for pinned connections (revocation servers may be unreachable)
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-            },
+            Timeout = policy.DefaultTimeout,
         };
-
-        return new HttpClient(handler);
     }
 
-    public static async Task Main(string[] args)
+    internal static void ConfigureBackendIdentityServices(
+        IServiceCollection services,
+        SupabaseConfig supabaseConfig,
+        TlsPinningConfig tlsPinningConfig,
+        Func<HttpClient>? httpClientFactory = null,
+        bool registerHostedServices = true)
     {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(supabaseConfig);
+        ArgumentNullException.ThrowIfNull(tlsPinningConfig);
+        httpClientFactory ??= () => CreateSupabaseHttpClient(tlsPinningConfig.CertPin);
+
+        services.AddSingleton<IBackendIdentityCredentialStore>(sp =>
+            sp.GetRequiredService<ISecretStore>() as IBackendIdentityCredentialStore
+            ?? throw new InvalidOperationException("The production secret store must own the identity snapshot."));
+        services.AddSingleton<IBackendIdentityLifecyclePortV1>(_ =>
+            new BackendIdentityLifecycleClient(httpClientFactory(), supabaseConfig.Url, supabaseConfig.AnonKey));
+        services.AddSingleton<BackendIdentityCoordinator>();
+        services.AddSingleton<IBackendIdentityCoordinator>(sp => sp.GetRequiredService<BackendIdentityCoordinator>());
+        services.AddSingleton<BackendRealtimeIdentityAuthority>();
+        services.AddSingleton<IRealtimeIdentityAuthority>(sp =>
+            sp.GetRequiredService<BackendRealtimeIdentityAuthority>());
+        services.AddSingleton<IBackendClient>(sp =>
+            new BackendClient(httpClientFactory(), supabaseConfig.Url, sp.GetRequiredService<IBackendIdentityCoordinator>()));
+        services.AddSingleton<IWnsRegistrationIntentStore>(sp =>
+            new SecretStoreWnsRegistrationIntentStore(sp.GetRequiredService<ISecretStore>()));
+        services.AddSingleton<WnsRegistrationCoordinator>();
+        services.AddSingleton<IWnsRegistrationCoordinator>(sp => sp.GetRequiredService<WnsRegistrationCoordinator>());
+        if (registerHostedServices)
+        {
+            services.AddHostedService<BackendIdentityStartupService>();
+            ConfigureWnsRegistrationHostedService(services);
+        }
+        services.AddScoped<IPairingService, PairingService>();
+    }
+
+    internal static void ConfigureIntegrityRuntimeHostedServices(IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddHostedService<BackendIdentityStartupService>();
+        services.AddHostedService<ControlParentalService>();
+        ConfigureWnsRegistrationHostedService(services);
+    }
+
+    internal static void ConfigureProductionHostedServices(
+        IServiceCollection services,
+        SupabaseConfig supabaseConfig,
+        TlsPinningConfig tlsPinningConfig,
+        Func<HttpClient>? httpClientFactory = null)
+    {
+        ConfigureBackendIdentityServices(
+            services,
+            supabaseConfig,
+            tlsPinningConfig,
+            httpClientFactory,
+            registerHostedServices: false);
+        ConfigureIntegrityRuntimeHostedServices(services);
+    }
+
+    private static void ConfigureWnsRegistrationHostedService(IServiceCollection services)
+        => services.AddHostedService<WnsRegistrationReconciliationService>();
+
+    internal static void ConfigureBackupAdmission(IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddSingleton<ITaskSchedulerBackup>(sp =>
+            new TaskSchedulerBackupService((mode, cancellationToken) =>
+                sp.GetRequiredService<IScheduledWorkService>().RunBackupAsync(mode, cancellationToken)));
+    }
+
+    internal static async Task RunBackupModeAsync(
+        IServiceProvider services,
+        BackupMode mode,
+        CancellationToken callerToken = default,
+        TimeSpan? timeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        var timeoutCts = new CancellationTokenSource(timeout ?? DefaultBackupAdmissionTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            callerToken,
+            timeoutCts.Token);
+
+        try
+        {
+            await services.GetRequiredService<ITaskSchedulerBackup>()
+                .TriggerBackupAsync(mode, linkedCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            throw new TimeoutException("Backup admission exceeded its finite timeout.");
+        }
+        finally
+        {
+            timeoutCts.Dispose();
+        }
+    }
+
+    internal static async Task RunBackupHostModeAsync(
+        IHost host,
+        BackupMode mode,
+        CancellationToken callerToken = default,
+        TimeSpan? timeout = null)
+    {
+        try
+        {
+            await RunBackupModeAsync(host.Services, mode, callerToken, timeout)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            Console.Error.WriteLine("[Program] Backup admission timed out.");
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(timeout ?? DefaultBackupAdmissionTimeout);
+            try
+            {
+                await host.StopAsync()
+                    .WaitAsync(stopCts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stopCts.IsCancellationRequested)
+            {
+                System.Diagnostics.Debug.WriteLine("[Program] Backup host shutdown exceeded its finite timeout.");
+            }
+        }
+    }
+
+    internal static async Task RunSelectedModeAsync(
+        IHost host,
+        bool isBackupMode,
+        BackupMode backupMode,
+        CancellationToken callerToken = default)
+    {
+        if (isBackupMode)
+        {
+            await RunBackupHostModeAsync(host, backupMode, callerToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await host.WaitForShutdownAsync().ConfigureAwait(false);
+    }
+
+    public static Task Main(string[] args) => RunMainAsync(args);
+
+    internal static Task RunMainAsync(string[] args) => RunMainAsync(args, static () => { });
+
+    internal static async Task RunMainAsync(string[] args, Action compositionStarted)
+    {
+        if (!TryParseBackupRequest(args, out var isBackupMode, out var backupMode))
+        {
+            Console.Error.WriteLine("[Program] Invalid or ambiguous backup arguments.");
+            return;
+        }
+
+        compositionStarted();
+
         // T18: Load Supabase config from .env (repo root or ProgramData)
         if (!ConfigurationLoader.TryLoad(out var supabaseConfig))
         {
@@ -123,9 +300,10 @@ public static class Program
             return;
         }
 
-        // T22: Load TLS certificate pin from environment
+        // T22: Prefer overlapping current/next pins; retain the legacy single-pin variable.
         var tlsPinningConfig = new TlsPinningConfig(
-            Environment.GetEnvironmentVariable("SUPABASE_CERT_PIN"));
+            Environment.GetEnvironmentVariable("SUPABASE_CERT_PINS")
+                ?? Environment.GetEnvironmentVariable("SUPABASE_CERT_PIN"));
 
         var builder = Host.CreateApplicationBuilder(args);
 
@@ -154,15 +332,18 @@ public static class Program
         // T38: IPC channel and session management
         builder.Services.AddSingleton<SessionManager>();
 
-        // T03: Register PolicyRepository and DbContext
+        // T03: Register PolicyRepository and DbContext factory
         var dataFolder = DataFolderPath;
-        builder.Services.AddSingleton<ControlParentalDbContext>(sp =>
-        {
-            var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-                .UseSqlite($"Data Source={Path.Combine(dataFolder, "controlparental.db")}")
-                .Options;
-            return new ControlParentalDbContext(options);
-        });
+         builder.Services.AddDbContextFactory<ControlParentalDbContext>(options =>
+         {
+             ConfigureDbContextOptions(
+                 options,
+                 connectionString: $"Data Source={Path.Combine(dataFolder, "controlparental.db")}",
+                 useCompiledModel: OperatingSystem.IsWindows() &&
+                     string.Equals(builder.Environment.EnvironmentName, Environments.Production, StringComparison.Ordinal));
+         });
+        builder.Services.AddScoped<ControlParentalDbContext>(sp =>
+            sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>().CreateDbContext());
         builder.Services.AddSingleton<IPolicyRepository, PolicyRepository>();
         builder.Services.AddSingleton<PolicyRepository>(); // Concrete for UsageAccumulator
 
@@ -172,11 +353,11 @@ public static class Program
         // T07: Register UsageReconciler (IPC channel set via SetIpcChannel after SessionManager creates it)
         builder.Services.AddSingleton<IUsageReconciler>((sp) =>
         {
-            var dbContext = sp.GetRequiredService<ControlParentalDbContext>();
+            var dbContextFactory = sp.GetRequiredService<IDbContextFactory<ControlParentalDbContext>>();
             var timeProvider = sp.GetRequiredService<ITimeProvider>();
             var ipcChannel = sp.GetService<IIpcChannel>(); // Nullable — set via SetIpcChannel
             Func<string, string> resolveAppId = Interop.AppIdentityResolver.Resolve;
-            return new UsageReconciler(dbContext, timeProvider, ipcChannel, resolveAppId);
+            return new UsageReconciler(dbContextFactory, timeProvider, ipcChannel, resolveAppId);
         });
 
         // T06: Register UsageAccumulator with optional IUsageReconciler for backfill
@@ -201,14 +382,17 @@ public static class Program
         builder.Services.AddSingleton<IOverlayPersistenceManager, OverlayPersistenceManager>();
 
         // T10: Register ServiceHealthMonitor and ServiceRecoveryManager
-        builder.Services.AddSingleton<IServiceHealthMonitor>((sp) =>
-        {
-            var timeProvider = sp.GetRequiredService<ITimeProvider>();
-            return new ServiceHealthMonitor(
-                timeProvider: timeProvider,
-                onAgentDied: () => System.Diagnostics.Debug.WriteLine("[HealthMonitor] Agent died."),
-                onServiceUnhealthy: issue => System.Diagnostics.Debug.WriteLine($"[HealthMonitor] Unhealthy: {issue}"));
-        });
+        builder.Services.AddSingleton<ServiceHealthMonitor>(sp =>
+            new ServiceHealthMonitor(
+                timeProvider: sp.GetRequiredService<ITimeProvider>(),
+                onAgentDied: () => System.Diagnostics.Debug.WriteLine(
+                    "[ServiceHealthMonitor] Agent death callback received."),
+                onServiceUnhealthy: _ => System.Diagnostics.Debug.WriteLine(
+                    "[ServiceHealthMonitor] Service health callback received.")));
+        builder.Services.AddSingleton<IServiceHealthMonitor>(sp =>
+            sp.GetRequiredService<ServiceHealthMonitor>());
+        builder.Services.AddSingleton<IAuthoritativeHealthSink>(sp =>
+            sp.GetRequiredService<ServiceHealthMonitor>());
         builder.Services.AddSingleton<IServiceRecoveryManager>((sp) =>
         {
             var healthMonitor = sp.GetRequiredService<IServiceHealthMonitor>();
@@ -224,6 +408,9 @@ public static class Program
         builder.Services.AddSingleton<IProcessTerminator, ProcessTerminator>();
 
         // T12: Register EnforcementLevelMonitor
+        builder.Services.AddSingleton<IPreventiveLayerDetector, WindowsPreventiveLayerDetector>();
+        builder.Services.AddSingleton<IIssueStore>(
+            _ => new FileIssueStore(Path.Combine(DataFolderPath, "enforcement-issues.v1.json")));
         builder.Services.AddSingleton<IEnforcementLevelMonitor>((sp) =>
         {
             var privilegeInspector = sp.GetRequiredService<IPrivilegeInspector>();
@@ -240,7 +427,10 @@ public static class Program
                 {
                     System.Diagnostics.Debug.WriteLine(
                         $"[EnforcementLevelMonitor] Issue detected: {issue.Type} - {issue.Description}");
-                });
+                },
+                preventiveLayerDetector: sp.GetRequiredService<IPreventiveLayerDetector>(),
+                accountManager: sp.GetRequiredService<IAccountManager>(),
+                issueStore: sp.GetRequiredService<IIssueStore>());
         });
 
         // T11: Enforcement loop
@@ -248,40 +438,14 @@ public static class Program
         // T03: Register OutboxManager
         builder.Services.AddSingleton<IOutboxManager, OutboxManager>();
 
-        // T23: Register IntegrityChecker for binary integrity verification
+        // T23: Register the durable integrity runtime without constructing it
+        // before backend identity startup has restored the definitive device.
         builder.Services.AddSingleton<IWinTrustVerifier, WinTrustVerifier>();
-        builder.Services.AddScoped<IIntegrityChecker>(sp =>
+        builder.Services.AddSingleton<IIntegrityChecker>(sp =>
             new IntegrityChecker(sp.GetRequiredService<IWinTrustVerifier>()));
-
-        // T23: Register IntegrityVerdictHandler (singleton — maintains state across service lifetime)
-        builder.Services.AddSingleton<IIntegrityVerdictHandler>(sp =>
-            new IntegrityVerdictHandler(sp.GetRequiredService<IOutboxManager>()));
-
-        // T13: Register AntiTamperMonitor
-        builder.Services.AddSingleton<IAntiTamperMonitor>((sp) =>
-        {
-            var timeProvider = sp.GetRequiredService<ITimeProvider>();
-            var outboxManager = sp.GetRequiredService<IOutboxManager>();
-            var privilegeInspector = sp.GetRequiredService<IPrivilegeInspector>();
-            var enforcementLevelMonitor = sp.GetRequiredService<IEnforcementLevelMonitor>();
-            var integrityChecker = sp.GetRequiredService<IIntegrityChecker>();
-            var backendClient = sp.GetRequiredService<IBackendClient>();
-            var verdictHandler = sp.GetRequiredService<IIntegrityVerdictHandler>();
-
-            return new AntiTamperMonitor(
-                timeProvider: timeProvider,
-                outboxManager: outboxManager,
-                privilegeInspector: privilegeInspector,
-                enforcementLevelMonitor: enforcementLevelMonitor,
-                integrityChecker: integrityChecker,
-                backendClient: backendClient,
-                verdictHandler: verdictHandler,
-                onTamperDetected: tamperEvent =>
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[AntiTamperMonitor] Tamper event: {tamperEvent.Type} - {tamperEvent.Description}");
-                });
-        });
+        builder.Services.AddSingleton<IIntegrityEscalationStateStore>(_ =>
+            new FileIntegrityEscalationStateStore(Path.Combine(DataFolderPath, "integrity-escalation")));
+        builder.Services.AddSingleton<IntegrityRuntimeFactory>();
 
         // T16: Register SecretStore (infrastructure for T17/T18)
         // Uses DPAPI for secure storage in ProgramData
@@ -294,32 +458,11 @@ public static class Program
             return new SecretStore(basePath);
         });
 
-        // T14: Register BackendClient (infrastructure for T18/T20)
-        // T22: Configured with SocketsHttpHandler — TLS 1.3 + SPKI certificate pinning
-        builder.Services.AddSingleton<IBackendClient>((sp) =>
-        {
-            var httpClient = CreateSupabaseHttpClient(tlsPinningConfig.CertPin);
-            var deviceAuth = sp.GetRequiredService<IDeviceAuthenticator>();
-            return new BackendClient(httpClient, supabaseConfig.Url, deviceAuth);
-        });
-
-        // T17: Register DeviceAuthenticator as hosted service
-        // T22: Same TLS/pinning handler for auth calls to supabase.co
-        builder.Services.AddSingleton<IDeviceAuthenticator>((sp) =>
-        {
-            var secretStore = sp.GetRequiredService<ISecretStore>();
-            var timeProvider = sp.GetRequiredService<ITimeProvider>();
-            var httpClient = CreateSupabaseHttpClient(tlsPinningConfig.CertPin);
-            return new DeviceAuthenticator(
-                secretStore,
-                timeProvider,
-                httpClient,
-                supabaseConfig.Url,
-                supabaseConfig.AnonKey);
-        });
-
-        // T24: Register PairingService for device pairing
-        builder.Services.AddScoped<IPairingService, PairingService>();
+        // SDD5 Unit 6: one production identity authority owns pairing and backend authorization.
+        ConfigureProductionHostedServices(
+            builder.Services,
+            supabaseConfig,
+            tlsPinningConfig);
 
         // T25: Register ConsentService for data collection consent
         builder.Services.AddScoped<IConsentService, ConsentService>();
@@ -327,8 +470,34 @@ public static class Program
         // T27: Register UsageStateQueryHandler for UI queries
         builder.Services.AddScoped<UsageStateQueryHandler>();
 
+        // T26: Register the App.UI IPC server and its message graph
+        builder.Services.AddSingleton<OnboardingStateService>(sp =>
+            new OnboardingStateService(
+                DataFolderPath,
+                sp.GetRequiredService<IChildAccountStore>(),
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OnboardingStateService>>(),
+                () => sp.GetRequiredService<ServiceHealthMonitor>().CanProceedWithHealthyOnboarding));
+        builder.Services.AddSingleton<IOnboardingStateService>(sp =>
+            sp.GetRequiredService<OnboardingStateService>());
+        builder.Services.AddSingleton<EnforcementLevelQueryHandler>();
+        builder.Services.AddSingleton<UIMessageHandler>(sp =>
+            new UIMessageHandler(
+                sp.GetRequiredService<OnboardingStateService>(),
+                sp.GetRequiredService<EnforcementLevelQueryHandler>(),
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<UIMessageHandler>>(),
+                 sp.GetRequiredService<IWnsRegistrationCoordinator>(),
+                 sp.GetRequiredService<IScheduledWorkService>(),
+                 sp.GetRequiredService<BackendRealtimeIdentityAuthority>()));
+        builder.Services.AddSingleton<NamedPipeUIServer>(sp =>
+            new NamedPipeUIServer(
+                null,
+                null,
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<NamedPipeUIServer>>()));
+        builder.Services.AddHostedService<NamedPipeUIServerHostedAdapter>();
+
         // T20: Register TaskSchedulerBackupService as safety net for timer failures
-        builder.Services.AddSingleton<ITaskSchedulerBackup, TaskSchedulerBackupService>();
+        ConfigureBackupAdmission(builder.Services);
 
         // T20: Register ScheduledWorkService as hosted service
         builder.Services.AddSingleton<IScheduledWorkService>((sp) =>
@@ -351,28 +520,13 @@ public static class Program
                 healthMonitor,
                 recoveryManager,
                 policyRepository,
-                taskSchedulerBackup);
+                taskSchedulerBackup,
+                sp.GetRequiredService<IBackendIdentityCoordinator>());
         });
         builder.Services.AddHostedService<ScheduledWorkServiceHostedAdapter>();
 
-        // T19: Register WNS push notification service
-        var wnsPackageSid = Environment.GetEnvironmentVariable("WNS_PACKAGE_SID") ?? string.Empty;
-        var wnsClientSecret = Environment.GetEnvironmentVariable("WNS_CLIENT_SECRET") ?? string.Empty;
-        var wnsConfig = new WnsConfig(wnsPackageSid, wnsClientSecret);
-        builder.Services.AddSingleton<IPushNotificationService>(sp =>
-        {
-            var httpClient = new HttpClient();
-            return new WnsNotificationService(
-                httpClient,
-                wnsConfig.PackageSid,
-                wnsConfig.ClientSecret,
-                sp.GetRequiredService<ITimeProvider>());
-        });
-        builder.Services.AddHostedService<WnsNotificationServiceHostedAdapter>();
-
         // T10: Service persistence
         builder.Services.AddWindowsService();
-        builder.Services.AddHostedService<ControlParentalService>();
 
         var host = builder.Build();
 
@@ -384,34 +538,135 @@ public static class Program
         // applied by the first run's ApplyHardeningAsync and persists on the folder.
         await ApplyHardeningAsync(host.Services);
 
-        // T03: Ensure database is created (after hardening so the ACL is stable)
-        using (var scope = host.Services.CreateScope())
+        await StartHostAndRunSelectedModeAsync(
+            host,
+            isBackupMode,
+            backupMode,
+            host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping);
+    }
+
+    internal static void ConfigureDbContextOptions(
+        DbContextOptionsBuilder options,
+        string connectionString,
+        bool useCompiledModel)
+    {
+        options.UseSqlite(connectionString);
+        if (useCompiledModel)
         {
-            var db = scope.ServiceProvider.GetRequiredService<ControlParentalDbContext>();
-            Console.WriteLine("[Program] DB path: " + db.Database.GetConnectionString());
-            Console.WriteLine("[Program] About to call EnsureCreatedAsync...");
-            var created = await db.Database.EnsureCreatedAsync();
-            Console.WriteLine($"[Program] EnsureCreatedAsync: created={created}");
-            Console.WriteLine($"[Program] DB can connect: {db.Database.CanConnect()}");
+            options.UseModel(ControlParentalDbContextModel.Instance);
+        }
+    }
 
-            // Force create tables via raw SQL to debug
-            var conn = db.Database.GetDbConnection();
-            await conn.OpenAsync();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table'";
-            using var reader = await cmd.ExecuteReaderAsync();
-            var tables = new List<string>();
-            while (await reader.ReadAsync())
+    internal static async Task InitializeDatabaseAsync(ControlParentalDbContext db, CancellationToken cancellationToken = default)
+    {
+        await db.Database.EnsureCreatedAsync(cancellationToken);
+        await SqliteSchemaBootstrapper.AdoptAsync(
+            db,
+            cancellationToken,
+            async (transaction, token) =>
             {
-                tables.Add(reader.GetString(0));
-            }
+                await EnsurePolicyColumnsAsync(db, transaction, token);
+                await EnsureUsageTodayElapsedSecondsColumnAsync(db, transaction, token);
+            });
+    }
 
-            await reader.CloseAsync();
-            Console.WriteLine($"[Program] Tables found: {string.Join(", ", tables)}");
-            await conn.CloseAsync();
+    internal static async Task StartHostAfterDatabaseInitializationAsync(IHost host, CancellationToken cancellationToken = default)
+    {
+        using var scope = host.Services.CreateScope();
+        await InitializeDatabaseAsync(
+            scope.ServiceProvider.GetRequiredService<ControlParentalDbContext>(),
+            cancellationToken);
+        await host.StartAsync(cancellationToken);
+    }
+
+    internal static async Task StartHostAndRunSelectedModeAsync(
+        IHost host,
+        bool isBackupMode,
+        BackupMode backupMode,
+        CancellationToken cancellationToken = default)
+    {
+        await StartHostAfterDatabaseInitializationAsync(host, cancellationToken);
+        await RunSelectedModeAsync(host, isBackupMode, backupMode, cancellationToken);
+    }
+
+    private static async Task EnsurePolicyColumnsAsync(ControlParentalDbContext db, SqliteTransaction transaction, CancellationToken ct)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+        {
+            await connection.OpenAsync(ct);
         }
 
-        await host.RunAsync();
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "PRAGMA table_info(policies)";
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) columns.Add(reader.GetString(1));
+        }
+
+        if (columns.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var definition in new[]
+        {
+            (Name: "snapshot_hash", Sql: "TEXT NOT NULL DEFAULT ''"),
+            (Name: "is_quarantined", Sql: "INTEGER NOT NULL DEFAULT 0"),
+            (Name: "quarantine_reason", Sql: "TEXT NULL"),
+        })
+        {
+            if (columns.Contains(definition.Name)) continue;
+            await using var alter = connection.CreateCommand();
+            alter.Transaction = transaction;
+            alter.CommandText = $"ALTER TABLE policies ADD COLUMN {definition.Name} {definition.Sql}";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
+    }
+
+    private static async Task EnsureUsageTodayElapsedSecondsColumnAsync(ControlParentalDbContext db, SqliteTransaction transaction, CancellationToken ct)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+        {
+            await connection.OpenAsync();
+        }
+
+        var hasElapsedSecondsColumn = false;
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "PRAGMA table_info(usage_today)";
+            using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                if (string.Equals(reader.GetString(1), "elapsed_seconds", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasElapsedSecondsColumn = true;
+                    break;
+                }
+            }
+        }
+
+        if (!hasElapsedSecondsColumn)
+        {
+            using var alter = connection.CreateCommand();
+            alter.Transaction = transaction;
+            alter.CommandText = "ALTER TABLE usage_today ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
+
+        using var backfill = connection.CreateCommand();
+        backfill.Transaction = transaction;
+        backfill.CommandText = @"
+UPDATE usage_today
+SET elapsed_seconds = CASE
+    WHEN elapsed_seconds = 0 AND minutes > 0 THEN minutes * 60
+    ELSE elapsed_seconds
+END";
+        await backfill.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>
@@ -420,6 +675,8 @@ public static class Program
     private static async Task ApplyHardeningAsync(IServiceProvider services)
     {
         var aclHardener = services.GetRequiredService<IAclHardener>();
+        var privilegeLevel = await services.GetRequiredService<IPrivilegeInspector>()
+            .GetPrivilegeLevelAsync(cancellationToken: CancellationToken.None);
 
         if (!Directory.Exists(DataFolderPath))
         {
@@ -434,16 +691,20 @@ public static class Program
             }
         }
 
-        _ = await aclHardener.HardenAllAsync(
+        var aclSucceeded = await aclHardener.HardenAllAsync(
             AgentFolderPath,
             DataFolderPath,
             ServiceRegistryKey,
             ServiceExePath,
             CancellationToken.None);
 
-        var scmController = services.GetRequiredService<IScmController>();
-        _ = await scmController.ConfigureFailureActionsAsync(ServiceName, CancellationToken.None);
-        _ = await scmController.SetStartupTypeAsync(ServiceName, "auto", CancellationToken.None);
+        var verdict = RuntimeSecurityVerdictEvaluator.Evaluate(privilegeLevel, aclSucceeded);
+        services.GetRequiredService<ServiceHealthMonitor>().ApplySecurityVerdict(verdict);
+
+        var scmHardening = new ServiceRecoveryHardeningCoordinator(
+            services.GetRequiredService<IScmController>());
+
+        _ = await scmHardening.ApplyAsync(ServiceName, CancellationToken.None);
     }
 }
 
@@ -483,22 +744,56 @@ public sealed class SessionManager : IDisposable
     private readonly Action<ForegroundChanged> onForegroundChanged;
     private readonly Action<AgentHeartbeat> onHeartbeat;
     private readonly Action<StateSnapshot> onStateSnapshot;
+    private readonly Action<AgentActionResult>? onAgentActionResult;
     private readonly IUsageAccumulator? usageAccumulator;
     private readonly IOverlayPersistenceManager? overlayPersistenceManager;
     private readonly Func<string, string?, IIpcMessage?, Task> sendOverlayToAgentAsync;
     private readonly IServiceHealthMonitor? healthMonitor;
     private readonly IServiceRecoveryManager? recoveryManager;
+    private readonly Action<IIpcChannel?>? onAgentChannelChanged;
     private readonly Action? onAgentRecoveryNeeded;
     private readonly Action? onAgentDeathDetected;
+    private CancellationToken serviceStoppingToken = default;
     private SessionWatcher? sessionWatcher;
-    private AgentLauncher? agentLauncher;
+    private readonly Dictionary<int, SessionRecord> sessionRecords = new();
+    private readonly object recordsLock = new();
+    private Func<int, AgentLauncher>? launcherFactory;
+    private int? activeSessionId;
     private bool disposed;
+    private const int RecoveryAttemptLimit = 3;
+    private static readonly TimeSpan[] RecoveryBackoffDelays =
+    [
+        TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(250),
+    ];
 
     /// <summary>
     /// Gets the IPC channel for communicating with the agent.
     /// May be null if the agent is not running.
     /// </summary>
-    public IIpcChannel? AgentChannel => this.agentLauncher?.AgentChannel;
+    public IIpcChannel? AgentChannel
+    {
+        get
+        {
+            lock (this.recordsLock)
+            {
+                return this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var record)
+                    ? record.Launcher.AgentChannel
+                    : null;
+            }
+        }
+    }
+
+    public int? ActiveSessionId
+    {
+        get
+        {
+            lock (this.recordsLock)
+            {
+                return this.activeSessionId;
+            }
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SessionManager"/> class.
@@ -523,11 +818,13 @@ public sealed class SessionManager : IDisposable
         Action<ForegroundChanged> onForegroundChanged,
         Action<AgentHeartbeat> onHeartbeat,
         Action<StateSnapshot> onStateSnapshot,
+        Action<AgentActionResult>? onAgentActionResult = null,
         IUsageAccumulator? usageAccumulator = null,
         IOverlayPersistenceManager? overlayPersistenceManager = null,
         Func<string, string?, IIpcMessage?, Task>? sendOverlayToAgentAsync = null,
         IServiceHealthMonitor? healthMonitor = null,
         IServiceRecoveryManager? recoveryManager = null,
+        Action<IIpcChannel?>? onAgentChannelChanged = null,
         Action? onAgentRecoveryNeeded = null,
         Action? onAgentDeathDetected = null)
     {
@@ -537,13 +834,31 @@ public sealed class SessionManager : IDisposable
         this.onForegroundChanged = onForegroundChanged;
         this.onHeartbeat = onHeartbeat;
         this.onStateSnapshot = onStateSnapshot;
+        this.onAgentActionResult = onAgentActionResult;
         this.usageAccumulator = usageAccumulator;
         this.overlayPersistenceManager = overlayPersistenceManager;
         this.sendOverlayToAgentAsync = sendOverlayToAgentAsync ?? this.DefaultSendOverlayAsync;
         this.healthMonitor = healthMonitor;
         this.recoveryManager = recoveryManager;
+        this.onAgentChannelChanged = onAgentChannelChanged;
         this.onAgentRecoveryNeeded = onAgentRecoveryNeeded;
         this.onAgentDeathDetected = onAgentDeathDetected;
+    }
+
+    internal SessionManager(
+        string childUsername,
+        string agentExePath,
+        string pipeName,
+        Action<ForegroundChanged> onForegroundChanged,
+        Action<AgentHeartbeat> onHeartbeat,
+        Action<StateSnapshot> onStateSnapshot,
+        AgentLauncher agentLauncher,
+        Action<IIpcChannel?>? onAgentChannelChanged = null)
+        : this(childUsername, agentExePath, pipeName, onForegroundChanged, onHeartbeat, onStateSnapshot)
+    {
+        var injectedLauncher = agentLauncher ?? throw new ArgumentNullException(nameof(agentLauncher));
+        this.launcherFactory = _ => injectedLauncher;
+        this.onAgentChannelChanged = onAgentChannelChanged;
     }
 
     /// <summary>
@@ -551,19 +866,24 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
+        this.serviceStoppingToken = cancellationToken;
+        var childSid = (SecurityIdentifier)new NTAccount(this.childUsername)
+            .Translate(typeof(SecurityIdentifier));
+
         // Create the agent launcher
-        this.agentLauncher = new AgentLauncher(
+        this.launcherFactory = sessionId => new AgentLauncher(
             this.agentExePath,
-            this.pipeName,
-            sid => this.ValidateChildSid(sid),
-            message => this.HandleAgentMessage(message),
-            () => this.OnAgentDisconnected());
+            $"{this.pipeName}-{sessionId}",
+            childSid,
+            sid => string.Equals(sid, childSid.Value, StringComparison.Ordinal),
+            message => this.HandleAgentMessage(sessionId, message),
+            () => this.OnAgentDisconnected(sessionId));
 
         // Create the session watcher
         this.sessionWatcher = new SessionWatcher(
             this.childUsername,
             async sessionId => await this.OnSessionStarted(sessionId),
-            () => this.OnSessionEnded(),
+            sessionId => _ = this.OnSessionEnded(sessionId),
             sessionId => this.OnSessionLocked(sessionId),
             sessionId => this.OnSessionUnlocked(sessionId));
 
@@ -578,16 +898,23 @@ public sealed class SessionManager : IDisposable
     {
         if (this.sessionWatcher != null)
         {
-            this.sessionWatcher.Stop();
+            await this.sessionWatcher.StopAsync();
             this.sessionWatcher.Dispose();
             this.sessionWatcher = null;
         }
 
-        if (this.agentLauncher != null)
+        SessionRecord[] records;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.KillAgentAsync();
-            this.agentLauncher.Dispose();
-            this.agentLauncher = null;
+            records = this.sessionRecords.Values.ToArray();
+            this.sessionRecords.Clear();
+            this.activeSessionId = null;
+        }
+
+        foreach (var record in records)
+        {
+            await record.StopAsync();
+            record.Dispose();
         }
     }
 
@@ -596,61 +923,60 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     public async Task SendToAgentAsync(IIpcMessage message, CancellationToken cancellationToken = default)
     {
-        if (this.agentLauncher != null && this.agentLauncher.IsAgentRunning)
+        SessionRecord? record;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.SendToAgentAsync(message, cancellationToken);
+            record = this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var active)
+                ? active
+                : null;
+        }
+
+        if (record != null)
+        {
+            await record.Launcher.SendToAgentAsync(message, cancellationToken);
         }
     }
 
-    private bool ValidateChildSid(string sid)
-    {
-        // Validate that the connecting client has the expected SID
-        // This is implemented by checking if the SID matches the child user's SID
-        try
-        {
-            var connectingSid = new System.Security.Principal.SecurityIdentifier(sid);
-
-            // For now, accept any local user connection (simplified)
-            // In production, this would compare against the actual child user SID
-            // SecurityIdentifier.IsValid() does not exist; check via GetBinaryForm
-            try
-            {
-                var binaryForm = new byte[connectingSid.BinaryLength];
-                connectingSid.GetBinaryForm(binaryForm, 0);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private async Task OnSessionStarted(int sessionId)
+    internal async Task OnSessionStarted(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             $"[SessionManager] Session started for child user: {sessionId}");
 
-        // Launch the agent in the new session
-        if (this.agentLauncher != null)
+        SessionRecord record;
+        lock (this.recordsLock)
         {
-            await this.agentLauncher.LaunchAgentAsync(sessionId);
+            this.activeSessionId = sessionId;
+            if (!this.sessionRecords.TryGetValue(sessionId, out record!))
+            {
+                record = new SessionRecord(sessionId, this.launcherFactory!(sessionId));
+                this.sessionRecords.Add(sessionId, record);
+            }
         }
+
+        await record.StartAsync(sessionId);
+        this.NotifyAgentChannelChanged();
     }
 
-    private void OnSessionEnded()
+    internal async Task OnSessionEnded(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             "[SessionManager] Session ended for child user.");
 
-        // Kill the agent when the session ends
-        if (this.agentLauncher != null)
+        SessionRecord? record;
+        lock (this.recordsLock)
         {
-            _ = this.agentLauncher.KillAgentAsync();
+            this.sessionRecords.Remove(sessionId, out record);
+            if (this.activeSessionId == sessionId)
+            {
+                this.activeSessionId = this.sessionRecords.Keys.FirstOrDefault();
+            }
+        }
+
+        if (record != null)
+        {
+            await record.StopAsync();
+            record.Dispose();
+            this.NotifyAgentChannelChanged();
         }
     }
 
@@ -678,7 +1004,8 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     private void RestorePersistentOverlay(string reason, string? ctaLabel)
     {
-        if (this.agentLauncher == null || !this.agentLauncher.IsAgentRunning)
+        var launcher = this.GetActiveLauncher();
+        if (launcher == null || !launcher.IsAgentRunning)
         {
             System.Diagnostics.Debug.WriteLine(
                 "[SessionManager] Cannot restore overlay: agent not running.");
@@ -686,7 +1013,7 @@ public sealed class SessionManager : IDisposable
         }
 
         var overlayMessage = new ShowOverlay(reason, ctaLabel);
-        this.agentLauncher.SendToAgentAsync(overlayMessage, CancellationToken.None)
+        launcher.SendToAgentAsync(overlayMessage, CancellationToken.None)
             .ContinueWith(_ => System.Diagnostics.Debug.WriteLine(
                 $"[SessionManager] Persistent overlay restored: {reason}"));
     }
@@ -696,13 +1023,14 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     private async Task DefaultSendOverlayAsync(string reason, string? ctaLabel, IIpcMessage? message)
     {
-        if (this.agentLauncher != null && this.agentLauncher.IsAgentRunning && message != null)
+        var launcher = this.GetActiveLauncher();
+        if (launcher != null && launcher.IsAgentRunning && message != null)
         {
-            await this.agentLauncher.SendToAgentAsync(message, CancellationToken.None);
+            await launcher.SendToAgentAsync(message, CancellationToken.None);
         }
     }
 
-    private void HandleAgentMessage(IIpcMessage message)
+    private void HandleAgentMessage(int sessionId, IIpcMessage message)
     {
         switch (message)
         {
@@ -712,6 +1040,10 @@ public sealed class SessionManager : IDisposable
 
             case AgentHeartbeat hb:
                 this.onHeartbeat(hb);
+                break;
+
+            case AgentCommandCompleted completed:
+                this.onAgentActionResult?.Invoke(completed.Result);
                 break;
 
             case StateSnapshot snapshot:
@@ -725,7 +1057,7 @@ public sealed class SessionManager : IDisposable
         }
     }
 
-    private void OnAgentDisconnected()
+    private void OnAgentDisconnected(int sessionId)
     {
         System.Diagnostics.Debug.WriteLine(
             "[SessionManager] Agent disconnected.");
@@ -738,15 +1070,218 @@ public sealed class SessionManager : IDisposable
 
         // If we have a recovery callback, trigger it
         this.onAgentRecoveryNeeded?.Invoke();
+        this.onAgentChannelChanged?.Invoke(null);
+    }
+
+    internal async Task<bool> RecoverAgentAsync(CancellationToken cancellationToken = default)
+    {
+        SessionRecord? record;
+        lock (this.recordsLock)
+        {
+            record = this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var active)
+                ? active
+                : null;
+        }
+
+        if (record == null)
+        {
+            return false;
+        }
+
+        using var linkedCts = this.serviceStoppingToken.CanBeCanceled || cancellationToken.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, this.serviceStoppingToken)
+            : null;
+
+        var recovered = await record.RecoverAsync(linkedCts?.Token ?? cancellationToken);
+        if (recovered)
+        {
+            this.NotifyAgentChannelChanged();
+        }
+
+        return recovered;
     }
 
     public void Dispose()
     {
         if (!this.disposed)
         {
-            this.StopAsync().Wait(TimeSpan.FromSeconds(5));
+            _ = this.StopAsync();
             this.disposed = true;
         }
+    }
+
+    private AgentLauncher? GetActiveLauncher()
+    {
+        lock (this.recordsLock)
+        {
+            return this.activeSessionId is int id && this.sessionRecords.TryGetValue(id, out var record)
+                ? record.Launcher
+                : null;
+        }
+    }
+
+    private void NotifyAgentChannelChanged()
+    {
+        this.onAgentChannelChanged?.Invoke(this.AgentChannel);
+    }
+
+    private sealed class SessionRecord : IDisposable
+    {
+        private readonly SemaphoreSlim lifecycleGate = new(1, 1);
+        private bool started;
+        private Task<bool>? recoveryTask;
+
+        public SessionRecord(int sessionId, AgentLauncher launcher)
+        {
+            this.SessionId = sessionId;
+            this.Launcher = launcher;
+        }
+
+        public int SessionId { get; }
+        public AgentLauncher Launcher { get; }
+
+        public async Task StartAsync(int sessionId)
+        {
+            await this.lifecycleGate.WaitAsync();
+            try
+            {
+                if (!this.started)
+                {
+                    this.started = await this.Launcher.LaunchAgentAsync(sessionId);
+                }
+            }
+            finally
+            {
+                this.lifecycleGate.Release();
+            }
+        }
+
+        public async Task StopAsync()
+        {
+            await this.lifecycleGate.WaitAsync();
+            try
+            {
+                await this.Launcher.KillAgentAsync();
+                this.started = false;
+            }
+            finally
+            {
+                this.lifecycleGate.Release();
+            }
+        }
+
+        public Task<bool> RecoverAsync(CancellationToken cancellationToken)
+        {
+            lock (this)
+            {
+                return this.recoveryTask ??= RecoverCoreAsync(cancellationToken);
+            }
+        }
+
+        private async Task<bool> RecoverCoreAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await this.lifecycleGate.WaitAsync(cancellationToken);
+                try
+                {
+                    for (var attempt = 0; attempt < RecoveryAttemptLimit; attempt++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        this.started = await this.Launcher.LaunchAgentAsync(this.SessionId, cancellationToken);
+                        if (this.started)
+                        {
+                            return true;
+                        }
+
+                        if (attempt < RecoveryAttemptLimit - 1)
+                        {
+                            await Task.Delay(RecoveryBackoffDelays[attempt], cancellationToken);
+                        }
+                    }
+
+                    return false;
+                }
+                finally
+                {
+                    this.lifecycleGate.Release();
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+            finally
+            {
+                lock (this)
+                {
+                    this.recoveryTask = null;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            this.Launcher.Dispose();
+            this.lifecycleGate.Dispose();
+        }
+    }
+}
+
+file sealed class RuntimeScopedIntegrityStateStore(
+    IIntegrityEscalationStateStore inner,
+    string identity) : IIntegrityEscalationStateStore
+{
+    public Task<IntegrityEscalationState?> LoadAsync(string _, CancellationToken cancellationToken = default)
+        => inner.LoadAsync(identity, cancellationToken);
+
+    public Task SaveAsync(IntegrityEscalationStateEnvelope value, CancellationToken cancellationToken = default)
+    {
+        if (!string.Equals(value.State.IdentityScope, identity, StringComparison.Ordinal))
+        {
+            throw new IntegrityEscalationStateException(IntegrityEscalationStateError.WrongIdentity, "The runtime escalation state identity does not match the captured identity.");
+        }
+
+        return inner.SaveAsync(value, cancellationToken);
+    }
+}
+
+/// <summary>Creates the integrity runtime after definitive identity startup.</summary>
+public sealed class IntegrityRuntimeFactory(
+    ITimeProvider timeProvider,
+    IOutboxManager outboxManager,
+    IPrivilegeInspector privilegeInspector,
+    IEnforcementLevelMonitor enforcementLevelMonitor,
+    IIntegrityChecker integrityChecker,
+    IBackendClient backendClient,
+    IBackendIdentityCoordinator identityCoordinator,
+    IIntegrityEscalationStateStore stateStore)
+{
+    internal IAntiTamperMonitor? CreatedMonitor { get; private set; }
+
+    internal IAntiTamperMonitor? Create()
+    {
+        var identityScope = identityCoordinator.CurrentState.DeviceId;
+        if (string.IsNullOrWhiteSpace(identityScope))
+        {
+            return null;
+        }
+
+        var handler = new IntegrityVerdictHandler(
+            outboxManager,
+            identityScope: identityScope);
+        this.CreatedMonitor = new AntiTamperMonitor(
+            timeProvider,
+            outboxManager,
+            privilegeInspector,
+            enforcementLevelMonitor,
+            integrityChecker,
+            backendClient,
+            handler,
+            identityCoordinator: identityCoordinator,
+            stateStore: new RuntimeScopedIntegrityStateStore(stateStore, identityScope));
+        return this.CreatedMonitor;
     }
 }
 
@@ -767,10 +1302,27 @@ public sealed class ControlParentalService : BackgroundService
     private readonly ITimeProvider timeProvider;
     private readonly IPolicyRepository policyRepository;
     private readonly IProcessTerminator processTerminator;
+    private readonly IProtectedProcessReporter? protectedProcessReporter;
     private readonly IEnforcementLevelMonitor? enforcementLevelMonitor;
-    private readonly IAntiTamperMonitor? antiTamperMonitor;
+    private IAntiTamperMonitor? antiTamperMonitor;
+    private readonly IntegrityRuntimeFactory? integrityRuntimeFactory;
     private SessionManager? sessionManager;
+    private IIpcChannel? boundAgentChannel;
     private IEnforcementEngine? enforcementEngine;
+    private SessionSafetyLoop? safetyLoop;
+    private Task bindingTask = Task.CompletedTask;
+    private Task recoveryTask = Task.CompletedTask;
+    private Task timeChangeTask = Task.CompletedTask;
+    private readonly SemaphoreSlim bindingGate = new(1, 1);
+    private readonly TaskCompletionSource startupCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object lifecycleLock = new();
+    private Task? stopTask;
+    private bool ownsAntiTamperMonitor;
+    private bool bindingAdmissionClosed;
+    private bool disposed;
+    private long agentGeneration;
+    private bool childIsAdmin;
+    private TimeChangeReason? pendingTimeChange;
 
     public ControlParentalService(
         IScmController scmController,
@@ -785,8 +1337,9 @@ public sealed class ControlParentalService : BackgroundService
         ITimeProvider timeProvider,
         IPolicyRepository policyRepository,
         IProcessTerminator processTerminator,
+        IProtectedProcessReporter? protectedProcessReporter = null,
         IEnforcementLevelMonitor? enforcementLevelMonitor = null,
-        IAntiTamperMonitor? antiTamperMonitor = null)
+        IntegrityRuntimeFactory? integrityRuntimeFactory = null)
     {
         this.scmController = scmController;
         this.privilegeInspector = privilegeInspector;
@@ -800,28 +1353,52 @@ public sealed class ControlParentalService : BackgroundService
         this.timeProvider = timeProvider;
         this.policyRepository = policyRepository;
         this.processTerminator = processTerminator;
+        this.protectedProcessReporter = protectedProcessReporter;
         this.enforcementLevelMonitor = enforcementLevelMonitor;
-        this.antiTamperMonitor = antiTamperMonitor;
+        this.integrityRuntimeFactory = integrityRuntimeFactory;
+    }
+
+    public override async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await base.StartAsync(cancellationToken).ConfigureAwait(false);
+        await this.startupCompletion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // T10: Start health monitoring
-        await this.healthMonitor.StartAsync(stoppingToken);
-        System.Diagnostics.Debug.WriteLine("[ControlParentalService] Health monitor started.");
+        this.timeProvider.TimeChanged += this.OnTimeChanged;
 
-        // T12: Start enforcement level monitoring
-        if (this.enforcementLevelMonitor != null)
+        try
         {
-            await this.enforcementLevelMonitor.StartAsync(stoppingToken);
-            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Enforcement level monitor started.");
+            // T10: Start health monitoring
+            await this.healthMonitor.StartAsync(stoppingToken);
+            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Health monitor started.");
+
+            await this.ReportProtectedProcessStatusAsync(stoppingToken);
+
+            // T12: Start enforcement level monitoring, including Unpaired local safety.
+            if (this.enforcementLevelMonitor != null)
+            {
+                await this.enforcementLevelMonitor.StartAsync(stoppingToken);
+                System.Diagnostics.Debug.WriteLine("[ControlParentalService] Enforcement level monitor started.");
+            }
+
+            // T13: Start anti-tamper monitoring. WNS and scheduled work are
+            // registered after this hosted service; the monitor itself gates
+            // its first remote integrity work on rehydration.
+            await this.StartIntegrityRuntimeAsync(stoppingToken);
+            this.startupCompletion.TrySetResult();
         }
-
-        // T13: Start anti-tamper monitoring
-        if (this.antiTamperMonitor != null)
+        catch (OperationCanceledException exception)
         {
-            await this.antiTamperMonitor.StartAsync(stoppingToken);
-            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Anti-tamper monitor started.");
+            this.startupCompletion.TrySetCanceled(
+                exception.CancellationToken.CanBeCanceled ? exception.CancellationToken : stoppingToken);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            this.startupCompletion.TrySetException(exception);
+            throw;
         }
 
         // T37: Verify child's account is standard
@@ -834,11 +1411,16 @@ public sealed class ControlParentalService : BackgroundService
 
             if (!isStandard)
             {
+                this.childIsAdmin = true;
                 System.Diagnostics.Debug.WriteLine(
                     $"[ControlParentalService] WARNING: Child account '{childName}' " +
                     "is an administrator. This is a DEGRADED state.");
             }
         }
+
+        this.enforcementEngine = new EnforcementEngine(
+            this.policyRepository, this.usageAccumulator, this.processTerminator,
+            this.workstationLockManager, this.timeProvider);
 
         // T38: Start session management
         if (!string.IsNullOrEmpty(childName))
@@ -846,9 +1428,7 @@ public sealed class ControlParentalService : BackgroundService
             // T10: Recovery callback for when agent dies
             Action OnAgentRecoveryNeeded = () =>
             {
-                _ = this.recoveryManager.RequestAgentRecoveryAsync("Agent died unexpectedly")
-                    .ContinueWith(t => System.Diagnostics.Debug.WriteLine(
-                        $"[ControlParentalService] Agent recovery requested. Success: {t.Result}"));
+                this.recoveryTask = this.RequestAgentRecoveryAsync();
             };
 
             this.sessionManager = new SessionManager(
@@ -858,50 +1438,23 @@ public sealed class ControlParentalService : BackgroundService
                 fg => this.OnForegroundChanged(fg),
                 hb => this.OnHeartbeat(hb),
                 snapshot => this.OnStateSnapshot(snapshot),
+                onAgentActionResult: result => this.safetyLoop?.AcceptResult(result),
                 usageAccumulator: this.usageAccumulator,
-                overlayPersistenceManager: this.overlayPersistenceManager,
                 healthMonitor: this.healthMonitor,
+                onAgentChannelChanged: channel => this.QueueAgentBinding(channel, stoppingToken),
                 onAgentRecoveryNeeded: OnAgentRecoveryNeeded,
                 onAgentDeathDetected: () => this.antiTamperMonitor?.RecordAgentDeath());
 
+            if (this.recoveryManager is ServiceRecoveryManager serviceRecoveryManager)
+            {
+                serviceRecoveryManager.SetRecoverAgentFunc(
+                    () => this.sessionManager.RecoverAgentAsync());
+            }
+
             await this.sessionManager.StartAsync(stoppingToken);
-        }
 
-        // T06: Start the usage counter and request backfill
-        // Set the IPC channel from SessionManager so UsageAccumulator can send ShowWarning
-        if (this.sessionManager?.AgentChannel is IIpcChannel ipcChannel)
-        {
-            // UsageAccumulator is constructed with null IPC channel by DI;
-            // set it now that SessionManager has created its channel
-            if (this.usageAccumulator is UsageAccumulator accumulator)
-            {
-                accumulator.SetIpcChannel(ipcChannel);
-            }
-
-            // T07: Also set IPC channel on UsageReconciler (created before SessionManager)
-            if (this.usageReconciler is UsageReconciler reconciler)
-            {
-                reconciler.SetIpcChannel(ipcChannel);
-            }
-
-            // T09: Also set IPC channel on WorkstationLockManager (created before SessionManager)
-            if (this.workstationLockManager is WorkstationLockManager lockManager)
-            {
-                lockManager.SetIpcChannel(ipcChannel);
-            }
-        }
-
-        // T11: Initialize the enforcement engine with IPC channel for overlay commands
-        if (this.sessionManager?.AgentChannel is IIpcChannel agentChannel)
-        {
-            this.enforcementEngine = new EnforcementEngine(
-                policyRepository: this.policyRepository,
-                usageAccumulator: this.usageAccumulator,
-                processTerminator: this.processTerminator,
-                workstationLockManager: this.workstationLockManager,
-                timeProvider: this.timeProvider,
-                ipcChannel: agentChannel);
-            System.Diagnostics.Debug.WriteLine("[ControlParentalService] Enforcement engine initialized.");
+            this.QueueAgentBinding(this.sessionManager.AgentChannel, stoppingToken);
+            await this.bindingTask;
         }
 
         // T07: Start the usage reconciler (WMI event listener)
@@ -909,58 +1462,54 @@ public sealed class ControlParentalService : BackgroundService
 
         await this.usageAccumulator.StartAsync(stoppingToken);
 
-        // T07/T10: Trigger initial backfill (reconciler is idempotent, only runs once per day)
-        // This is part of cold start reconciliation
-        _ = this.usageReconciler.ReconcileAsync(stoppingToken);
+        // T07/T10: Trigger initial backfill through the accumulator seam.
+        await this.usageAccumulator.RequestBackfillAsync(stoppingToken);
 
         // TODO: T20 - Heartbeat and sync
 
+        var healthLogTicks = 0;
         while (!stoppingToken.IsCancellationRequested)
         {
-            // T10: Periodically log health status
-            var status = this.recoveryManager.GetRecoveryStatus();
-            System.Diagnostics.Debug.WriteLine(
-                $"[ControlParentalService] Health: {status.HealthLevel}, " +
-                $"AgentDeaths: {status.AgentDeaths}, " +
-                $"FailedRecoveries: {status.FailedRecoveries}");
+            this.safetyLoop?.Tick();
+            if (++healthLogTicks >= 60)
+            {
+                healthLogTicks = 0;
+                var status = this.recoveryManager.GetRecoveryStatus();
+                System.Diagnostics.Debug.WriteLine($"[ControlParentalService] Health: {status.HealthLevel}");
+            }
 
-            await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
         }
     }
 
-    private async void OnForegroundChanged(ForegroundChanged message)
+    private async Task StartIntegrityRuntimeAsync(CancellationToken stoppingToken)
+    {
+        if (this.integrityRuntimeFactory is null)
+        {
+            return;
+        }
+
+        var monitor = this.integrityRuntimeFactory.Create();
+        if (monitor is null)
+        {
+            return;
+        }
+
+        this.antiTamperMonitor = monitor;
+        this.ownsAntiTamperMonitor = true;
+        await monitor.StartAsync(stoppingToken);
+        System.Diagnostics.Debug.WriteLine("[ControlParentalService] Anti-tamper monitor started.");
+    }
+
+    private void OnForegroundChanged(ForegroundChanged message)
     {
         // T06: Update usage counter with foreground change
         this.usageAccumulator.OnForegroundChanged(message.AppId);
 
-        // T10: Record heartbeat from agent
-        this.healthMonitor?.RecordAgentHeartbeat();
-
         // T12: Record foreground change for enforcement level monitoring
         this.enforcementLevelMonitor?.RecordForegroundChange();
 
-        // T11: Evaluate the policy and decide whether to block
-        System.Diagnostics.Debug.WriteLine(
-            $"[ControlParentalService] Foreground changed: {message.AppId}");
-
-        // Use the enforcement engine to evaluate and apply policy
-        if (this.enforcementEngine != null)
-        {
-            var result = await this.enforcementEngine.EnforceForegroundChangeAsync(
-                message.AppId,
-                CancellationToken.None);
-
-            if (result.Blocked)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ControlParentalService] BLOCKED {message.AppId}: {result.ReasonText}");
-            }
-            else
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ControlParentalService] ALLOWED {message.AppId}");
-            }
-        }
+        this.safetyLoop?.Observe(message);
     }
 
     private void OnHeartbeat(AgentHeartbeat message)
@@ -970,8 +1519,11 @@ public sealed class ControlParentalService : BackgroundService
             $"[ControlParentalService] Agent heartbeat: {message.AgentId}, " +
             $"uptime={message.UpTimeMs}ms, overlay={message.IsOverlayVisible}");
 
-        // T12: Record agent heartbeat for enforcement level monitoring
-        this.enforcementLevelMonitor?.RecordAgentHeartbeat();
+        if (this.safetyLoop?.AcceptHeartbeat(message) == true)
+        {
+            this.healthMonitor.RecordAgentHeartbeat();
+            this.enforcementLevelMonitor?.RecordAgentHeartbeat();
+        }
     }
 
     private void OnStateSnapshot(StateSnapshot message)
@@ -982,25 +1534,290 @@ public sealed class ControlParentalService : BackgroundService
             $"overlay={message.IsOverlayVisible}");
     }
 
-    public override async Task StopAsync(CancellationToken cancellationToken)
+    private void QueueAgentBinding(IIpcChannel? channel, CancellationToken cancellationToken)
     {
-        // T10: Stop health monitoring
-        await this.healthMonitor.StopAsync();
-
-        // T12: Stop enforcement level monitoring
-        await this.enforcementLevelMonitor?.StopAsync()!;
-
-        // T13: Stop anti-tamper monitoring
-        await this.antiTamperMonitor?.StopAsync()!;
-
-        this.usageAccumulator.Stop();
-        this.usageReconciler.Stop();
-        if (this.sessionManager != null)
+        lock (this.lifecycleLock)
         {
-            await this.sessionManager.StopAsync();
-            this.sessionManager.Dispose();
+            if (this.bindingAdmissionClosed || this.disposed)
+            {
+                return;
+            }
+
+            this.bindingTask = this.BindSessionAgentChannelAsync(channel, cancellationToken);
+        }
+    }
+
+    private async Task BindSessionAgentChannelAsync(IIpcChannel? channel, CancellationToken cancellationToken)
+    {
+        await this.bindingGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (ReferenceEquals(this.boundAgentChannel, channel))
+            {
+                return;
+            }
+
+            this.boundAgentChannel = channel;
+
+            if (channel is null)
+            {
+                if (this.safetyLoop != null)
+                {
+                    await this.safetyLoop.AgentDiedAsync(cancellationToken);
+                }
+
+                return;
+            }
+
+            var sessionId = this.sessionManager?.ActiveSessionId;
+            if (sessionId is null || this.enforcementEngine is null ||
+                this.healthMonitor is not IAuthoritativeHealthSink healthSink)
+            {
+                return;
+            }
+
+            if (this.safetyLoop is null)
+            {
+                var intentPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "ControlParental", $"overlay-intent-{sessionId}.json");
+                this.safetyLoop = new SessionSafetyLoop(
+                    sessionId.Value,
+                    this.enforcementEngine.EnforceForegroundChangeAsync,
+                    this.processTerminator.TerminateAsync,
+                    new FileOverlayIntentStore(intentPath),
+                    healthSink);
+                if (this.pendingTimeChange is { } pendingReason)
+                {
+                    this.pendingTimeChange = null;
+                    await this.safetyLoop.TimeChangedAsync(pendingReason, cancellationToken);
+                }
+                if (this.childIsAdmin)
+                {
+                    await this.safetyLoop.ChildAdminChangedAsync(true, cancellationToken);
+                }
+            }
+
+            var generation = Interlocked.Increment(ref this.agentGeneration);
+            await channel.SendAsync(new AgentAuthority(sessionId.Value, generation), cancellationToken);
+            await this.safetyLoop.AttachAgentAsync(
+                generation,
+                (command, token) => new ValueTask(
+                    channel.SendAsync(new AgentCommandRequest(command), token)),
+                cancellationToken);
+
+            if (this.usageAccumulator is UsageAccumulator accumulator)
+            {
+                accumulator.SetIpcChannel(channel);
+            }
+
+            if (this.usageReconciler is UsageReconciler reconciler)
+            {
+                reconciler.SetIpcChannel(channel);
+            }
+
+            if (this.workstationLockManager is WorkstationLockManager lockManager)
+            {
+                lockManager.SetCommandExecutor(
+                    sessionId.Value,
+                    generation,
+                    (command, token) => new ValueTask<AgentActionResult>(
+                        this.safetyLoop.ExecuteAgentCommandAsync(command, token)));
+            }
+
+            await this.usageAccumulator.RequestBackfillAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[ControlParentalService] Failed to bind agent channel: {ex.Message}");
+        }
+        finally
+        {
+            this.bindingGate.Release();
+        }
+    }
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        lock (this.lifecycleLock)
+        {
+            this.bindingAdmissionClosed = true;
+            return this.stopTask ??= this.StopAndBaseAsync(cancellationToken);
+        }
+    }
+
+    private async Task StopAndBaseAsync(CancellationToken cancellationToken)
+    {
+        var failures = new List<Exception>();
+        try
+        {
+            await this.StopCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
         }
 
-        await base.StopAsync(cancellationToken);
+        try
+        {
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
+        }
+
+        ThrowCleanupFailures(failures);
+    }
+
+    private async Task StopCoreAsync(CancellationToken cancellationToken)
+    {
+        this.timeProvider.TimeChanged -= this.OnTimeChanged;
+        var failures = new List<Exception>();
+
+        await AttemptCleanupAsync(failures, () => this.healthMonitor.StopAsync());
+        await AttemptCleanupAsync(failures, () => this.enforcementLevelMonitor?.StopAsync() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, () => this.antiTamperMonitor?.StopAsync() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, async () =>
+        {
+            if (this.usageAccumulator is UsageAccumulator accumulator)
+            {
+                await accumulator.StopAsync(cancellationToken);
+            }
+            else
+            {
+                this.usageAccumulator.Stop();
+            }
+        });
+        await AttemptCleanupAsync(failures, () =>
+        {
+            this.usageReconciler.Stop();
+            return Task.CompletedTask;
+        });
+        await AttemptCleanupAsync(failures, () => this.bindingTask);
+        await AttemptCleanupAsync(failures, () => this.recoveryTask);
+        await AttemptCleanupAsync(failures, () => this.timeChangeTask);
+
+        if (this.sessionManager is { } session)
+        {
+            await AttemptCleanupAsync(failures, session.StopAsync);
+            await AttemptCleanupAsync(failures, () =>
+            {
+                session.Dispose();
+                return Task.CompletedTask;
+            });
+        }
+
+        await AttemptCleanupAsync(failures, () => this.safetyLoop?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+        await AttemptCleanupAsync(failures, () =>
+        {
+            this.bindingGate.Dispose();
+            return Task.CompletedTask;
+        });
+        ThrowCleanupFailures(failures);
+    }
+
+    private static async Task AttemptCleanupAsync(List<Exception> failures, Func<Task> cleanup)
+    {
+        try
+        {
+            await cleanup().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            AddCleanupFailures(failures, exception);
+        }
+    }
+
+    private static void AddCleanupFailures(List<Exception> failures, Exception exception)
+    {
+        if (exception is AggregateException aggregate)
+        {
+            failures.AddRange(aggregate.Flatten().InnerExceptions);
+        }
+        else
+        {
+            failures.Add(exception);
+        }
+    }
+
+    private static void ThrowCleanupFailures(IReadOnlyCollection<Exception> failures)
+    {
+        if (failures.Count == 0)
+        {
+            return;
+        }
+
+        if (failures.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures.Single()).Throw();
+            return;
+        }
+
+        throw new AggregateException("Service cleanup failed.", failures);
+    }
+
+    public override void Dispose()
+    {
+        IAntiTamperMonitor? monitor = null;
+        lock (this.lifecycleLock)
+        {
+            if (this.disposed)
+            {
+                return;
+            }
+
+            this.disposed = true;
+            this.bindingAdmissionClosed = true;
+            if (this.ownsAntiTamperMonitor)
+            {
+                monitor = this.antiTamperMonitor;
+                this.antiTamperMonitor = null;
+            }
+        }
+
+        monitor?.Dispose();
+        base.Dispose();
+    }
+
+    private void OnTimeChanged(object? sender, TimeChangedEventArgs args)
+    {
+        if (this.safetyLoop is { } loop)
+        {
+            this.timeChangeTask = loop.TimeChangedAsync(args.Reason);
+        }
+        else
+        {
+            this.pendingTimeChange = args.Reason;
+        }
+    }
+
+    private async Task RequestAgentRecoveryAsync()
+    {
+        var succeeded = await this.recoveryManager.RequestAgentRecoveryAsync("Agent died unexpectedly");
+        System.Diagnostics.Debug.WriteLine(
+            $"[ControlParentalService] Agent recovery requested. Success: {succeeded}");
+    }
+
+    private async Task ReportProtectedProcessStatusAsync(CancellationToken cancellationToken)
+    {
+        if (this.protectedProcessReporter is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var status = await this.protectedProcessReporter.GetStatusDescriptionAsync(cancellationToken);
+            System.Diagnostics.Debug.WriteLine($"[ControlParentalService] PPL status: {status}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[ControlParentalService] Failed to report PPL status: {ex.Message}");
+        }
     }
 }

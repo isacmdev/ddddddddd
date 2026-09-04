@@ -166,6 +166,21 @@ public sealed class OnboardingStateServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Hardening_AdvanceAsync_WhenSecurityIsDegraded_BlocksHealthyOnboarding()
+    {
+        var degraded = new OnboardingStateService(
+            this.tempDir + "-degraded",
+            new Mock<IChildAccountStore>().Object,
+            new Mock<Microsoft.Extensions.Logging.ILogger<OnboardingStateService>>().Object,
+            canProceedWithHealthyOnboarding: () => false);
+
+        var state = await degraded.AdvanceAsync(3);
+
+        Assert.Equal(0, state.CurrentStepIndex);
+        Assert.Equal(OnboardingStepStatus.Pending, state.Steps[0].Status);
+    }
+
+    [Fact]
     public async Task AdvanceAsync_CalledTwice_AdvancesTwice()
     {
         // T26 PR #11 — sanity test that the in-process AdvanceAsync still works

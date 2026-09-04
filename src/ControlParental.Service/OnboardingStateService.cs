@@ -20,6 +20,7 @@ public sealed class OnboardingStateService : IOnboardingStateService
     private readonly string stateFilePath;
     private readonly IChildAccountStore childAccountStore;
     private readonly ILogger<OnboardingStateService> logger;
+    private readonly Func<bool> canProceedWithHealthyOnboarding;
     private readonly SemaphoreSlim fileLock = new(1, 1);
 
     /// <summary>
@@ -31,10 +32,12 @@ public sealed class OnboardingStateService : IOnboardingStateService
     public OnboardingStateService(
         string dataFolderPath,
         IChildAccountStore childAccountStore,
-        ILogger<OnboardingStateService> logger)
+        ILogger<OnboardingStateService> logger,
+        Func<bool>? canProceedWithHealthyOnboarding = null)
     {
         this.childAccountStore = childAccountStore;
         this.logger = logger;
+        this.canProceedWithHealthyOnboarding = canProceedWithHealthyOnboarding ?? (() => true);
         Directory.CreateDirectory(dataFolderPath);
         this.stateFilePath = Path.Combine(dataFolderPath, "onboarding_state.json");
     }
@@ -137,6 +140,12 @@ public sealed class OnboardingStateService : IOnboardingStateService
     public async Task<OnboardingState> AdvanceAsync(int newIndex, CancellationToken ct = default)
     {
         var state = await this.GetStateAsync(ct).ConfigureAwait(false);
+
+        if (newIndex >= 3 && !this.canProceedWithHealthyOnboarding())
+        {
+            this.logger.LogWarning("Healthy onboarding is blocked by the runtime security verdict.");
+            return state;
+        }
 
         if (newIndex >= state.Steps.Count)
         {

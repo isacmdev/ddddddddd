@@ -69,6 +69,42 @@ public interface IEnforcementLevelMonitor
     /// <param name="description">Descripción del issue.</param>
     void AddIssue(EnforcementIssueType type, EnforcementIssueSeverity severity, string description);
 
+    void AddIssue(IssueKey key, EnforcementIssueSeverity severity, string description) =>
+        this.AddIssue(key.Type, severity, description);
+
+    void ResolveIssue(IssueKey key)
+    {
+    }
+
+    Task AddIssueAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string description,
+        CancellationToken cancellationToken = default)
+    {
+        this.AddIssue(key, severity, description);
+        return Task.CompletedTask;
+    }
+
+    Task AddIssueAsync(
+        IssueKey key,
+        EnforcementIssueSeverity severity,
+        string description,
+        string? idempotencyKey,
+        CancellationToken cancellationToken = default)
+    {
+        throw new NotSupportedException("Keyed issue admission is not supported.");
+    }
+
+    Task ResolveIssueAsync(
+        IssueKey key,
+        string recoveryEvidence,
+        CancellationToken cancellationToken = default)
+    {
+        this.ResolveIssue(key);
+        return Task.CompletedTask;
+    }
+
     /// <summary>
     /// Evento cuando el nivel de enforcement cambia.
     /// </summary>
@@ -85,6 +121,7 @@ public interface IEnforcementLevelMonitor
 /// </summary>
 public sealed class EnforcementIssue
 {
+    public IssueKey? Key { get; init; }
     /// <summary>
     /// Tipo de issue.
     /// </summary>
@@ -155,7 +192,19 @@ public enum EnforcementIssueType
     /// Fallo de integridad binaria — firma inválida o hash no coincide.
     /// </summary>
     BinaryIntegrityFailure,
+
+    /// <summary>
+    /// La evaluación de enforcement falló inesperadamente.
+    /// </summary>
+    EvaluationFailure,
+
+    /// <summary>
+    /// Durable enforcement state could not be restored.
+    /// </summary>
+    RestoreFailure,
 }
+
+public sealed record IssueKey(int SessionId, EnforcementIssueType Type, string Cause, string? IdentityScope = null);
 
 /// <summary>
 /// Severidad de issues.

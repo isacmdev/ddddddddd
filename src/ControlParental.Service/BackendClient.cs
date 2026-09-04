@@ -6,9 +6,23 @@ namespace ControlParental.Service;
 
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
+using ControlParental.Domain.WireContracts.Models;
+
+public sealed record BackendReliabilityOptions(TimeSpan RequestTimeout, int MaximumAttempts,
+    Func<int, TimeSpan?, TimeSpan> DelayFactory, Func<TimeSpan, CancellationToken, Task> DelayAsync)
+{
+    public static BackendReliabilityOptions Default { get; } = new(
+        TimeSpan.FromSeconds(10),
+        2,
+        static (attempt, retryAfter) => retryAfter ?? TimeSpan.FromMilliseconds(100 * (1 << attempt) + Random.Shared.Next(0, 51)),
+        static (delay, cancellationToken) => Task.Delay(delay, cancellationToken));
+}
 
 /// <summary>
 /// T14 — Implementación del cliente del backend de Supabase.
@@ -18,7 +32,9 @@ public sealed class BackendClient : IBackendClient
     private readonly HttpClient httpClient;
     private readonly JsonSerializerOptions jsonOptions;
     private readonly string baseUrl;
-    private readonly IDeviceAuthenticator deviceAuthenticator;
+    private readonly IDeviceAuthenticator? deviceAuthenticator;
+    private readonly IBackendIdentityCoordinator? identityCoordinator;
+    private readonly BackendReliabilityOptions reliability;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BackendClient"/> class.
@@ -26,7 +42,8 @@ public sealed class BackendClient : IBackendClient
     /// <param name="httpClient">HTTP client for making requests.</param>
     /// <param name="baseUrl">Supabase base URL.</param>
     /// <param name="deviceAuthenticator">Authenticator for session token (T17).</param>
-    public BackendClient(
+    [Obsolete("Test compatibility only. Production composition requires IBackendIdentityCoordinator.")]
+    internal BackendClient(
         HttpClient httpClient,
         string baseUrl,
         IDeviceAuthenticator deviceAuthenticator)
@@ -34,12 +51,34 @@ public sealed class BackendClient : IBackendClient
         this.httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         this.baseUrl = baseUrl ?? throw new ArgumentNullException(nameof(baseUrl));
         this.deviceAuthenticator = deviceAuthenticator ?? throw new ArgumentNullException(nameof(deviceAuthenticator));
-        this.jsonOptions = new JsonSerializerOptions
+        this.reliability = BackendReliabilityOptions.Default;
+        this.jsonOptions = CreateJsonOptions();
+    }
+
+    public BackendClient(
+        HttpClient httpClient,
+        string baseUrl,
+        IBackendIdentityCoordinator identityCoordinator,
+        BackendReliabilityOptions? reliability = null)
+    {
+        this.httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        this.baseUrl = baseUrl ?? throw new ArgumentNullException(nameof(baseUrl));
+        this.identityCoordinator = identityCoordinator ?? throw new ArgumentNullException(nameof(identityCoordinator));
+        this.reliability = reliability ?? BackendReliabilityOptions.Default;
+        if (this.reliability.MaximumAttempts is < 1 or > 3 || this.reliability.RequestTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(reliability));
+        }
+
+        this.jsonOptions = CreateJsonOptions();
+    }
+
+    private static JsonSerializerOptions CreateJsonOptions()
+        => new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false,
         };
-    }
 
     /// <summary>
     /// Creates a request message with the current auth token from DeviceAuthenticator.
@@ -47,12 +86,142 @@ public sealed class BackendClient : IBackendClient
     private HttpRequestMessage CreateAuthenticatedRequest(HttpMethod method, string url)
     {
         var request = new HttpRequestMessage(method, url);
-        var token = this.deviceAuthenticator.CurrentAccessToken;
+        var token = this.deviceAuthenticator?.CurrentAccessToken;
         if (!string.IsNullOrEmpty(token))
         {
             request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
         }
 
+        return request;
+    }
+
+    private async Task<HttpResponseMessage?> SendAuthenticatedAsync(
+        Func<HttpRequestMessage> requestFactory,
+        bool retryable,
+        CancellationToken cancellationToken,
+        bool classifyTimeout = false)
+    {
+        if (this.identityCoordinator is null)
+        {
+            using var request = requestFactory();
+            var legacyToken = this.deviceAuthenticator?.CurrentAccessToken;
+            if (!string.IsNullOrWhiteSpace(legacyToken))
+            {
+                request.Headers.Authorization = new("Bearer", legacyToken);
+            }
+
+            return await this.httpClient.SendAsync(request, cancellationToken);
+        }
+
+        var idempotencyKey = retryable ? Guid.NewGuid().ToString("N") : null;
+        for (var attempt = 0; attempt < this.reliability.MaximumAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(this.reliability.RequestTimeout);
+            var authorization = await this.identityCoordinator.GetDefinitiveSessionAsync(
+                classifyTimeout ? timeout.Token : cancellationToken);
+
+            if (!authorization.IsSuccess)
+            {
+                if (classifyTimeout && authorization.Error == BackendIdentityErrorV1.Timeout)
+                {
+                    throw new TaskCanceledException("Backend request timed out", null, timeout.Token);
+                }
+
+                return null;
+            }
+
+            using var request = requestFactory();
+            request.Headers.Authorization = new("Bearer", authorization.Session!.AccessToken);
+            if (idempotencyKey is not null)
+            {
+                request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            }
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await this.httpClient.SendAsync(request, timeout.Token);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException) when (classifyTimeout)
+            {
+                throw new TaskCanceledException("Backend request timed out", null, timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+            catch (HttpRequestException)
+            {
+                if (retryable && attempt + 1 < this.reliability.MaximumAttempts)
+                {
+                    await this.DelayForRetryAsync(attempt, null, cancellationToken);
+                    continue;
+                }
+
+                return null;
+            }
+
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                await this.identityCoordinator.InvalidateAsync(
+                    authorization.Session.Generation,
+                    response.StatusCode == HttpStatusCode.Unauthorized
+                        ? BackendIdentityErrorV1.Revoked
+                        : BackendIdentityErrorV1.Forbidden,
+                    cancellationToken);
+                return response;
+            }
+
+            if (retryable && IsTransient(response.StatusCode) && attempt + 1 < this.reliability.MaximumAttempts)
+            {
+                var retryAfter = response.Headers.RetryAfter?.Delta;
+                response.Dispose();
+                await this.DelayForRetryAsync(attempt, retryAfter, cancellationToken);
+                continue;
+            }
+
+            try
+            {
+                await response.Content.LoadIntoBufferAsync(64 * 1024, cancellationToken);
+                return response;
+            }
+            catch (HttpRequestException)
+            {
+                response.Dispose();
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private Task DelayForRetryAsync(int attempt, TimeSpan? retryAfter, CancellationToken cancellationToken)
+    {
+        var delay = this.reliability.DelayFactory(attempt, retryAfter);
+        if (delay < TimeSpan.Zero || delay > TimeSpan.FromSeconds(30))
+        {
+            delay = TimeSpan.FromSeconds(30);
+        }
+
+        return this.reliability.DelayAsync(delay, cancellationToken);
+    }
+
+    private static bool IsTransient(HttpStatusCode status)
+        => status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)status >= 500;
+
+    private static HttpRequestMessage CreateUpsertRequest<T>(string url, T payload)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = JsonContent.Create(payload),
+        };
+        request.Headers.Add("Prefer", "resolution=merge-duplicates");
         return request;
     }
 
@@ -62,19 +231,32 @@ public sealed class BackendClient : IBackendClient
         int currentVersion,
         CancellationToken cancellationToken = default)
     {
+        if (this.identityCoordinator is not null)
+        {
+            var identity = this.identityCoordinator.CurrentState;
+            if (identity?.CanAuthorizeRemoteAccess == true
+                && (string.IsNullOrWhiteSpace(identity.DeviceId)
+                    || !string.Equals(deviceId, identity.DeviceId, StringComparison.Ordinal)))
+            {
+                return PolicyFetchResult.Failed("Remote access denied");
+            }
+        }
+
         try
         {
             var url = $"{this.baseUrl}/rest/v1/rpc/get_device_policy";
-            var content = JsonContent.Create(new { p_device_id = deviceId });
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
+            using var response = await this.SendAuthenticatedAsync(
+                () => new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = JsonContent.Create(new PolicyFetchRequestPayload(deviceId)),
+                },
+                retryable: true,
+                cancellationToken,
+                classifyTimeout: true);
 
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return PolicyFetchResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return PolicyFetchResult.Failed(response is null ? "Remote access denied" : $"HTTP {response.StatusCode}");
             }
 
             var result = await response.Content.ReadFromJsonAsync<PolicyFetchResponse>(
@@ -88,18 +270,30 @@ public sealed class BackendClient : IBackendClient
 
             return PolicyFetchResult.Succeeded(result.Version, result.PolicyJson ?? string.Empty);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return PolicyFetchResult.Failed($"Network error: {ex.Message}");
+            return PolicyFetchResult.Failed("Network error");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (TaskCanceledException ex) when (ex.CancellationToken != cancellationToken)
         {
             return PolicyFetchResult.Failed("Request timeout");
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            return PolicyFetchResult.Failed($"Unexpected error: {ex.Message}");
+            return PolicyFetchResult.Failed("Unexpected error");
         }
+    }
+
+    private static Guid GuidFromHashMaterial(string material)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(material))[..16];
+        bytes[7] = (byte)((bytes[7] & 0x0f) | 0x40);
+        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
+        return new Guid(bytes);
     }
 
     /// <inheritdoc />
@@ -116,38 +310,43 @@ public sealed class BackendClient : IBackendClient
         try
         {
             var url = $"{this.baseUrl}/rest/v1/usage_logs";
-            var payload = logsList.Select(l => new
+            var payload = logsList.Select(l => new UsageLogPostPayload(
+                l.AppId,
+                l.Minutes,
+                l.ServerDate.ToString("yyyy-MM-dd"),
+                l.DedupKey));
+
+            using var response = await this.SendAuthenticatedAsync(
+                () =>
+                {
+                    var request = new HttpRequestMessage(HttpMethod.Post, url)
+                    {
+                        Content = JsonContent.Create(payload),
+                    };
+                    request.Headers.Add("Prefer", "resolution=merge-duplicates");
+                    return request;
+                },
+                retryable: true,
+                cancellationToken);
+
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                app_id = l.AppId,
-                minutes = l.Minutes,
-                server_date = l.ServerDate.ToString("yyyy-MM-dd"),
-                dedup_key = l.DedupKey,
-            });
-
-            var content = JsonContent.Create(payload);
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
-
-            // Add idempotency headers
-            request.Headers.Add("Prefer", "resolution=merge-duplicates");
-
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return DataPushResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return DataPushResult.Failed(response is null ? "Remote access denied" : $"HTTP {response.StatusCode}");
             }
 
             return DataPushResult.Succeeded(logsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            throw;
+        }
+        catch (Exception)
+        {
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -165,38 +364,36 @@ public sealed class BackendClient : IBackendClient
         try
         {
             var url = $"{this.baseUrl}/rest/v1/device_alerts";
-            var payload = alertsList.Select(a => new
+            var payload = alertsList.Select(a => new DeviceAlertPostPayload(
+                a.EventType,
+                a.Description,
+                a.Severity,
+                a.DetectedAt.ToString("O"),
+                a.DedupKey));
+
+            using var response = await this.SendAuthenticatedAsync(
+                () => CreateUpsertRequest(url, payload),
+                retryable: true,
+                cancellationToken);
+
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                event_type = a.EventType,
-                description = a.Description,
-                severity = a.Severity,
-                detected_at = a.DetectedAt.ToString("O"),
-                dedup_key = a.DedupKey,
-            });
-
-            var content = JsonContent.Create(payload);
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
-
-            request.Headers.Add("Prefer", "resolution=merge-duplicates");
-
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return DataPushResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return DataPushResult.Failed(response is null ? "Remote access denied" : $"HTTP {response.StatusCode}");
             }
 
             return DataPushResult.Succeeded(alertsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            throw;
+        }
+        catch (Exception)
+        {
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -214,38 +411,36 @@ public sealed class BackendClient : IBackendClient
         try
         {
             var url = $"{this.baseUrl}/rest/v1/behavioral_events";
-            var payload = eventsList.Select(e => new
+            var payload = eventsList.Select(e => new BehavioralEventPostPayload(
+                e.EventType,
+                e.AppId,
+                e.Timestamp.ToString("O"),
+                e.Metadata,
+                e.DedupKey));
+
+            using var response = await this.SendAuthenticatedAsync(
+                () => CreateUpsertRequest(url, payload),
+                retryable: true,
+                cancellationToken);
+
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                event_type = e.EventType,
-                app_id = e.AppId,
-                timestamp = e.Timestamp.ToString("O"),
-                metadata = e.Metadata,
-                dedup_key = e.DedupKey,
-            });
-
-            var content = JsonContent.Create(payload);
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
-
-            request.Headers.Add("Prefer", "resolution=merge-duplicates");
-
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return DataPushResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return DataPushResult.Failed(response is null ? "Remote access denied" : $"HTTP {response.StatusCode}");
             }
 
             return DataPushResult.Succeeded(eventsList.Count);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return DataPushResult.Failed($"Network error: {ex.Message}");
+            return DataPushResult.Failed("Network error");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return DataPushResult.Failed($"Unexpected error: {ex.Message}");
+            throw;
+        }
+        catch (Exception)
+        {
+            return DataPushResult.Failed("Unexpected error");
         }
     }
 
@@ -257,24 +452,20 @@ public sealed class BackendClient : IBackendClient
         try
         {
             var url = $"{this.baseUrl}/rest/v1/rpc/heartbeat";
-            var payload = new
+            var payload = new HeartbeatPostPayload(
+                heartbeat.Enforcement.ToString(),
+                heartbeat.BatteryPct ?? 0,
+                heartbeat.ClockOffsetMs,
+                heartbeat.AgentUptimeMs);
+
+            using var response = await this.SendAuthenticatedAsync(
+                () => new HttpRequestMessage(HttpMethod.Post, url) { Content = JsonContent.Create(payload) },
+                retryable: true,
+                cancellationToken);
+
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                enforcement = heartbeat.Enforcement.ToString(),
-                battery_pct = heartbeat.BatteryPct,
-                clock_offset_ms = heartbeat.ClockOffsetMs,
-                agent_uptime_ms = heartbeat.AgentUptimeMs,
-            };
-
-            var content = JsonContent.Create(payload);
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
-
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return HeartbeatResult.Failed($"HTTP {response.StatusCode}: {error}");
+                return HeartbeatResult.Failed(response is null ? "Remote access denied" : $"HTTP {response.StatusCode}");
             }
 
             var result = await response.Content.ReadFromJsonAsync<HeartbeatResponse>(
@@ -285,13 +476,17 @@ public sealed class BackendClient : IBackendClient
                 result?.ServerTimeOffsetMs,
                 result?.NewPolicyAvailable ?? false);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return HeartbeatResult.Failed($"Network error: {ex.Message}");
+            return HeartbeatResult.Failed("Network error");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return HeartbeatResult.Failed($"Unexpected error: {ex.Message}");
+            throw;
+        }
+        catch (Exception)
+        {
+            return HeartbeatResult.Failed("Unexpected error");
         }
     }
 
@@ -305,36 +500,38 @@ public sealed class BackendClient : IBackendClient
         try
         {
             var url = $"{this.baseUrl}/rest/v1/device_push_tokens";
-            var payload = new
+            var payload = new PushTokenPostPayload(channel, pushToken, expiresAt?.ToString("O"));
+
+            using var response = await this.SendAuthenticatedAsync(
+                () => CreateUpsertRequest(url, payload),
+                retryable: true,
+                cancellationToken);
+
+            if (response is null || !response.IsSuccessStatusCode)
             {
-                channel = channel,
-                push_handle = pushToken,
-                expires_at = expiresAt?.ToString("O"),
-            };
-
-            var content = JsonContent.Create(payload);
-            var request = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = content;
-
-            request.Headers.Add("Prefer", "resolution=merge-duplicates");
-
-            var response = await this.httpClient.SendAsync(request, cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                return PushTokenRegistrationResult.Failed($"HTTP {response.StatusCode}: {error}");
+                var kind = response?.StatusCode switch
+                {
+                    HttpStatusCode.Unauthorized => PushTokenRegistrationFailureKind.Revoked,
+                    HttpStatusCode.Forbidden => PushTokenRegistrationFailureKind.Forbidden,
+                    HttpStatusCode.TooManyRequests => PushTokenRegistrationFailureKind.RateLimited,
+                    _ => PushTokenRegistrationFailureKind.RemoteUnavailable,
+                };
+                return PushTokenRegistrationResult.Failed("WnsRegistrationFailed", kind);
             }
 
             return PushTokenRegistrationResult.Succeeded(expiresAt);
         }
-        catch (HttpRequestException ex)
+        catch (HttpRequestException)
         {
-            return PushTokenRegistrationResult.Failed($"Network error: {ex.Message}");
+            return PushTokenRegistrationResult.Failed("WnsRegistrationFailed");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return PushTokenRegistrationResult.Failed($"Unexpected error: {ex.Message}");
+            throw;
+        }
+        catch (Exception)
+        {
+            return PushTokenRegistrationResult.Failed("WnsRegistrationFailed");
         }
     }
 
@@ -343,24 +540,79 @@ public sealed class BackendClient : IBackendClient
         TimeRequestEntry request,
         CancellationToken cancellationToken = default)
     {
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || request.Minutes is < 1 or > 180
+            || request.CreatedAt.Offset != TimeSpan.Zero
+            || string.IsNullOrWhiteSpace(request.Scope)
+            || request.Origin is not ("status_page" or "overlay")
+            || request.PolicyVersion is null
+            || request.DeviceId is null
+            || request.DeviceId == Guid.Empty)
+        {
+            return false;
+        }
+
         try
         {
             var url = $"{this.baseUrl}/rest/v1/time_requests";
-            var payload = new
+            var identity = this.identityCoordinator?.CurrentState;
+            var deviceId = Guid.Empty;
+            var hasDeviceIdentity = identity?.CanAuthorizeRemoteAccess == true
+                && Guid.TryParse(identity.DeviceId, out deviceId)
+                && deviceId != Guid.Empty;
+            if (this.identityCoordinator is not null && !hasDeviceIdentity)
             {
-                request_id = request.RequestId,
-                minutes = request.Minutes,
-                reason = request.Reason,
-                created_at = request.CreatedAt.ToString("O"),
-            };
+                return false;
+            }
 
-            var content = JsonContent.Create(payload);
-            var requestMsg = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            requestMsg.Content = content;
+            var requestId = Guid.Empty;
+            if (hasDeviceIdentity
+                && !Guid.TryParse(request.RequestId, out requestId))
+            {
+                return false;
+            }
 
-            var response = await this.httpClient.SendAsync(requestMsg, cancellationToken);
+            if (hasDeviceIdentity && request.DeviceId != deviceId)
+            {
+                return false;
+            }
 
-            return response.IsSuccessStatusCode;
+            if (hasDeviceIdentity)
+            {
+                var wireRequest = new CreateTimeRequestWire(
+                    requestId,
+                    request.Scope!,
+                    request.Minutes,
+                    request.Origin!,
+                    request.PolicyVersion.Value,
+                    request.DeviceId.Value,
+                    request.CreatedAt,
+                    request.Reason);
+                var wireBytes = WireContractCodec.EncodeValidatedEnvelope(
+                    wireRequest, requestId, WireContractCatalog.CreateTimeRequest, DateTimeOffset.UtcNow);
+                using var wireResponse = await this.SendAuthenticatedAsync(
+                    () =>
+                    {
+                        var message = new HttpRequestMessage(HttpMethod.Post, url)
+                        {
+                            Content = new ByteArrayContent(wireBytes),
+                        };
+                        message.Content.Headers.ContentType = new("application/json");
+                        return message;
+                    },
+                    retryable: true,
+                    cancellationToken);
+                return wireResponse?.IsSuccessStatusCode == true;
+            }
+
+            // A legacy DTO has no authenticated identity and must be rejected
+            // before any I/O rather than being adapted into an ambiguous payload.
+            return false;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception)
         {
@@ -373,45 +625,106 @@ public sealed class BackendClient : IBackendClient
         IntegrityReport report,
         CancellationToken cancellationToken = default)
     {
+        if (report is null
+            || string.IsNullOrWhiteSpace(report.ReportHash)
+            || string.IsNullOrWhiteSpace(report.BinaryHash)
+            || report.Timestamp.Offset != TimeSpan.Zero
+            || report.BinaryHash.Length != 64
+            || report.BinaryHash.Any(c => c is < '0' or > '9' and < 'a' or > 'f')
+            || string.IsNullOrEmpty(report.AgentVersion)
+            || report.AgentVersion.Length > 128
+            || report.AgentVersion.Any(c => c > 0x7f)
+            || string.IsNullOrEmpty(report.Platform)
+            || report.Platform.Length > 256
+            || report.Platform.Any(c => c > 0x7f))
+        {
+            return new IntegrityReportResult(Success: false, Verdict: null, IsInvalidEnvelope: true);
+        }
+
         try
         {
             var url = $"{this.baseUrl}/rest/v1/integrity_reports";
-            var payload = new
+            var evidenceId = GuidFromHashMaterial(report.ReportHash);
+            var generation = this.identityCoordinator?.CurrentState?.Generation ?? 0;
+            var evidence = new IntegrityEvidenceWire
             {
-                report_hash = report.ReportHash,
-                timestamp = report.Timestamp.ToString("O"),
-                agent_version = report.AgentVersion,
-                platform = report.Platform,
+                EvidenceId = evidenceId,
+                DeviceGeneration = GuidFromHashMaterial($"generation:{generation}"),
+                AgentVersion = report.AgentVersion,
+                BinarySha256 = report.BinaryHash,
+                SignatureResult = report.SignatureValid ? "valid" : "invalid",
+                SignerSummary = report.Platform,
+                CollectedAt = report.Timestamp.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                EvidenceSchemaVersion = 1,
             };
+            var bytes = WireContractCodec.EncodeEnvelope(evidence, evidenceId, WireContractCatalog.IntegrityEvidence);
+            var validation = WireContractCodec.DecodeAndValidate(
+                bytes,
+                WireContractCatalog.IntegrityEvidence,
+                DateTimeOffset.UtcNow);
+            if (!validation.IsValid)
+            {
+                return new IntegrityReportResult(Success: false, Verdict: null, IsInvalidEnvelope: true);
+            }
 
-            var content = JsonContent.Create(payload);
-            var requestMsg = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
-            requestMsg.Content = content;
+            HttpRequestMessage CreateIntegrityRequest()
+            {
+                var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = new ByteArrayContent(bytes) };
+                request.Content.Headers.ContentType = new("application/json");
+                return request;
+            }
 
-            var response = await this.httpClient.SendAsync(requestMsg, cancellationToken);
+            using var response = await this.SendAuthenticatedAsync(
+                CreateIntegrityRequest,
+                retryable: true,
+                cancellationToken);
 
-            if (!response.IsSuccessStatusCode)
+            if (response is null || !response.IsSuccessStatusCode)
             {
                 return new IntegrityReportResult(Success: false, Verdict: null);
             }
 
-            // Extract verdict from response body
-            string? verdict = null;
+            // A verdict is actionable only when the complete frozen envelope is
+            // valid and binds to the evidence submitted by this request. Bare
+            // JSON is deliberately not a compatible response shape.
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
             try
             {
-                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
                 using var doc = JsonDocument.Parse(responseBody);
-                if (doc.RootElement.TryGetProperty("verdict", out var verdictElement))
+                var correlationMatches = doc.RootElement.ValueKind == JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("correlation_id", out var correlation)
+                    && correlation.ValueKind == JsonValueKind.String
+                    && Guid.TryParseExact(correlation.GetString(), "D", out var correlationId)
+                    && correlationId == GuidFromHashMaterial(report.ReportHash);
+                var typed = WireContractCodec.DecodeAndValidate(
+                    Encoding.UTF8.GetBytes(responseBody),
+                    WireContractCatalog.IntegrityVerdict,
+                    DateTimeOffset.UtcNow);
+                var verdictMatches = false;
+                if (typed.IsValid)
                 {
-                    verdict = verdictElement.GetString();
+                    verdictMatches = correlationMatches
+                        && typed.Value!.EvidenceId == GuidFromHashMaterial(report.ReportHash)
+                        && typed.Value.VerdictVersion == 1;
                 }
-            }
-            catch (Exception)
-            {
-                // Verdict field absent or malformed — no action per backlog
-            }
 
-            return new IntegrityReportResult(Success: true, Verdict: verdict);
+                return verdictMatches
+                    ? new IntegrityReportResult(Success: true, Verdict: typed.Value!.Verdict)
+                    : new IntegrityReportResult(Success: false, Verdict: null, IsInvalidEnvelope: true);
+            }
+            catch (Exception exception) when (
+                (exception is JsonException or InvalidOperationException or ArgumentException)
+                && !cancellationToken.IsCancellationRequested)
+            {
+                // A successful submission with no usable verdict is non-definitive;
+                // it must not be converted into a transport failure or open the
+                // circuit breaker.
+                return new IntegrityReportResult(Success: false, Verdict: null, IsInvalidEnvelope: true);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception)
         {
@@ -420,20 +733,19 @@ public sealed class BackendClient : IBackendClient
     }
 
     /// <inheritdoc />
-    public async Task<PairingHttpResult> PairAsync(PairingRequest request, CancellationToken cancellationToken = default)
+    [Obsolete("Pairing is owned by IBackendIdentityCoordinator through IPairingService.")]
+    internal async Task<PairingHttpResult> PairAsync(PairingRequest request, CancellationToken cancellationToken = default)
     {
         try
         {
             var url = $"{this.baseUrl}/functions/v1/pairing";
-            var payload = new
-            {
-                code = request.Code,
-                device_name = request.DeviceName,
-                device_model = request.DeviceModel,
-                os_version = request.OsVersion,
-                app_version = request.AppVersion,
-                age_band = request.AgeBand,
-            };
+            var payload = new PairingPostPayload(
+                request.Code,
+                request.DeviceName,
+                request.DeviceModel,
+                request.OsVersion,
+                request.AppVersion,
+                request.AgeBand);
 
             var content = JsonContent.Create(payload);
             var requestMsg = this.CreateAuthenticatedRequest(HttpMethod.Post, url);
@@ -508,4 +820,54 @@ public sealed class BackendClient : IBackendClient
         public long? ServerTimeOffsetMs { get; set; }
         public bool NewPolicyAvailable { get; set; }
     }
+
+    private sealed record PolicyFetchRequestPayload(
+        [property: JsonPropertyName("p_device_id")] string DeviceId);
+
+    private sealed record UsageLogPostPayload(
+        [property: JsonPropertyName("app_id")] string AppId,
+        [property: JsonPropertyName("minutes")] int Minutes,
+        [property: JsonPropertyName("server_date")] string ServerDate,
+        [property: JsonPropertyName("dedup_key")] string DedupKey);
+
+    private sealed record DeviceAlertPostPayload(
+        [property: JsonPropertyName("event_type")] string EventType,
+        [property: JsonPropertyName("description")] string? Description,
+        [property: JsonPropertyName("severity")] string? Severity,
+        [property: JsonPropertyName("detected_at")] string DetectedAt,
+        [property: JsonPropertyName("dedup_key")] string DedupKey);
+
+    private sealed record BehavioralEventPostPayload(
+        [property: JsonPropertyName("event_type")] string EventType,
+        [property: JsonPropertyName("app_id")] string? AppId,
+        [property: JsonPropertyName("timestamp")] string Timestamp,
+        [property: JsonPropertyName("metadata")] Dictionary<string, object>? Metadata,
+        [property: JsonPropertyName("dedup_key")] string DedupKey);
+
+    private sealed record HeartbeatPostPayload(
+        [property: JsonPropertyName("enforcement")] string Enforcement,
+        [property: JsonPropertyName("battery_pct")] int BatteryPct,
+        [property: JsonPropertyName("clock_offset_ms")] long ClockOffsetMs,
+        [property: JsonPropertyName("agent_uptime_ms")] long AgentUptimeMs);
+
+    private sealed record PushTokenPostPayload(
+        [property: JsonPropertyName("channel")] string Channel,
+        [property: JsonPropertyName("push_handle")] string PushHandle,
+        [property: JsonPropertyName("expires_at")] string? ExpiresAt);
+
+    private sealed record IntegrityReportPostPayload(
+        [property: JsonPropertyName("report_hash")] string ReportHash,
+        [property: JsonPropertyName("binary_hash")] string BinaryHash,
+        [property: JsonPropertyName("signature_valid")] bool SignatureValid,
+        [property: JsonPropertyName("timestamp")] string Timestamp,
+        [property: JsonPropertyName("agent_version")] string AgentVersion,
+        [property: JsonPropertyName("platform")] string Platform);
+
+    private sealed record PairingPostPayload(
+        [property: JsonPropertyName("code")] string Code,
+        [property: JsonPropertyName("device_name")] string DeviceName,
+        [property: JsonPropertyName("device_model")] string DeviceModel,
+        [property: JsonPropertyName("os_version")] string OsVersion,
+        [property: JsonPropertyName("app_version")] string AppVersion,
+        [property: JsonPropertyName("age_band")] string AgeBand);
 }

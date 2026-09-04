@@ -5,6 +5,7 @@
 namespace ControlParental.Service.Tests;
 
 using System.Collections.Concurrent;
+using System.Reflection;
 using ControlParental.Domain;
 using ControlParental.Service;
 using FluentAssertions;
@@ -125,7 +126,7 @@ public class ServiceHealthMonitorTests : IDisposable
         await this.monitor.StartAsync();
 
         // Assert
-        this.monitor.IsServiceHealthy.Should().BeTrue();
+        this.monitor.IsServiceHealthy.Should().BeFalse("restore, heartbeat, and action confirmation are not authoritative yet");
     }
 
     [Fact]
@@ -138,7 +139,66 @@ public class ServiceHealthMonitorTests : IDisposable
         await this.monitor.StartAsync();
 
         // Assert - should not throw
+        this.monitor.IsServiceHealthy.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task IsServiceHealthyRequiresAuthoritativeRestoreHeartbeatAndCurrentConfirmation()
+    {
+        await this.monitor.StartAsync();
+        this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(100);
+
+        this.monitor.SetRestoreStatus(succeeded: true);
+        this.monitor.SetHealthBlockingIssues(hasBlockingIssues: false);
+        this.monitor.SetCurrentCriticalActionsConfirmed(confirmed: true);
+
+        this.monitor.IsServiceHealthy.Should().BeFalse("a success state cannot substitute for agent liveness");
+
+        this.monitor.RecordAgentHeartbeat();
+
         this.monitor.IsServiceHealthy.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task AgentDeathInvalidatesHeartbeatAndCurrentConfirmation()
+    {
+        await this.monitor.StartAsync();
+        this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(100);
+        this.monitor.SetRestoreStatus(succeeded: true);
+        this.monitor.SetHealthBlockingIssues(hasBlockingIssues: false);
+        this.monitor.SetCurrentCriticalActionsConfirmed(confirmed: true);
+        this.monitor.RecordAgentHeartbeat();
+        this.monitor.IsServiceHealthy.Should().BeTrue();
+
+        this.monitor.RecordAgentDeath();
+
+        this.monitor.IsAgentHealthy.Should().BeFalse();
+        this.monitor.IsServiceHealthy.Should().BeFalse();
+        this.monitor.RecordAgentHeartbeat();
+        this.monitor.IsServiceHealthy.Should().BeFalse("replacement heartbeat does not confirm current critical intent");
+    }
+
+    [Theory]
+    [InlineData(RuntimeSecurityVerdict.HealthyStandard, true, true)]
+    [InlineData(RuntimeSecurityVerdict.Administrator, true, true)]
+    [InlineData(RuntimeSecurityVerdict.Unknown, false, true)]
+    [InlineData(RuntimeSecurityVerdict.AclFailure, false, true)]
+    public async Task Hardening_ApplySecurityVerdict_PublishesHealthWithoutDisablingEnforcement(
+        RuntimeSecurityVerdict verdict,
+        bool healthy,
+        bool enforcementActive)
+    {
+        this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(100);
+        this.monitor.SetRestoreStatus(succeeded: true);
+        this.monitor.SetHealthBlockingIssues(hasBlockingIssues: false);
+        this.monitor.SetCurrentCriticalActionsConfirmed(confirmed: true);
+        this.monitor.RecordAgentHeartbeat();
+        this.monitor.ApplySecurityVerdict(verdict);
+        await this.monitor.StartAsync();
+
+        this.monitor.IsServiceHealthy.Should().Be(healthy);
+        this.monitor.IsEnforcementActive.Should().Be(enforcementActive);
+        this.monitor.SecurityVerdict.Should().Be(verdict);
     }
 
     [Fact]
@@ -355,6 +415,20 @@ public class ServiceHealthMonitorTests : IDisposable
         issues.Should().ContainMatch("*Agent died 3 times*");
     }
 
+    [Fact]
+    public void GetHealthIssues_WhenSecurityVerdictIsUnhealthy_ReturnsSecurityIssue()
+    {
+        // Arrange
+        this.monitor.StartAsync().Wait();
+        this.monitor.ApplySecurityVerdict(RuntimeSecurityVerdict.AclFailure);
+
+        // Act
+        var issues = this.monitor.GetHealthIssues();
+
+        // Assert
+        issues.Should().ContainMatch("*Runtime security verdict is AclFailure*");
+    }
+
     // ── ServiceBecameUnhealthy Event Tests ───────────────────────
 
     [Fact]
@@ -484,6 +558,33 @@ public class ServiceHealthMonitorTests : IDisposable
         this.monitor.AgentRestartCount.Should().BeGreaterThan(countBefore);
     }
 
+    [Fact]
+    public void HealthCheckCallback_WhenRunningAndOverdueHeartbeat_FiresUnhealthyCallbacks()
+    {
+        // Arrange
+        this.monitor.StartAsync().Wait();
+        this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(100);
+        this.monitor.RecordAgentHeartbeat();
+
+        this.mockTimeProvider.SetupGet(t => t.MonotonicNow).Returns(
+            100 + (long)(TimeSpan.FromSeconds(31).TotalMilliseconds * 10_000));
+
+        var callback = typeof(ServiceHealthMonitor).GetMethod(
+            "HealthCheckCallback",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        callback.Should().NotBeNull();
+
+        // Act
+        callback!.Invoke(this.monitor, new object?[] { null });
+
+        // Assert
+        this.monitor.AgentRestartCount.Should().Be(1);
+        this.agentDiedEvents.Should().Contain("agent-died");
+        this.unhealthyEvents.Should().NotBeEmpty();
+        this.unhealthyEvents.ToArray()[0].Should().Contain("No agent heartbeat received yet");
+    }
+
     // ── IsAgentInCriticalState Tests ─────────────────────────────
 
     [Fact]
@@ -508,6 +609,30 @@ public class ServiceHealthMonitorTests : IDisposable
 
         // Assert
         this.monitor.IsAgentInCriticalState.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task RecoverySuccess_ResetsAgentRestartCountButDoesNotInventHealthyStatus()
+    {
+        // Arrange
+        this.monitor.RecordAgentDeath();
+        this.monitor.RecordAgentDeath();
+
+        var recoveryManager = new ServiceRecoveryManager(
+            healthMonitor: this.monitor,
+            recoverAgentFunc: () => Task.FromResult(true),
+            onRecoveryFailed: _ => { },
+            onRecoverySucceeded: () => { });
+
+        // Act
+        var recovered = await recoveryManager.RequestAgentRecoveryAsync("Crash/relaunch recovery");
+        var status = recoveryManager.GetRecoveryStatus();
+
+        // Assert
+        recovered.Should().BeTrue();
+        this.monitor.AgentRestartCount.Should().Be(0);
+        status.IsHealthy.Should().BeFalse();
+        status.HealthLevel.Should().Be(ServiceHealthLevel.Degraded);
     }
 }
 
@@ -571,6 +696,34 @@ public class ServiceRecoveryManagerTests : IDisposable
             .WithParameterName("recoverAgentFunc");
     }
 
+    [Fact]
+    public void Constructor_WithNullOnRecoveryFailed_ThrowsArgumentNullException()
+    {
+        // Act & Assert
+        var act = () => new ServiceRecoveryManager(
+            healthMonitor: this.mockHealthMonitor.Object,
+            recoverAgentFunc: () => Task.FromResult(false),
+            onRecoveryFailed: null!,
+            onRecoverySucceeded: () => { });
+
+        act.Should().ThrowExactly<ArgumentNullException>()
+            .WithParameterName("onRecoveryFailed");
+    }
+
+    [Fact]
+    public void Constructor_WithNullOnRecoverySucceeded_ThrowsArgumentNullException()
+    {
+        // Act & Assert
+        var act = () => new ServiceRecoveryManager(
+            healthMonitor: this.mockHealthMonitor.Object,
+            recoverAgentFunc: () => Task.FromResult(false),
+            onRecoveryFailed: _ => { },
+            onRecoverySucceeded: null!);
+
+        act.Should().ThrowExactly<ArgumentNullException>()
+            .WithParameterName("onRecoverySucceeded");
+    }
+
     // ── Initial State Tests ─────────────────────────────────────────
 
     [Fact]
@@ -612,6 +765,56 @@ public class ServiceRecoveryManagerTests : IDisposable
         // Assert
         result.Should().BeTrue();
         this.successEvents.Should().Contain("success");
+    }
+
+    [Fact]
+    public async Task RequestAgentRecoveryAsync_WhenAlreadyInFlight_ReturnsFalse()
+    {
+        // Arrange
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        this.recoveryManager = new ServiceRecoveryManager(
+            healthMonitor: this.mockHealthMonitor.Object,
+            recoverAgentFunc: () =>
+            {
+                started.TrySetResult(true);
+                return release.Task;
+            },
+            onRecoveryFailed: issue => this.failedEvents.Enqueue(issue),
+            onRecoverySucceeded: () => { });
+
+        var firstAttempt = this.recoveryManager.RequestAgentRecoveryAsync("First attempt");
+        await started.Task;
+
+        // Act
+        var secondResult = await this.recoveryManager.RequestAgentRecoveryAsync("Second attempt");
+
+        // Assert
+        secondResult.Should().BeFalse();
+
+        release.SetResult(true);
+        (await firstAttempt).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task RequestAgentRecoveryAsync_RespectsCooldownAfterSuccess()
+    {
+        // Arrange
+        this.recoveryManager = new ServiceRecoveryManager(
+            healthMonitor: this.mockHealthMonitor.Object,
+            recoverAgentFunc: () => Task.FromResult(true),
+            onRecoveryFailed: issue => this.failedEvents.Enqueue(issue),
+            onRecoverySucceeded: () => { });
+
+        // Act
+        var firstResult = await this.recoveryManager.RequestAgentRecoveryAsync("Initial");
+        var secondResult = await this.recoveryManager.RequestAgentRecoveryAsync("Immediate retry");
+
+        // Assert
+        firstResult.Should().BeTrue();
+        secondResult.Should().BeFalse();
+        this.recoveryManager.LastRecoveryError.Should().Contain("Recovery cooldown active");
     }
 
     [Fact]
@@ -699,6 +902,7 @@ public class ServiceRecoveryManagerTests : IDisposable
     {
         // Arrange
         this.mockHealthMonitor.SetupGet(m => m.AgentRestartCount).Returns(0);
+        this.mockHealthMonitor.SetupGet(m => m.IsServiceHealthy).Returns(true);
 
         // Act
         var status = this.recoveryManager.GetRecoveryStatus();
@@ -706,6 +910,18 @@ public class ServiceRecoveryManagerTests : IDisposable
         // Assert
         status.IsHealthy.Should().BeTrue();
         status.HealthLevel.Should().Be(ServiceHealthLevel.Healthy);
+    }
+
+    [Fact]
+    public void GetRecoveryStatus_WhenCountersAreClearButAuthorityIsUnhealthy_ReturnsDegraded()
+    {
+        this.mockHealthMonitor.SetupGet(m => m.AgentRestartCount).Returns(0);
+        this.mockHealthMonitor.SetupGet(m => m.IsServiceHealthy).Returns(false);
+
+        var status = this.recoveryManager.GetRecoveryStatus();
+
+        status.IsHealthy.Should().BeFalse();
+        status.HealthLevel.Should().Be(ServiceHealthLevel.Degraded);
     }
 
     [Fact]

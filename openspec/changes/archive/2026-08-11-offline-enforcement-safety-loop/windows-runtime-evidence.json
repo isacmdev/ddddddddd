@@ -1,0 +1,39 @@
+{
+  "StartedAtUtc": "2026-08-11T14:02:33.1773578+00:00",
+  "FinishedAtUtc": "2026-08-11T14:02:36.912609+00:00",
+  "Os": "Microsoft Windows NT 10.0.26200.0",
+  "ProcessId": 12508,
+  "SessionId": 1,
+  "Flows": [
+    {
+      "Name": "overlay-lifecycle",
+      "Result": "PASS",
+      "DurationMs": 54.293,
+      "Detail": "native 320x180 topmost show/replace/clear"
+    },
+    {
+      "Name": "exact-termination",
+      "Result": "PASS",
+      "DurationMs": 3200.2851,
+      "Detail": "wrong start-time rejected; exact child terminated"
+    },
+    {
+      "Name": "lock-workstation-safe-seam",
+      "Result": "PASS",
+      "DurationMs": 470.1381,
+      "Detail": "user32 export resolved; production lock path called safe delegate once; workstation not locked"
+    },
+    {
+      "Name": "agent-reconnect",
+      "Result": "PASS",
+      "DurationMs": 470.1381,
+      "Detail": "real named-pipe replacement generation 1 -\u003E 2; stale generation rejected"
+    },
+    {
+      "Name": "heartbeat-loss-recovery",
+      "Result": "PASS",
+      "DurationMs": 470.1381,
+      "Detail": "300ms bounded silence observed; generation-2 authority heartbeat accepted"
+    }
+  ]
+}

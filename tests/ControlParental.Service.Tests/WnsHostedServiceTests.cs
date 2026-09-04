@@ -299,9 +299,14 @@ public class WnsHostedServiceTests
         // Stop the service
         await sut.StopAsync(CancellationToken.None);
 
-        // Assert - no exception thrown, renewal failure was handled gracefully
-        // If we got here without exception, the test passes
-        Assert.True(true);
+        // The stop path must not trigger or duplicate renewal work.
+        this.mockWns.Verify(
+            service => service.GetOrRenewTokenAsync(It.IsAny<CancellationToken>()),
+            Times.Once);
+        this.mockBackend.Verify(
+            backend => backend.RegisterPushTokenAsync(
+                channelUri, "wns", expiresAt, It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]

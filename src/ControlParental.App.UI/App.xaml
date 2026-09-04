@@ -6,6 +6,9 @@
     xmlns:converters="using:ControlParental.App.UI.Converters">
     <Application.Resources>
         <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
             <converters:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
             <!-- T26: WinUI 3 1.7/1.8 stub resources for unpackaged apps -->
             <CornerRadius x:Key="ControlCornerRadius">4</CornerRadius>

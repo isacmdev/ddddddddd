@@ -5,7 +5,9 @@
 namespace ControlParental.Service.Tests;
 
 using System.Reflection;
+using System.Text.Json;
 using ControlParental.Domain;
+using ControlParental.Domain.WireContracts;
 using FluentAssertions;
 using Moq;
 using Xunit;
@@ -30,6 +32,7 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     private readonly Mock<IServiceHealthMonitor> mockHealthMonitor;
     private readonly Mock<IServiceRecoveryManager> mockRecoveryManager;
     private readonly Mock<IPolicyRepository> mockPolicyRepository;
+    private readonly Mock<IBackendIdentityCoordinator> mockIdentityCoordinator;
     private readonly ScheduledWorkService service;
 
     public ScheduledWorkServiceAsyncDispatchTests()
@@ -42,11 +45,14 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         this.mockHealthMonitor = new Mock<IServiceHealthMonitor>();
         this.mockRecoveryManager = new Mock<IServiceRecoveryManager>();
         this.mockPolicyRepository = new Mock<IPolicyRepository>();
+        this.mockIdentityCoordinator = new Mock<IBackendIdentityCoordinator>();
 
         this.mockUsageReconciler.SetupGet(r => r.IsRunning).Returns(false);
         this.mockEnforcementLevelMonitor.SetupGet(m => m.CurrentLevel).Returns(EnforcementLevel.Standard);
         this.mockHealthMonitor.SetupGet(m => m.IsAgentHealthy).Returns(true);
         this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(DateTimeOffset.UtcNow);
+        this.mockIdentityCoordinator.SetupGet(c => c.CurrentState).Returns(
+            BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
 
         this.service = new ScheduledWorkService(
             backendClient: this.mockBackendClient.Object,
@@ -56,7 +62,8 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
             timeProvider: this.mockTimeProvider.Object,
             healthMonitor: this.mockHealthMonitor.Object,
             recoveryManager: this.mockRecoveryManager.Object,
-            policyRepository: this.mockPolicyRepository.Object);
+            policyRepository: this.mockPolicyRepository.Object,
+            identityCoordinator: this.mockIdentityCoordinator.Object);
     }
 
     public void Dispose()
@@ -411,8 +418,11 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecuteHeartbeatAsync_WhenNewPolicyAvailable_DispatchesSync()
+    public async Task ExecuteHeartbeatAsync_WhenNewPolicyAvailable_AwaitsSyncCompletion()
     {
+        var syncStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSync = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
         this.mockBackendClient
             .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(HeartbeatResult.Succeeded(newPolicyAvailable: true));
@@ -422,17 +432,271 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
             .ReturnsAsync(0);
         this.mockBackendClient
             .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(PolicyFetchResult.Succeeded(1, string.Empty));
+            .Returns(async () =>
+            {
+                syncStarted.SetResult();
+                await releaseSync.Task;
+                return PolicyFetchResult.Succeeded(1, string.Empty);
+            });
 
-        await this.service.StartAsync();
-        await this.service.ExecuteHeartbeatAsync(CancellationToken.None);
+        var heartbeat = this.service.ExecuteHeartbeatAsync(CancellationToken.None);
+        await syncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // The follow-up sync must reach the backend at least once.
+        heartbeat.IsCompleted.Should().BeFalse("heartbeat completion must include the requested policy sync");
+        releaseSync.SetResult();
+        await heartbeat;
+
         this.mockBackendClient.Verify(
             c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
-            Times.AtLeastOnce);
+            Times.Once);
     }
 
+    [Fact]
+    public async Task ExecuteHeartbeatAsync_WhenPolicySyncIsCancelled_PropagatesCancellation()
+    {
+        var syncStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+
+        this.mockBackendClient
+            .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), cts.Token))
+            .ReturnsAsync(HeartbeatResult.Succeeded(newPolicyAvailable: true));
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), cts.Token))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), cts.Token))
+            .Returns(async () =>
+            {
+                syncStarted.SetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+                return PolicyFetchResult.Succeeded(1, string.Empty);
+            });
+
+        var heartbeat = this.service.ExecuteHeartbeatAsync(cts.Token);
+        await syncStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cts.Cancel();
+
+        var act = async () => await heartbeat;
+        await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenAnotherSyncIsRunning_DoesNotOverlap()
+    {
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var active = 0;
+        var maximumActive = 0;
+
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                var call = Interlocked.Increment(ref calls);
+                var currentActive = Interlocked.Increment(ref active);
+                maximumActive = Math.Max(maximumActive, currentActive);
+                if (call == 1)
+                {
+                    await releaseFirst.Task;
+                }
+
+                Interlocked.Decrement(ref active);
+                return 0;
+            });
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(1, string.Empty));
+
+        var first = this.service.ExecutePolicySyncAsync(CancellationToken.None);
+        calls.Should().Be(1);
+
+        var second = this.service.ExecutePolicySyncAsync(CancellationToken.None);
+        calls.Should().Be(1, "the second sync must await the active sync without entering policy work");
+
+        releaseFirst.SetResult();
+        await Task.WhenAll(first, second);
+
+        calls.Should().Be(2);
+        maximumActive.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_DeniedIdentityThenLaterAdmissionConvergesAcrossAllSources()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Unpaired());
+
+        var denied = await this.service.AdmitSyncAsync(SyncTriggerSource.Wns);
+
+        Assert.Equal(SyncAdmissionResult.Accepted, denied);
+        this.mockPolicyRepository.Verify(
+            r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockPolicyRepository.Invocations.Clear();
+        this.mockBackendClient.Invocations.Clear();
+
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 2, "device-test"));
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return 0;
+            });
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(0, string.Empty));
+
+        var sources = new[]
+        {
+            SyncTriggerSource.Startup,
+            SyncTriggerSource.Wns,
+            SyncTriggerSource.Ui,
+            SyncTriggerSource.Timer,
+            SyncTriggerSource.Polling,
+        };
+        var admissions = sources.Select(source => this.service.AdmitSyncAsync(source)).ToArray();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        release.SetResult();
+        var results = await Task.WhenAll(admissions);
+
+        Assert.Equal(1, results.Count(result => result == SyncAdmissionResult.Accepted));
+        Assert.Equal(4, results.Count(result => result == SyncAdmissionResult.Coalesced));
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_CancelledRequestDoesNotStartPolicyWork()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var result = await this.service.AdmitSyncAsync(SyncTriggerSource.Ui, cts.Token);
+
+        Assert.Equal(SyncAdmissionResult.Cancelled, result);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_UnknownSourceIsRejected()
+    {
+        var result = await this.service.AdmitSyncAsync((SyncTriggerSource)99);
+
+        Assert.Equal(SyncAdmissionResult.Rejected, result);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_CallerCancellationOnlyCancelsThatWaiter()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return 0;
+            });
+
+        using var callerCancellation = new CancellationTokenSource();
+        var owner = this.service.AdmitSyncAsync(SyncTriggerSource.Wns, callerCancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var coalesced = this.service.AdmitSyncAsync(SyncTriggerSource.Ui);
+
+        callerCancellation.Cancel();
+        Assert.Equal(SyncAdmissionResult.Cancelled, await owner);
+
+        release.SetResult();
+        Assert.Equal(SyncAdmissionResult.Coalesced, await coalesced);
+        this.mockBackendClient.Verify(
+            c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_ShutdownCancellationCancelsSharedWork()
+    {
+        await this.StartWithoutStartupPolicySyncAsync();
+        var workEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns((string _, CancellationToken token) =>
+            {
+                workEntered.TrySetResult();
+                return ObserveCancellationAsync(token, cancellationObserved);
+            });
+
+        var admission = this.service.AdmitSyncAsync(SyncTriggerSource.Timer);
+        await workEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await this.service.StopAsync();
+
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SyncAdmissionResult.Accepted, await admission);
+    }
+
+    [Fact]
+    public async Task AdmitSyncAsync_StoppedAndDisposedServiceRejectsAdmission()
+    {
+        Assert.Equal(
+            SyncAdmissionResult.Rejected,
+            await this.service.AdmitSyncAsync(SyncTriggerSource.Polling));
+
+        this.service.Dispose();
+        Assert.Equal(
+            SyncAdmissionResult.Rejected,
+            await this.service.AdmitSyncAsync(SyncTriggerSource.Polling));
+    }
+
+    private async Task StartWithoutStartupPolicySyncAsync()
+    {
+        var startupCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Callback(() => startupCompleted.TrySetResult())
+            .ReturnsAsync(PolicyFetchResult.Succeeded(0, string.Empty));
+        await this.service.StartAsync();
+        await startupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        this.mockBackendClient.Invocations.Clear();
+        this.mockPolicyRepository.Invocations.Clear();
+    }
+    private static async Task<int> ObserveCancellationAsync(
+        CancellationToken cancellationToken,
+        TaskCompletionSource cancellationObserved)
+    {
+        using var registration = cancellationToken.Register(() => cancellationObserved.TrySetResult());
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            cancellationObserved.TrySetResult();
+            throw;
+        }
+
+        return 0;
+    }
     [Fact]
     public async Task ExecuteHeartbeatAsync_WhenCancelled_ThrowsOperationCanceledException()
     {
@@ -531,7 +795,7 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     // ── Direct coverage for ExecutePolicySyncAsync ───────────────────────
 
     [Fact]
-    public async Task ExecutePolicySyncAsync_WhenNewerPolicyArrives_PersistsIt()
+    public async Task ExecutePolicySyncAsync_WhenLegacyPolicyArrives_RejectsBeforePersistence()
     {
         // Policy uses snake_case JSON property names and integer-valued enums
         // (PolicyJsonContext has no UseStringEnumConverter).
@@ -553,9 +817,27 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         this.mockBackendClient
             .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(PolicyFetchResult.Succeeded(7, policyJson));
+        await Assert.ThrowsAsync<JsonException>(() => this.service.ExecutePolicySyncAsync(CancellationToken.None));
+
+        this.mockPolicyRepository.Verify(
+            r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenVersionedPolicyEnvelopeArrives_PersistsPayload()
+    {
+        var policyWithoutHash = """{"device_id":"00000000-0000-4000-8000-000000000012","version":7,"device_state":"active","daily_screen_time_minutes":120,"schedules":[],"category_limits":[],"app_policies":[],"category_assignments":{},"grants":[]}""";
+        using var payloadDocument = JsonDocument.Parse(policyWithoutHash);
+        var policyJson = policyWithoutHash[..^1] + ",\"snapshot_hash\":\"" + CanonicalJson.Sha256Hex(payloadDocument.RootElement) + "\"}";
+        var envelope = """{"contract":"control-parental.windows","version":1,"message_type":"policy.snapshot","correlation_id":"00000000-0000-4000-8000-000000000001","payload":""" + policyJson + "}";
+
         this.mockPolicyRepository
-            .Setup(r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(3);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(7, envelope));
 
         await this.service.ExecutePolicySyncAsync(CancellationToken.None);
 
@@ -576,6 +858,24 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
 
         await this.service.ExecutePolicySyncAsync(CancellationToken.None);
 
+        this.mockPolicyRepository.Verify(
+            r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecutePolicySyncAsync_WhenEnvelopeHasUnknownMember_DoesNotPersist()
+    {
+        this.mockPolicyRepository
+            .Setup(r => r.GetLocalVersionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0);
+        this.mockBackendClient
+            .Setup(c => c.FetchPolicyAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PolicyFetchResult.Succeeded(1, "{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"policy.snapshot\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"unexpected\":true,\"payload\":{}}"));
+
+        var act = async () => await this.service.ExecutePolicySyncAsync(CancellationToken.None);
+
+        await act.Should().ThrowAsync<System.Text.Json.JsonException>();
         this.mockPolicyRepository.Verify(
             r => r.UpsertPolicyAsync(It.IsAny<Policy>(), It.IsAny<CancellationToken>()),
             Times.Never);
@@ -688,14 +988,14 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     public async Task RunBackupAsync_WithOutboxMode_DispatchesAndReturns()
     {
         this.mockOutboxManager
-            .Setup(m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Setup(m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Array.Empty<OutboxEntry>());
 
         var task = this.service.RunBackupAsync(BackupMode.Outbox, CancellationToken.None);
         await task;
 
         this.mockOutboxManager.Verify(
-            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -705,13 +1005,227 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
         using var cts = new CancellationTokenSource();
 
         this.mockOutboxManager
-            .Setup(m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.Is<CancellationToken>(ct => ct == cts.Token)))
+            .Setup(m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.Is<CancellationToken>(ct => ct == cts.Token)))
             .ReturnsAsync(Array.Empty<OutboxEntry>());
 
         await this.service.RunBackupAsync(BackupMode.Outbox, cts.Token);
 
         this.mockOutboxManager.Verify(
-            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.Is<CancellationToken>(ct => ct == cts.Token)),
+            m => m.ClaimAsync(It.IsAny<int>(), It.IsAny<TimeSpan>(), It.Is<CancellationToken>(ct => ct == cts.Token)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_ClaimsAndCompletesEachDurableEntry()
+    {
+        var entry = new OutboxEntry
+        {
+            Id = 41,
+            TableName = "usage_logs",
+            PayloadJson = "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-41\"}",
+            DedupKey = "op-41",
+            OperationId = "op-41",
+            ClaimVersion = 2,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+
+        await this.service.StartAsync();
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        this.mockOutboxManager.Verify(
+            m => m.CompleteAsync(It.Is<OutboxEntry>(claimed => claimed.Id == entry.Id && claimed.OperationId == entry.OperationId), It.IsAny<CancellationToken>()),
+            Times.Once);
+        this.mockOutboxManager.Verify(
+            m => m.GetPendingEntriesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        this.mockOutboxManager.Verify(
+            m => m.MarkSentAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_CancellationLeavesClaimForDurableRecovery()
+    {
+        var entry = new OutboxEntry
+        {
+            Id = 42,
+            TableName = "usage_logs",
+            PayloadJson = "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-42\"}",
+            DedupKey = "op-42",
+            OperationId = "op-42",
+            ClaimVersion = 1,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
+        this.mockIdentityCoordinator
+            .SetupGet(c => c.CurrentState)
+            .Returns(BackendIdentityState.Restore(BackendIdentityPhase.DefinitiveSession, 1, "device-test"));
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        using var cts = new CancellationTokenSource();
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IEnumerable<UsageLogEntry> _, CancellationToken token) =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return DataPushResult.Succeeded(1);
+            });
+
+        await this.service.StartAsync();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+
+        await this.service.Invoking(s => s.ExecuteOutboxPushAsync(cts.Token))
+            .Should().ThrowAsync<OperationCanceledException>();
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(It.IsAny<OutboxEntry>(), It.IsAny<string>(), It.IsAny<DateTimeOffset?>(), It.IsAny<bool>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunBackupAsync_WhenCallerIsCancelledInFlight_PropagatesCancellation()
+    {
+        var enteredBackend = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBackend = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        this.mockBackendClient
+            .Setup(c => c.SendHeartbeatAsync(It.IsAny<HeartbeatData>(), It.Is<CancellationToken>(token => token == cts.Token)))
+            .Returns(async (HeartbeatData _, CancellationToken token) =>
+            {
+                enteredBackend.SetResult(true);
+                await releaseBackend.Task.WaitAsync(token);
+                return HeartbeatResult.Succeeded();
+            });
+
+        var backup = this.service.RunBackupAsync(BackupMode.Heartbeat, cts.Token);
+
+        try
+        {
+            await enteredBackend.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cts.Cancel();
+
+            var act = async () => await backup;
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            releaseBackend.TrySetResult(true);
+            try
+            {
+                await backup;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_DeliversAllSupportedEntryTypesIndependently()
+    {
+        var entries = new[]
+        {
+            CreateEntry(43, "device_alerts", "{\"eventType\":\"warning\",\"detectedAt\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-43\"}"),
+            CreateEntry(44, "behavioral_events", "{\"eventType\":\"blocked\",\"timestamp\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-44\"}"),
+            CreateEntry(45, "time_requests", "{\"requestId\":\"00000000-0000-4000-8000-000000000045\",\"minutes\":5,\"createdAt\":\"2026-07-23T12:00:00Z\"}"),
+        };
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(entries);
+        this.mockBackendClient
+            .Setup(c => c.PushDeviceAlertsAsync(It.IsAny<IEnumerable<DeviceAlertEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+        this.mockBackendClient
+            .Setup(c => c.PushBehavioralEventsAsync(It.IsAny<IEnumerable<BehavioralEventEntry>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataPushResult.Succeeded(1));
+        this.mockBackendClient
+            .Setup(c => c.CreateTimeRequestAsync(It.IsAny<TimeRequestEntry>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.CompleteAsync(It.IsAny<OutboxEntry>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.Is<OutboxEntry>(entry => entry.Id == 45),
+                "permanent",
+                null,
+                true,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_MalformedAndUnsupportedEntriesArePermanentFailures()
+    {
+        var entries = new[]
+        {
+            CreateEntry(46, "usage_logs", "not-json"),
+            CreateEntry(47, "unknown", "{}"),
+        };
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(entries);
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.IsAny<OutboxEntry>(),
+                "permanent",
+                null,
+                true,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+        this.mockBackendClient.Verify(
+            c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteOutboxPushAsync_DeliveryExceptionUsesSafeTransientFailure()
+    {
+        var entry = CreateEntry(
+            48,
+            "usage_logs",
+            "{\"appId\":\"app\",\"minutes\":1,\"serverDate\":\"2026-07-23T12:00:00Z\",\"dedupKey\":\"op-48\"}");
+        this.mockOutboxManager
+            .Setup(m => m.ClaimAsync(100, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { entry });
+        this.mockBackendClient
+            .Setup(c => c.PushUsageLogsAsync(It.IsAny<IEnumerable<UsageLogEntry>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("secret-token=must-not-leak"));
+
+        await this.service.ExecuteOutboxPushAsync(CancellationToken.None);
+
+        this.mockOutboxManager.Verify(
+            m => m.FailAsync(
+                It.Is<OutboxEntry>(failed => failed.Id == entry.Id),
+                "network",
+                It.IsAny<DateTimeOffset?>(),
+                false,
+                ScheduledWorkService.MaxOutboxAttempts,
+                It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -720,6 +1234,22 @@ public class ScheduledWorkServiceAsyncDispatchTests : IDisposable
     {
         ScheduledWorkService.ShutdownBudgetSeconds.Should().Be(30);
         ScheduledWorkService.ShutdownBudgetSeconds.Should().NotBe(ScheduledWorkService.MaxBackoffSeconds);
+    }
+
+    private static OutboxEntry CreateEntry(int id, string tableName, string payloadJson)
+    {
+        return new OutboxEntry
+        {
+            Id = id,
+            TableName = tableName,
+            PayloadJson = payloadJson,
+            DedupKey = $"op-{id}",
+            OperationId = $"op-{id}",
+            ClaimVersion = 1,
+            AttemptCount = 1,
+            Status = OutboxEntryStatus.Claimed,
+            CreatedAt = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero),
+        };
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

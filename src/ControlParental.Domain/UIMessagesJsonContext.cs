@@ -25,7 +25,9 @@ using System.Text.Json.Serialization;
 /// etc.) carry the field as <c>string</c> on the wire, so the round-trip is
 /// symmetric on both sides of the pipe.
 /// </summary>
-[JsonSourceGenerationOptions(UseStringEnumConverter = true)]
+[JsonSourceGenerationOptions(
+    UseStringEnumConverter = true,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow)]
 [JsonSerializable(typeof(GetEnforcementLevel))]
 [JsonSerializable(typeof(EnforcementLevelResponse))]
 [JsonSerializable(typeof(EnforcementLevelCheck))]
@@ -44,6 +46,8 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(GrantInfo))]
 [JsonSerializable(typeof(ActiveIssue))]
 [JsonSerializable(typeof(TriggerSync))]
+[JsonSerializable(typeof(GetRealtimeIdentity))]
+[JsonSerializable(typeof(RealtimeIdentityResponse))]
 [JsonSerializable(typeof(PairDevice))]
 [JsonSerializable(typeof(PairDeviceResponse))]
 [JsonSerializable(typeof(ListAccounts))]
@@ -60,10 +64,16 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(GrantConsent))]
 [JsonSerializable(typeof(AdvanceOnboardingStep))]
 [JsonSerializable(typeof(ResetOnboardingState))]
+[JsonSerializable(typeof(RegisterWnsChannel))]
+[JsonSerializable(typeof(WnsRegistrationResult))]
+[JsonSerializable(typeof(WnsRegistrationStatus))]
 
 // Agent ↔ Service envelopes (same wire contract, different pipe).
 [JsonSerializable(typeof(ForegroundChanged))]
 [JsonSerializable(typeof(AgentHeartbeat))]
+[JsonSerializable(typeof(AgentAuthority))]
+[JsonSerializable(typeof(AgentCommandRequest))]
+[JsonSerializable(typeof(AgentCommandCompleted))]
 [JsonSerializable(typeof(StateSnapshot))]
 [JsonSerializable(typeof(Pong))]
 [JsonSerializable(typeof(ShowOverlay))]
@@ -83,6 +93,15 @@ using System.Text.Json.Serialization;
 [JsonSerializable(typeof(FunnelEventType))]
 [JsonSerializable(typeof(GrantSource))]
 [JsonSerializable(typeof(PairingStatus))]
+[JsonSerializable(typeof(ContractEnvelope))]
+[JsonSerializable(typeof(ContractHint))]
+[JsonSerializable(typeof(SetProtectedAccountRequest))]
+[JsonSerializable(typeof(SetProtectedAccountResponse))]
+[JsonSerializable(typeof(RuntimeActivationState))]
+[JsonSerializable(typeof(CreateTimeRequest))]
+[JsonSerializable(typeof(TimeRequestOutbox))]
+[JsonSerializable(typeof(IntegrityEvidence))]
+[JsonSerializable(typeof(IntegrityVerdict))]
 public sealed partial class UIMessagesJsonContext : JsonSerializerContext
 {
 }

@@ -32,6 +32,18 @@ public sealed class NamedPipeUIServerDeserializeTests
     }
 
     [Fact]
+    public void DeserializeMessage_GetRealtimeIdentity_NotNull()
+    {
+        var original = new GetRealtimeIdentity();
+        var json = JsonSerializer.Serialize(original, UIMessagesJsonContext.Default.GetRealtimeIdentity);
+
+        var deserialized = DeserializeThroughServer(json);
+
+        Assert.NotNull(deserialized);
+        Assert.IsType<GetRealtimeIdentity>(deserialized);
+    }
+
+    [Fact]
     public void DeserializeMessage_AdvanceOnboardingStep_NotNull()
     {
         // Arrange
@@ -114,6 +126,26 @@ public sealed class NamedPipeUIServerDeserializeTests
         Assert.Null(deserialized);
     }
 
+    [Fact]
+    public void DeserializeMessage_UnknownMember_ReturnsNull()
+    {
+        var json = "{\"MessageType\":\"TriggerSync\",\"unexpected\":true}";
+
+        var deserialized = DeserializeThroughServer(json);
+
+        Assert.Null(deserialized);
+    }
+
+    [Fact]
+    public void DeserializeMessage_NonStringMessageType_ReturnsNull()
+    {
+        var json = "{\"MessageType\":123}";
+
+        var deserialized = DeserializeThroughServer(json);
+
+        Assert.Null(deserialized);
+    }
+
     private static IIpcMessage? DeserializeThroughServer(string json)
     {
         var listenerType = typeof(NamedPipeUIServer).GetNestedType(
@@ -125,7 +157,7 @@ public sealed class NamedPipeUIServerDeserializeTests
             listenerType!,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            args: new object?[] { "test", null, null, null, null, CancellationToken.None },
+            args: new object?[] { "test", null, null, null, null, CancellationToken.None, null, null, null },
             culture: null);
         Assert.NotNull(listener);
 

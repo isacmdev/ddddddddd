@@ -13,12 +13,14 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <WindowsPackageType>MSIX</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" />
     <PackageReference Include="Microsoft.WindowsAppSDK" />
     <PackageReference Include="System.Reactive" />
+    <PackageReference Include="System.Management" />
     <PackageReference Include="ZXing.Net" />
     <PackageReference Include="ZXing.Net.Bindings.Windows.Compatibility" />
     <PackageReference Include="Grpc.Net.Client" />
@@ -29,6 +31,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ControlParental.Domain\ControlParental.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Strings\es\Strings.resw" LogicalName="ControlParental.App.UI.Strings.es.Strings.resw" />
+    <EmbeddedResource Include="Strings\en-US\Strings.resw" LogicalName="ControlParental.App.UI.Strings.en-US.Strings.resw" />
   </ItemGroup>
 
 </Project>

@@ -21,10 +21,8 @@ using ControlParental.Domain;
 /// <summary>
 /// Base interface for UI → Service messages.
 /// </summary>
-public interface IUIMessage
+public interface IUIMessage : ControlParental.Domain.IUIMessage
 {
-    /// <inheritdoc/>
-    string MessageType { get; }
 }
 
 /// <summary>

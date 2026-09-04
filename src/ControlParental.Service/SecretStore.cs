@@ -14,11 +14,13 @@ using ControlParental.Domain;
 /// Usa DPAPI con protección de máquina y entropía adicional.
 /// Soporta fallback a DataProtectionProvider cuando está disponible.
 /// </summary>
-public sealed class SecretStore : ISecretStore, IDisposable
+public sealed partial class SecretStore : ISecretStore, IBackendIdentityCredentialStore, IDisposable
 {
     private readonly string basePath;
     private readonly byte[] entropy;
-    private readonly bool disposed;
+    private readonly ICredentialProtector protector;
+    private readonly ICredentialFileAccessPolicy accessPolicy;
+    private readonly SemaphoreSlim writeGate = new(1, 1);
 
     /// <summary>
     /// Entropía fija para el cifrado (256 bits).
@@ -31,7 +33,12 @@ public sealed class SecretStore : ISecretStore, IDisposable
     /// Initializes a new instance of the <see cref="SecretStore"/> class.
     /// </summary>
     /// <param name="basePath">Base path for secret storage (defaults to ProgramData).</param>
-    public SecretStore(string? basePath = null)
+    /// <param name="protector">Credential protection adapter.</param>
+    /// <param name="accessPolicy">Credential file ACL adapter.</param>
+    public SecretStore(
+        string? basePath = null,
+        ICredentialProtector? protector = null,
+        ICredentialFileAccessPolicy? accessPolicy = null)
     {
         // Default to ProgramData if not specified
         this.basePath = basePath ?? Path.Combine(
@@ -45,6 +52,8 @@ public sealed class SecretStore : ISecretStore, IDisposable
         // Generar entropía única de máquina
         // Combinamos la entropía de aplicación con información de la máquina
         this.entropy = GenerateMachineEntropy();
+        this.protector = protector ?? new DpapiCredentialProtector(this.entropy, ApplicationEntropy);
+        this.accessPolicy = accessPolicy ?? new WindowsServiceCredentialFileAccessPolicy();
     }
 
     /// <inheritdoc />
@@ -128,14 +137,10 @@ public sealed class SecretStore : ISecretStore, IDisposable
 
         try
         {
+            var existed = File.Exists(filePath);
             var encrypted = this.Encrypt(value);
-            await File.WriteAllBytesAsync(filePath, encrypted, cancellationToken);
-
-            // Aplicar ACL del servicio (solo LocalSystem y admins pueden leer)
-            ApplyServiceAcl(filePath);
-
-            var existed = File.Exists(filePath); // Esto siempre será true después de escribir
-            return SecretWriteResult.ExistingSecret();
+            await this.WriteAtomicallyAsync(filePath, encrypted, cancellationToken);
+            return existed ? SecretWriteResult.ExistingSecret() : SecretWriteResult.NewSecret();
         }
         catch (IOException ex)
         {
@@ -217,17 +222,7 @@ public sealed class SecretStore : ISecretStore, IDisposable
     private byte[] Encrypt(string plainText)
     {
         var plainBytes = Encoding.UTF8.GetBytes(plainText);
-
-        // Combinar entropía de aplicación con entropía de máquina
-        var combinedEntropy = CombineEntropy(this.entropy);
-
-        // DPAPI con protección de máquina (T16: scope máquina para que LocalSystem lo lea)
-        var encrypted = ProtectedData.Protect(
-            plainBytes,
-            combinedEntropy,
-            DataProtectionScope.LocalMachine);
-
-        return encrypted;
+        return this.protector.Protect(plainBytes);
     }
 
     /// <summary>
@@ -235,14 +230,7 @@ public sealed class SecretStore : ISecretStore, IDisposable
     /// </summary>
     private string Decrypt(byte[] encryptedData)
     {
-        // Combinar entropía de aplicación con entropía de máquina
-        var combinedEntropy = CombineEntropy(this.entropy);
-
-        var decrypted = ProtectedData.Unprotect(
-            encryptedData,
-            combinedEntropy,
-            DataProtectionScope.LocalMachine);
-
+        var decrypted = this.protector.Unprotect(encryptedData);
         return Encoding.UTF8.GetString(decrypted);
     }
 
@@ -267,18 +255,6 @@ public sealed class SecretStore : ISecretStore, IDisposable
 
         var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(machineInfo.ToString()));
         return hash;
-    }
-
-    /// <summary>
-    /// Combina la entropía de aplicación con la entropía de máquina.
-    /// </summary>
-    private static byte[] CombineEntropy(byte[] machineEntropy)
-    {
-        using var sha = SHA256.Create();
-        var combined = new byte[ApplicationEntropy.Length + machineEntropy.Length];
-        Buffer.BlockCopy(ApplicationEntropy, 0, combined, 0, ApplicationEntropy.Length);
-        Buffer.BlockCopy(machineEntropy, 0, combined, ApplicationEntropy.Length, machineEntropy.Length);
-        return sha.ComputeHash(combined);
     }
 
     /// <summary>
@@ -351,35 +327,6 @@ public sealed class SecretStore : ISecretStore, IDisposable
     }
 
     /// <summary>
-    /// Aplica ACL del servicio (solo el servicio y admins pueden leer).
-    /// </summary>
-    private static void ApplyServiceAcl(string filePath)
-    {
-        try
-        {
-            // Obtener info del archivo
-            var fileInfo = new FileInfo(filePath);
-
-            // Obtener ACL actual
-            var security = fileInfo.GetAccessControl();
-
-            // Agregar deny para usuarios normales (excepto SYSTEM y Admin)
-            // Esto es una simplificación - en producción usar SetAccessRuleProtection
-            var currentUserSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
-            if (!string.IsNullOrEmpty(currentUserSid))
-            {
-                // El archivo ya está protegido por el contexto del usuario actual
-                // Cuando el servicio corre como SYSTEM, solo SYSTEM puede leer
-            }
-        }
-        catch
-        {
-            // Si no podemos aplicar ACL, continuar de todas formas
-            // El cifrado DPAPI ya provee protección
-        }
-    }
-
-    /// <summary>
     /// Sana文件名 para evitar path traversal.
     /// </summary>
     private static string SanitizeFileName(string name)
@@ -413,7 +360,6 @@ public sealed class SecretStore : ISecretStore, IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
-        // No hay recursos unmanaged que liberar
-        // DPAPI usa recursos del sistema operativo
+        this.writeGate.Dispose();
     }
 }

@@ -12,21 +12,52 @@ using Microsoft.EntityFrameworkCore;
 /// T03 — Repository for policy and usage persistence.
 /// Handles atomic version guard, usage accumulation, and outbox.
 /// </summary>
-public sealed class PolicyRepository : IPolicyRepository
+public sealed class PolicyRepository : IPolicyRepository, IDisposable
 {
-    private readonly ControlParentalDbContext db;
+    private readonly IDbContextFactory<ControlParentalDbContext> dbContextFactory;
     private readonly ITimeProvider timeProvider;
-
+    private readonly SemaphoreSlim policyGate = new(1, 1);
+    private readonly object policySnapshotSync = new();
+    private Policy? policySnapshot;
+    private bool policySnapshotInitialized;
+    private long policySnapshotRevision;
+    private bool policyQuarantined;
+    private string? policyQuarantineReason;
+    private const string SameVersionHashMismatchReason = "same_version_snapshot_hash_mismatch";
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
         Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.SnakeCaseLower) },
     };
 
-    public PolicyRepository(ControlParentalDbContext db, ITimeProvider timeProvider)
+    public PolicyRepository(
+        IDbContextFactory<ControlParentalDbContext> dbContextFactory,
+        ITimeProvider timeProvider)
     {
-        this.db = db;
+        this.dbContextFactory = dbContextFactory;
         this.timeProvider = timeProvider;
+    }
+
+    public bool IsPolicyQuarantined
+    {
+        get
+        {
+            lock (this.policySnapshotSync)
+            {
+                return this.policyQuarantined;
+            }
+        }
+    }
+
+    public string? PolicyQuarantineReason
+    {
+        get
+        {
+            lock (this.policySnapshotSync)
+            {
+                return this.policyQuarantineReason;
+            }
+        }
     }
 
     // ── Policy persistence ──────────────────────────────────────────────
@@ -38,49 +69,82 @@ public sealed class PolicyRepository : IPolicyRepository
     /// <returns>True if applied, false if discarded.</returns>
     public async Task<bool> UpsertPolicyAsync(Policy policy, CancellationToken ct = default)
     {
-        var existing = await this.db.Policies
-            .FirstOrDefaultAsync(p => p.DeviceId == policy.DeviceId, ct);
-
-        if (existing != null && existing.Version >= policy.Version)
+        ArgumentNullException.ThrowIfNull(policy);
+        try
         {
-            // Downgrade or same version — discard
+            policy.Validate();
+        }
+        catch (ArgumentException)
+        {
+            // Invalid remote input must not open a database transaction or
+            // publish a partially materialized policy.
             return false;
         }
 
-        // Serialize full policy
-        var policyJson = JsonSerializer.Serialize(policy, PolicyJsonContext.Default.Policy);
-        var categoryAssignmentsJson = JsonSerializer.Serialize(policy.CategoryAssignments);
+        await this.policyGate.WaitAsync(ct);
+        try
+        {
+            await using var db = this.dbContextFactory.CreateDbContext();
 
-        if (existing != null)
-        {
-            // Update existing — modify properties; EF Core will detect change
-            // when SaveChanges is called (no explicit Update() call to avoid cascade).
-            existing.Version = policy.Version;
-            existing.PolicyJson = policyJson;
-            existing.CategoryAssignmentsJson = categoryAssignmentsJson;
-            existing.LastUpdated = this.timeProvider.WallClockNow;
-        }
-        else
-        {
-            // Insert new
-            this.db.Policies.Add(new PolicyDbEntity
+            var existing = await db.Policies
+                .FirstOrDefaultAsync(p => p.DeviceId == policy.DeviceId, ct);
+
+            if (existing != null && existing.Version >= policy.Version)
             {
-                DeviceId = policy.DeviceId,
-                Version = policy.Version,
-                PolicyJson = policyJson,
-                CategoryAssignmentsJson = categoryAssignmentsJson,
-                LastUpdated = this.timeProvider.WallClockNow,
-            });
+                if (existing.Version == policy.Version
+                    && !string.Equals(existing.SnapshotHash, policy.SnapshotHash, StringComparison.Ordinal))
+                {
+                    existing.IsQuarantined = true;
+                    existing.QuarantineReason = SameVersionHashMismatchReason;
+                    await db.SaveChangesAsync(ct);
+                    // The conflict is authoritative immediately after the durable
+                    // write. Do not leave the previous snapshot available to the
+                    // active enforcement process while the row is quarantined.
+                    this.SetPolicySnapshot(null, SameVersionHashMismatchReason);
+
+                }
+                return false;
+            }
+
+            // Serialize full policy
+            var policyJson = JsonSerializer.Serialize(policy, PolicyJsonContext.Default.Policy);
+            var categoryAssignmentsJson = JsonSerializer.Serialize(policy.CategoryAssignments);
+
+            if (existing != null)
+            {
+                existing.Version = policy.Version;
+                existing.SnapshotHash = policy.SnapshotHash;
+                existing.IsQuarantined = false;
+                existing.QuarantineReason = null;
+                existing.PolicyJson = policyJson;
+                existing.CategoryAssignmentsJson = categoryAssignmentsJson;
+                existing.LastUpdated = this.timeProvider.WallClockNow;
+            }
+            else
+            {
+                db.Policies.Add(new PolicyDbEntity
+                {
+                    DeviceId = policy.DeviceId,
+                    Version = policy.Version,
+                    SnapshotHash = policy.SnapshotHash,
+                    PolicyJson = policyJson,
+                    CategoryAssignmentsJson = categoryAssignmentsJson,
+                    LastUpdated = this.timeProvider.WallClockNow,
+                });
+            }
+
+            await PolicyRepository.SyncAppPoliciesAsync(db, policy, ct);
+
+            await PolicyRepository.SyncGrantsAsync(db, policy, ct);
+
+            await db.SaveChangesAsync(ct);
+            this.SetPolicySnapshot(policy, null);
+            return true;
         }
-
-        // Update app policies
-        await this.SyncAppPoliciesAsync(policy, ct);
-
-        // Update grants (replace all for simplicity)
-        await this.SyncGrantsAsync(policy, ct);
-
-        await this.db.SaveChangesAsync(ct);
-        return true;
+        finally
+        {
+            this.policyGate.Release();
+        }
     }
 
     /// <summary>
@@ -88,24 +152,80 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task<Policy?> GetPolicyAsync(CancellationToken ct = default)
     {
-        var entity = await this.db.Policies
-            .AsNoTracking()
-            .FirstOrDefaultAsync(ct);
-
-        if (entity == null)
+        await this.policyGate.WaitAsync(ct);
+        try
         {
-            return null;
-        }
+            lock (this.policySnapshotSync)
+            {
+                if (this.policySnapshotInitialized)
+                {
+                    return this.policySnapshot;
+                }
+            }
 
-        return JsonSerializer.Deserialize<Policy>(entity.PolicyJson, JsonOptions);
+            await using var db = this.dbContextFactory.CreateDbContext();
+            var entity = await db.Policies.AsNoTracking().FirstOrDefaultAsync(ct);
+            // A conflicting rewrite is a durable quarantine. Never expose the
+            // previous snapshot to enforcement after restart or cache invalidation.
+            var policy = entity == null || entity.IsQuarantined
+                ? null
+                : JsonSerializer.Deserialize<Policy>(entity.PolicyJson, JsonOptions);
+            var quarantineReason = entity?.IsQuarantined == true
+                ? entity.QuarantineReason ?? SameVersionHashMismatchReason
+                : null;
+            this.SetPolicySnapshot(policy, quarantineReason);
+            return policy;
+        }
+        finally
+        {
+            this.policyGate.Release();
+        }
     }
+
+    public void InvalidatePolicySnapshot()
+    {
+        lock (this.policySnapshotSync)
+        {
+            this.policySnapshot = null;
+            this.policySnapshotInitialized = false;
+            this.policySnapshotRevision++;
+        }
+    }
+
+    private void SetPolicySnapshot(Policy? policy, string? quarantineReason)
+    {
+        lock (this.policySnapshotSync)
+        {
+            this.policySnapshot = policy;
+            this.policySnapshotInitialized = true;
+            this.policyQuarantined = quarantineReason is not null;
+            this.policyQuarantineReason = quarantineReason;
+            this.policySnapshotRevision++;
+        }
+    }
+
+
+    internal long PolicySnapshotRevision
+    {
+        get
+        {
+            lock (this.policySnapshotSync)
+            {
+                return this.policySnapshotRevision;
+            }
+        }
+    }
+
+    public void Dispose() => this.policyGate.Dispose();
 
     /// <summary>
     /// Gets the locally stored policy version, or 0 if not found.
     /// </summary>
     public async Task<int> GetLocalVersionAsync(string deviceId, CancellationToken ct = default)
     {
-        var entity = await this.db.Policies
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var entity = await db.Policies
             .AsNoTracking()
             .FirstOrDefaultAsync(p => p.DeviceId == deviceId, ct);
 
@@ -122,31 +242,40 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task AccumulateUsageAsync(
         string appId,
-        int deltaMinutes,
+        long elapsedSeconds,
         CancellationToken ct = default)
     {
-        var serverDate = this.timeProvider.ServerDate ?? DateOnly.FromDateTime(DateTime.UtcNow);
+        await using var db = this.dbContextFactory.CreateDbContext();
 
-        var existing = await this.db.UsageToday
+        var serverDate = this.GetServerDate();
+
+        var existing = await db.UsageToday
             .FirstOrDefaultAsync(u => u.AppId == appId && u.ServerDate == serverDate, ct);
 
         if (existing != null)
         {
-            existing.Minutes += deltaMinutes;
+            var currentElapsedSeconds = existing.ElapsedSeconds > 0
+                ? existing.ElapsedSeconds
+                : existing.Minutes * 60L;
+
+            currentElapsedSeconds += elapsedSeconds;
+            existing.ElapsedSeconds = currentElapsedSeconds;
+            existing.Minutes = (int)(currentElapsedSeconds / 60L);
             existing.LastUpdated = this.timeProvider.WallClockNow;
         }
         else
         {
-            this.db.UsageToday.Add(new UsageTodayDbEntity
+            db.UsageToday.Add(new UsageTodayDbEntity
             {
                 AppId = appId,
                 ServerDate = serverDate,
-                Minutes = deltaMinutes,
+                ElapsedSeconds = elapsedSeconds,
+                Minutes = (int)(elapsedSeconds / 60L),
                 LastUpdated = this.timeProvider.WallClockNow,
             });
         }
 
-        await this.db.SaveChangesAsync(ct);
+        await db.SaveChangesAsync(ct);
     }
 
     /// <summary>
@@ -156,15 +285,17 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task<UsageSnapshot> GetUsageSnapshotAsync(CancellationToken ct = default)
     {
-        var serverDate = this.timeProvider.ServerDate ?? DateOnly.FromDateTime(DateTime.UtcNow);
+        await using var db = this.dbContextFactory.CreateDbContext();
 
-        var usageRecords = await this.db.UsageToday
+        var serverDate = this.GetServerDate();
+
+        var usageRecords = await db.UsageToday
             .Where(u => u.ServerDate == serverDate)
             .AsNoTracking()
             .ToListAsync(ct);
 
         // Load category assignments from policy
-        var policyEntity = await this.db.Policies
+        var policyEntity = await db.Policies
             .AsNoTracking()
             .FirstOrDefaultAsync(ct);
 
@@ -183,7 +314,7 @@ public sealed class PolicyRepository : IPolicyRepository
         }
 
         // Load always_allowed apps
-        var alwaysAllowedApps = await this.db.AppPolicies
+        var alwaysAllowedApps = await db.AppPolicies
             .Where(a => a.State == "AlwaysAllowed")
             .Select(a => a.PackageName)
             .AsNoTracking()
@@ -201,13 +332,15 @@ public sealed class PolicyRepository : IPolicyRepository
 
         foreach (var record in usageRecords)
         {
-            appMinutes[record.AppId] = record.Minutes;
+            var elapsedSeconds = this.GetElapsedSeconds(record);
+            var appUsageMinutes = (int)(elapsedSeconds / 60L);
+            appMinutes[record.AppId] = appUsageMinutes;
 
             if (!exemptApps.Contains(record.AppId))
             {
                 if (categoryAssignments.TryGetValue(record.AppId, out var category))
                 {
-                    categoryMinutes[category] = categoryMinutes.GetValueOrDefault(category) + record.Minutes;
+                    categoryMinutes[category] = categoryMinutes.GetValueOrDefault(category) + appUsageMinutes;
                 }
             }
         }
@@ -228,12 +361,14 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task<int> GetAppUsageAsync(string appId, CancellationToken ct = default)
     {
-        var serverDate = this.timeProvider.ServerDate ?? DateOnly.FromDateTime(DateTime.UtcNow);
-        var record = await this.db.UsageToday
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var serverDate = this.GetServerDate();
+        var record = await db.UsageToday
             .AsNoTracking()
             .FirstOrDefaultAsync(u => u.AppId == appId && u.ServerDate == serverDate, ct);
 
-        return record?.Minutes ?? 0;
+        return record == null ? 0 : (int)this.GetElapsedSeconds(record);
     }
 
     // ── Outbox ─────────────────────────────────────────────────────────
@@ -248,7 +383,9 @@ public sealed class PolicyRepository : IPolicyRepository
         string dedupKey,
         CancellationToken ct = default)
     {
-        var existing = await this.db.Outbox
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var existing = await db.Outbox
             .FirstOrDefaultAsync(o => o.DedupKey == dedupKey, ct);
 
         if (existing != null)
@@ -257,7 +394,7 @@ public sealed class PolicyRepository : IPolicyRepository
             return;
         }
 
-        this.db.Outbox.Add(new OutboxDbEntity
+        db.Outbox.Add(new OutboxDbEntity
         {
             EventType = eventType,
             PayloadJson = payloadJson,
@@ -266,7 +403,7 @@ public sealed class PolicyRepository : IPolicyRepository
             CreatedAt = this.timeProvider.WallClockNow,
         });
 
-        await this.db.SaveChangesAsync(ct);
+        await db.SaveChangesAsync(ct);
     }
 
     /// <summary>
@@ -274,11 +411,16 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task<OutboxDbEntity[]> GetPendingOutboxEventsAsync(int maxCount = 50, CancellationToken ct = default)
     {
-        return await this.db.Outbox
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var entries = await db.Outbox
+            .ToListAsync(ct);
+
+        return entries
             .Where(o => o.Attempts < 5)
             .OrderBy(o => o.CreatedAt)
             .Take(maxCount)
-            .ToArrayAsync(ct);
+            .ToArray();
     }
 
     /// <summary>
@@ -286,11 +428,13 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task MarkOutboxSentAsync(int id, CancellationToken ct = default)
     {
-        var entity = await this.db.Outbox.FindAsync([id], ct);
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var entity = await db.Outbox.FindAsync([id], ct);
         if (entity != null)
         {
-            this.db.Outbox.Remove(entity);
-            await this.db.SaveChangesAsync(ct);
+            db.Outbox.Remove(entity);
+            await db.SaveChangesAsync(ct);
         }
     }
 
@@ -299,13 +443,15 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task MarkOutboxFailedAsync(int id, string error, CancellationToken ct = default)
     {
-        var entity = await this.db.Outbox.FindAsync([id], ct);
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var entity = await db.Outbox.FindAsync([id], ct);
         if (entity != null)
         {
             entity.Attempts++;
             entity.LastAttemptAt = this.timeProvider.WallClockNow;
             entity.LastError = error.Length > 500 ? error[..500] : error;
-            await this.db.SaveChangesAsync(ct);
+            await db.SaveChangesAsync(ct);
         }
     }
 
@@ -316,12 +462,15 @@ public sealed class PolicyRepository : IPolicyRepository
     /// </summary>
     public async Task<Grant[]> GetActiveGrantsAsync(DateTimeOffset now, CancellationToken ct = default)
     {
-        var entities = await this.db.Grants
-            .Where(g => g.GrantedAt <= now && now < g.ExpiresAt)
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var entities = await db.Grants
             .AsNoTracking()
             .ToListAsync(ct);
 
-        return entities.Select(e => new Grant
+        return entities
+            .Where(g => g.GrantedAt <= now && now < g.ExpiresAt)
+            .Select(e => new Grant
         {
             Id = e.GrantId,
             RequestId = e.RequestId,
@@ -339,26 +488,28 @@ public sealed class PolicyRepository : IPolicyRepository
     public async Task CleanupExpiredGrantsAsync(CancellationToken ct = default)
     {
         var now = this.timeProvider.WallClockNow;
-        var expired = await this.db.Grants
+        await using var db = this.dbContextFactory.CreateDbContext();
+
+        var expired = await db.Grants
             .Where(g => g.ExpiresAt <= now)
             .ToListAsync(ct);
 
         if (expired.Count > 0)
         {
-            this.db.Grants.RemoveRange(expired);
-            await this.db.SaveChangesAsync(ct);
+            db.Grants.RemoveRange(expired);
+            await db.SaveChangesAsync(ct);
         }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
 
-    private async Task SyncAppPoliciesAsync(Policy policy, CancellationToken ct)
+    private static async Task SyncAppPoliciesAsync(ControlParentalDbContext db, Policy policy, CancellationToken ct)
     {
         // Remove existing app policies for this device
-        var existing = await this.db.AppPolicies
+        var existing = await db.AppPolicies
             .Where(a => a.DeviceId == policy.DeviceId)
             .ToListAsync(ct);
-        this.db.AppPolicies.RemoveRange(existing);
+        db.AppPolicies.RemoveRange(existing);
 
         // Add new app policies
         foreach (var appPolicy in policy.AppPolicies)
@@ -367,8 +518,8 @@ public sealed class PolicyRepository : IPolicyRepository
                 ? JsonSerializer.Serialize(appPolicy.AllowedWindows)
                 : null;
 
-            this.db.AppPolicies.Add(new AppPolicyDbEntity
-            {
+                db.AppPolicies.Add(new AppPolicyDbEntity
+                {
                 DeviceId = policy.DeviceId,
                 PackageName = appPolicy.PackageName,
                 State = appPolicy.State.ToString(),
@@ -379,19 +530,19 @@ public sealed class PolicyRepository : IPolicyRepository
         }
     }
 
-    private async Task SyncGrantsAsync(Policy policy, CancellationToken ct)
+    private static async Task SyncGrantsAsync(ControlParentalDbContext db, Policy policy, CancellationToken ct)
     {
         // Remove existing grants for this device
-        var existing = await this.db.Grants
+        var existing = await db.Grants
             .Where(g => g.DeviceId == policy.DeviceId)
             .ToListAsync(ct);
-        this.db.Grants.RemoveRange(existing);
+        db.Grants.RemoveRange(existing);
 
         // Add new grants
         foreach (var grant in policy.Grants)
         {
-            this.db.Grants.Add(new GrantDbEntity
-            {
+                db.Grants.Add(new GrantDbEntity
+                {
                 DeviceId = policy.DeviceId,
                 GrantId = grant.Id,
                 RequestId = grant.RequestId,
@@ -402,5 +553,15 @@ public sealed class PolicyRepository : IPolicyRepository
                 Source = grant.Source.ToString(),
             });
         }
+    }
+
+    private DateOnly GetServerDate()
+    {
+        return this.timeProvider.ServerDate ?? DateOnly.FromDateTime(this.timeProvider.WallClockNow.UtcDateTime);
+    }
+
+    private long GetElapsedSeconds(UsageTodayDbEntity record)
+    {
+        return record.ElapsedSeconds > 0 ? record.ElapsedSeconds : record.Minutes * 60L;
     }
 }

@@ -6,22 +6,20 @@ namespace ControlParental.Service.Tests;
 
 using System.Reflection;
 using ControlParental.Domain;
+using FluentAssertions;
 using Moq;
 using Xunit;
 
 /// <summary>
-/// T20/A2 — coverage for the time-based backoff behavior of
-/// <see cref="ScheduledWorkService"/>. The previous counter-based backoff
-/// never decremented; these tests assert that with an injected clock, the
-/// backoff expires on its own when wall-clock time advances past the deadline.
+/// T20/A2 — clock-based eligibility coverage for <see cref="ScheduledWorkService"/>.
 /// </summary>
-public class ScheduledWorkServiceBackoffDecrementTests
+public class ScheduledWorkServiceBackoffDecrementTests : IDisposable
 {
+    private readonly MutableTimeProvider timeProvider;
     private readonly Mock<IBackendClient> mockBackendClient;
     private readonly Mock<IOutboxManager> mockOutboxManager;
     private readonly Mock<IUsageReconciler> mockUsageReconciler;
     private readonly Mock<IEnforcementLevelMonitor> mockEnforcementLevelMonitor;
-    private readonly Mock<ITimeProvider> mockTimeProvider;
     private readonly Mock<IServiceHealthMonitor> mockHealthMonitor;
     private readonly Mock<IServiceRecoveryManager> mockRecoveryManager;
     private readonly Mock<IPolicyRepository> mockPolicyRepository;
@@ -29,11 +27,11 @@ public class ScheduledWorkServiceBackoffDecrementTests
 
     public ScheduledWorkServiceBackoffDecrementTests()
     {
+        this.timeProvider = new MutableTimeProvider(new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero));
         this.mockBackendClient = new Mock<IBackendClient>();
         this.mockOutboxManager = new Mock<IOutboxManager>();
         this.mockUsageReconciler = new Mock<IUsageReconciler>();
         this.mockEnforcementLevelMonitor = new Mock<IEnforcementLevelMonitor>();
-        this.mockTimeProvider = new Mock<ITimeProvider>();
         this.mockHealthMonitor = new Mock<IServiceHealthMonitor>();
         this.mockRecoveryManager = new Mock<IServiceRecoveryManager>();
         this.mockPolicyRepository = new Mock<IPolicyRepository>();
@@ -41,65 +39,60 @@ public class ScheduledWorkServiceBackoffDecrementTests
         this.mockUsageReconciler.SetupGet(r => r.IsRunning).Returns(false);
         this.mockEnforcementLevelMonitor.SetupGet(m => m.CurrentLevel).Returns(EnforcementLevel.Standard);
         this.mockHealthMonitor.SetupGet(m => m.IsAgentHealthy).Returns(true);
-        this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
-
-        var now = new DateTimeOffset(2026, 7, 23, 12, 0, 0, TimeSpan.Zero);
-        this.mockTimeProvider.SetupGet(t => t.WallClockNow).Returns(now);
+        this.mockHealthMonitor.SetupGet(m => m.LastAgentHeartbeat).Returns(this.timeProvider.Now);
 
         this.service = new ScheduledWorkService(
             backendClient: this.mockBackendClient.Object,
             outboxManager: this.mockOutboxManager.Object,
             usageReconciler: this.mockUsageReconciler.Object,
             enforcementLevelMonitor: this.mockEnforcementLevelMonitor.Object,
-            timeProvider: this.mockTimeProvider.Object,
+            timeProvider: this.timeProvider,
             healthMonitor: this.mockHealthMonitor.Object,
             recoveryManager: this.mockRecoveryManager.Object,
             policyRepository: this.mockPolicyRepository.Object);
+
+        this.SetPrivateField("isRunning", true);
     }
 
-    [Fact]
-    public void InitialBackoff_IsZero_WhenNoFailureYet()
+    public void Dispose()
     {
-        var backoff = this.service.GetBackoffForTesting(ScheduledWorkService.WorkType.Heartbeat);
-
-        Assert.Equal(ScheduledWorkService.InitialBackoffSeconds, backoff);
+        this.service.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     [Fact]
-    public void ApplyBackoff_ThenAdvanceClock_BackoffExpires()
+    public void ShouldRun_WhenStarted_AndNoDeadline_ReturnsTrue()
+    {
+        this.GetNextEligibleAt(ScheduledWorkService.WorkType.Heartbeat).Should().Be(DateTimeOffset.MinValue);
+        this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ApplyBackoff_SetsDeadline_AndBlocksUntilClockPasses()
     {
         this.InvokePrivateVoid("ApplyBackoff", ScheduledWorkService.WorkType.Heartbeat);
 
-        var afterApply = this.service.GetBackoffForTesting(ScheduledWorkService.WorkType.Heartbeat);
-        Assert.Equal(2, afterApply);
+        this.GetBackoff(ScheduledWorkService.WorkType.Heartbeat).Should().Be(2);
+        this.GetNextEligibleAt(ScheduledWorkService.WorkType.Heartbeat)
+            .Should().Be(this.timeProvider.Now.AddSeconds(ScheduledWorkService.InitialBackoffSeconds));
+        this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat).Should().BeFalse();
 
+        this.timeProvider.Now = this.timeProvider.Now.AddMilliseconds(999);
+        this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat).Should().BeFalse();
+
+        this.timeProvider.Now = this.timeProvider.Now.AddMilliseconds(1);
+        this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ResetBackoff_ClearsDeadline_AfterSuccess()
+    {
+        this.InvokePrivateVoid("ApplyBackoff", ScheduledWorkService.WorkType.Heartbeat);
         this.InvokePrivateVoid("ResetBackoff", ScheduledWorkService.WorkType.Heartbeat);
 
-        var reset = this.service.GetBackoffForTesting(ScheduledWorkService.WorkType.Heartbeat);
-        Assert.Equal(ScheduledWorkService.InitialBackoffSeconds, reset);
-    }
-
-    [Fact]
-    public void ShouldRun_TrueBeforeBackoff_FalseDuringBackoff_TrueAfterDeadline()
-    {
-        this.SetPrivateField("isRunning", true);
-        this.SetBackoff(ScheduledWorkService.WorkType.Heartbeat, 1);
-
-        Assert.False(this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat));
-
-        this.SetBackoff(ScheduledWorkService.WorkType.Heartbeat, 0);
-
-        Assert.True(this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat));
-    }
-
-    [Fact]
-    public void ApplyBackoff_TracksLastFailureTime()
-    {
-        this.InvokePrivateVoid("ApplyBackoff", ScheduledWorkService.WorkType.Heartbeat);
-        Assert.Equal(2, this.service.GetBackoffForTesting(ScheduledWorkService.WorkType.Heartbeat));
-
-        this.InvokePrivateVoid("ApplyBackoff", ScheduledWorkService.WorkType.Heartbeat);
-        Assert.Equal(4, this.service.GetBackoffForTesting(ScheduledWorkService.WorkType.Heartbeat));
+        this.GetBackoff(ScheduledWorkService.WorkType.Heartbeat).Should().Be(ScheduledWorkService.InitialBackoffSeconds);
+        this.GetNextEligibleAt(ScheduledWorkService.WorkType.Heartbeat).Should().Be(DateTimeOffset.MinValue);
+        this.InvokeShouldRun(ScheduledWorkService.WorkType.Heartbeat).Should().BeTrue();
     }
 
     private bool InvokeShouldRun(ScheduledWorkService.WorkType workType)
@@ -124,16 +117,26 @@ public class ScheduledWorkServiceBackoffDecrementTests
         method!.Invoke(this.service, new object[] { workType });
     }
 
-    private void SetBackoff(ScheduledWorkService.WorkType workType, int value)
+    private int GetBackoff(ScheduledWorkService.WorkType workType)
     {
-        var field = typeof(ScheduledWorkService).GetField(
-            "backoffByWorkType",
+        var method = typeof(ScheduledWorkService).GetMethod(
+            "GetBackoffForTesting",
             BindingFlags.NonPublic | BindingFlags.Instance);
 
-        Assert.NotNull(field);
+        Assert.NotNull(method);
 
-        var backoffByWorkType = (Dictionary<ScheduledWorkService.WorkType, int>)field!.GetValue(this.service)!;
-        backoffByWorkType[workType] = value;
+        return (int)method!.Invoke(this.service, new object[] { workType })!;
+    }
+
+    private DateTimeOffset GetNextEligibleAt(ScheduledWorkService.WorkType workType)
+    {
+        var method = typeof(ScheduledWorkService).GetMethod(
+            "GetNextEligibleAtForTesting",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        Assert.NotNull(method);
+
+        return (DateTimeOffset)method!.Invoke(this.service, new object[] { workType })!;
     }
 
     private void SetPrivateField(string fieldName, bool value)
@@ -144,5 +147,33 @@ public class ScheduledWorkServiceBackoffDecrementTests
 
         Assert.NotNull(field);
         field!.SetValue(this.service, value);
+    }
+
+    private sealed class MutableTimeProvider : ITimeProvider
+    {
+        public MutableTimeProvider(DateTimeOffset now)
+        {
+            this.Now = now;
+        }
+
+        public DateTimeOffset Now { get; set; }
+
+        public long MonotonicNow => 0;
+
+        public DateTimeOffset WallClockNow => this.Now;
+
+        public TimeZoneInfo CurrentZone => TimeZoneInfo.Utc;
+
+        public DateOnly? ServerDate => null;
+
+        public bool IsServerDateUncertain => false;
+
+        public event EventHandler<TimeChangedEventArgs>? TimeChanged;
+
+        public void SetServerDate(long offsetMs)
+        {
+        }
+
+        public bool DetectClockJump() => false;
     }
 }

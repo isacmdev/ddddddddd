@@ -16,29 +16,53 @@
             in the canonical Strings/{es,en-US}/Strings.resw catalog
             (design.md Â§10, ADR-007).
         -->
-        <Grid Grid.Row="0" Margin="24,16,24,8">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
+        <StackPanel Grid.Row="0" Margin="24,16,24,8" Spacing="12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
 
-            <TextBlock
-                Grid.Column="0"
-                Text="{x:Bind Strings.ProtectionActiveOverlay, Mode=OneTime}"
-                FontSize="20"
-                FontWeight="SemiBold"
-                Foreground="#0078D4"
-                VerticalAlignment="Center" />
+                <TextBlock
+                    Grid.Column="0"
+                    Text="{x:Bind Strings.ProtectionActiveOverlay, Mode=OneTime}"
+                    FontSize="20"
+                    FontWeight="SemiBold"
+                    Foreground="#0078D4"
+                    VerticalAlignment="Center" />
 
-            <ProgressBar
-                Grid.Column="1"
-                Width="180"
-                Height="8"
-                Minimum="0"
-                Maximum="4"
-                Value="{x:Bind ViewModel.ProgressCount, Mode=OneWay}"
-                Foreground="#0078D4" />
-        </Grid>
+                <ProgressBar
+                    Grid.Column="1"
+                    Width="180"
+                    Height="8"
+                    Minimum="0"
+                    Maximum="4"
+                    Value="{x:Bind ViewModel.ProgressCount, Mode=OneWay}"
+                    Foreground="#0078D4" />
+            </Grid>
+
+                <Border
+                Background="#FFF3F3"
+                CornerRadius="4"
+                Padding="12"
+                Visibility="{x:Bind ViewModel.ErrorVisibility, Mode=OneWay}">
+                <StackPanel Orientation="Horizontal" Spacing="12">
+                    <TextBlock
+                        Text="{x:Bind ViewModel.ErrorMessage, Mode=OneWay}"
+                        TextWrapping="Wrap"
+                        Foreground="#D13438"
+                        VerticalAlignment="Center"
+                        HorizontalAlignment="Stretch"
+                        Margin="0,0,8,0" />
+                    <Button Content="Retry" HorizontalAlignment="Right" />
+                </StackPanel>
+            </Border>
+            <Button
+                Content="Register notifications"
+                Click="OnWnsRegistrationRequested"
+                AutomationProperties.AutomationId="WnsRegistrationNavigationButton"
+                HorizontalAlignment="Left" />
+        </StackPanel>
 
         <!--
             Routed page host — T26 PR #11 / Unit 2 (ADR-006).

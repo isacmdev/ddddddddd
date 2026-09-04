@@ -12,6 +12,7 @@ public sealed class RealtimeChannelAdapter : Domain.IRealtimeChannel
 {
     private readonly Supabase.Realtime.RealtimeChannel channel;
     private readonly Supabase.Realtime.RealtimeBroadcast<Supabase.Realtime.Models.BaseBroadcast> broadcast;
+    private readonly Func<Task>? ensureConnected;
     private bool disposed;
 
     /// <summary>
@@ -21,18 +22,33 @@ public sealed class RealtimeChannelAdapter : Domain.IRealtimeChannel
     /// <param name="broadcast">The broadcast handler for this channel.</param>
     public RealtimeChannelAdapter(
         Supabase.Realtime.RealtimeChannel channel,
-        Supabase.Realtime.RealtimeBroadcast<Supabase.Realtime.Models.BaseBroadcast> broadcast)
+        Supabase.Realtime.RealtimeBroadcast<Supabase.Realtime.Models.BaseBroadcast> broadcast,
+        Func<Task>? ensureConnected = null)
     {
         this.channel = channel;
         this.broadcast = broadcast;
+        this.ensureConnected = ensureConnected;
         this.broadcast.AddBroadcastEventHandler(this.OnBroadcast);
     }
+
+    /// <summary>
+    /// Gets the exact backend topic to which this adapter is bound.
+    /// </summary>
+    public string Topic => this.channel.Topic;
 
     /// <inheritdoc />
     public bool IsSubscribed => !this.disposed && this.channel.IsSubscribed;
 
     /// <inheritdoc />
-    public Task SubscribeAsync() => this.channel.Subscribe();
+    public async Task SubscribeAsync()
+    {
+        if (this.ensureConnected is not null)
+        {
+            await this.ensureConnected().ConfigureAwait(false);
+        }
+
+        await this.channel.Subscribe().ConfigureAwait(false);
+    }
 
     /// <inheritdoc />
     public void Unsubscribe() => this.channel.Unsubscribe();

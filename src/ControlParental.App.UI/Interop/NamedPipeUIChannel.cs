@@ -13,6 +13,7 @@ namespace ControlParental.App.UI.Interop;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
+using ControlParental.Domain;
 
 /// <summary>
 /// T26 — Named pipe client for IPC between App.UI and Service.
@@ -24,6 +25,26 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
     private const string PipeName = "ControlParental.UI";
     private const int TimeoutMs = 5000;
     private const int BufferSize = 65536;
+    private readonly Func<IUITransport> transportFactory;
+    private readonly TimeSpan timeout;
+
+    public NamedPipeUIChannel()
+        : this(
+            static () => new NamedPipeUITransport(PipeName),
+            TimeSpan.FromMilliseconds(TimeoutMs))
+    {
+    }
+
+    internal NamedPipeUIChannel(string pipeName, TimeSpan timeout)
+        : this(() => new NamedPipeUITransport(pipeName), timeout)
+    {
+    }
+
+    internal NamedPipeUIChannel(Func<IUITransport> transportFactory, TimeSpan timeout)
+    {
+        this.transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
+        this.timeout = timeout;
+    }
 
     /// <summary>
     /// Queries the Service with a request and waits for a response.
@@ -45,17 +66,16 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
                 connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 connectCts.CancelAfter(TimeoutMs);
 
-                using var pipe = new NamedPipeClientStream(
-                    ".",
-                    PipeName,
-                    PipeDirection.InOut,
-                    PipeOptions.Asynchronous);
+                using var pipe = this.transportFactory();
 
-                await pipe.ConnectAsync(TimeoutMs, connectCts.Token).ConfigureAwait(false);
+                await pipe.ConnectAsync(this.timeout, connectCts.Token).ConfigureAwait(false);
 
                 // Send query — T26 PR #14 source-gen dispatch by runtime type
                 // (same approach as the Service-side NamedPipeUIServer).
-                var queryTypeInfo = UIMessagesJsonContext.Default.GetTypeInfo(query.GetType())!;
+                var queryTypeInfo = query is ControlParental.Domain.IUIMessage
+                    && query.GetType().Assembly == typeof(RegisterWnsChannel).Assembly
+                    ? ControlParental.Domain.UIMessagesJsonContext.Default.GetTypeInfo(query.GetType())!
+                    : UIMessagesJsonContext.Default.GetTypeInfo(query.GetType())!;
                 var json = JsonSerializer.Serialize(query, queryTypeInfo);
                 var bytes = Encoding.UTF8.GetBytes(json);
                 await pipe.WriteAsync(bytes, connectCts.Token).ConfigureAwait(false);
@@ -69,7 +89,9 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
                 }
 
                 var responseJson = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                var responseTypeInfo = UIMessagesJsonContext.Default.GetTypeInfo(typeof(TResponse))!;
+                var responseTypeInfo = typeof(TResponse).Assembly == typeof(RegisterWnsChannel).Assembly
+                    ? ControlParental.Domain.UIMessagesJsonContext.Default.GetTypeInfo(typeof(TResponse))!
+                    : UIMessagesJsonContext.Default.GetTypeInfo(typeof(TResponse))!;
                 var response = JsonSerializer.Deserialize(responseJson, responseTypeInfo) as TResponse;
                 return response;
             }
@@ -78,9 +100,9 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
                 connectCts?.Dispose();
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // Timeout or cancellation
+            // The channel timeout is an unavailable Service response.
             return null;
         }
         catch (IOException)
@@ -103,18 +125,16 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A task that completes when the message has been written.</returns>
     public async Task SendAsync<T>(T message, CancellationToken ct = default)
-        where T : IUIMessage
+        where T : ControlParental.Domain.IUIMessage
     {
-        using var pipe = new NamedPipeClientStream(
-            ".",
-            PipeName,
-            PipeDirection.InOut,
-            PipeOptions.Asynchronous);
+        using var pipe = this.transportFactory();
 
-        await pipe.ConnectAsync(TimeoutMs, ct).ConfigureAwait(false);
+        await pipe.ConnectAsync(this.timeout, ct).ConfigureAwait(false);
 
         // T26 PR #14 — source-gen dispatch by runtime type via UIMessagesJsonContext.
-        var typeInfo = UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())!;
+        var typeInfo = message.GetType().Assembly == typeof(RegisterWnsChannel).Assembly
+            ? ControlParental.Domain.UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())!
+            : UIMessagesJsonContext.Default.GetTypeInfo(message.GetType())!;
         var json = JsonSerializer.Serialize(message, typeInfo);
         var bytes = Encoding.UTF8.GetBytes(json);
         await pipe.WriteAsync(bytes, ct).ConfigureAwait(false);
@@ -126,4 +146,38 @@ public sealed class NamedPipeUIChannel : IUIChannel, IDisposable
     public void Dispose()
     {
     }
+}
+
+internal interface IUITransport : IDisposable
+{
+    Task ConnectAsync(TimeSpan timeout, CancellationToken cancellationToken);
+
+    Task WriteAsync(byte[] buffer, CancellationToken cancellationToken);
+
+    Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
+}
+
+internal sealed class NamedPipeUITransport : IUITransport
+{
+    private readonly NamedPipeClientStream pipe;
+
+    public NamedPipeUITransport(string pipeName)
+    {
+        this.pipe = new NamedPipeClientStream(
+            ".",
+            pipeName,
+            PipeDirection.InOut,
+            PipeOptions.Asynchronous);
+    }
+
+    public Task ConnectAsync(TimeSpan timeout, CancellationToken cancellationToken)
+        => this.pipe.ConnectAsync(timeout, cancellationToken);
+
+    public Task WriteAsync(byte[] buffer, CancellationToken cancellationToken)
+        => this.pipe.WriteAsync(buffer, cancellationToken).AsTask();
+
+    public Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
+        => this.pipe.ReadAsync(buffer, cancellationToken).AsTask();
+
+    public void Dispose() => this.pipe.Dispose();
 }

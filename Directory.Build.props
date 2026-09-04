@@ -25,7 +25,7 @@
     <PublishSingleFile Condition="'$(Configuration)' == 'Release'">false</PublishSingleFile>
     <SelfContained Condition="'$(Configuration)' == 'Release'">true</SelfContained>
     <PublishReadyToRun Condition="'$(Configuration)' == 'Release'">true</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Release'">false</PublishTrimmed>
+    <PublishTrimmed Condition="'$(Configuration)' == 'Release' and '$(PublishAot)' != 'true'">false</PublishTrimmed>
 
     <!-- Platform -->
     <PlatformTarget>AnyCPU</PlatformTarget>

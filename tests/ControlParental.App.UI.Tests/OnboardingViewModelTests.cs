@@ -37,12 +37,16 @@ public sealed class OnboardingViewModelTests
     [Fact]
     public async Task InitializeAsync_ReadsSnapshotPersistedByClient()
     {
-        // The IPC client is the single source of truth: the VM picks up the
-        // pairing-Completed snapshot the fake exposes (no local cache).
+        // The IPC client is the single source of truth: completion and route
+        // advancement are separate Service-owned transitions.
         var client = new FakeIpcOnboardingStateService();
         var viewModel = new OnboardingViewModel(client);
 
-        await client.CompleteOnboardingStepAsync("pairing").ConfigureAwait(false);
+        var completed = await client.CompleteOnboardingStepAsync("pairing").ConfigureAwait(false);
+        Assert.Equal(0, completed.CurrentStepIndex);
+        Assert.Equal(OnboardingStepStatus.Completed, completed.Steps[0].Status);
+
+        await client.AdvanceOnboardingStepAsync().ConfigureAwait(false);
         await viewModel.InitializeAsync().ConfigureAwait(false);
 
         Assert.NotNull(viewModel.CurrentStep);
@@ -86,7 +90,7 @@ public sealed class OnboardingViewModelTests
 
         await viewModel.InitializeAsync().ConfigureAwait(false);
 
-        Assert.Equal("ProtecciÃ³n 0 de 4", viewModel.ProgressLabel);
+        Assert.Equal("Protección 0 de 4", viewModel.ProgressLabel);
         Assert.Equal(0, viewModel.ProgressCount);
     }
 

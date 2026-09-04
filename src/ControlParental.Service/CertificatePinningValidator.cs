@@ -137,7 +137,7 @@ public static class CertificatePinningValidator
                 System.Text.Encoding.ASCII.GetBytes(expectedPin)))
         {
             throw new CertificatePinValidationException(
-                $"Certificate pin mismatch. Expected SPKI pin: {expectedPin}, computed: {computedPin}");
+                "Certificate pin mismatch. Connection rejected.");
         }
 
         return true;

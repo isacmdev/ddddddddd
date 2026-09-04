@@ -4,6 +4,7 @@
 
 namespace ControlParental.SessionAgent.Tests;
 
+using ControlParental.Domain;
 using Xunit;
 
 /// <summary>
@@ -17,9 +18,12 @@ public class ForegroundWatcherTests
     private sealed class FakeForegroundWatcher : IForegroundWatcher
     {
         public string? CurrentAppId { get; set; }
+        public ObservedProcessTarget? CurrentTarget { get; set; }
+        public bool IsStarted { get; private set; }
         public event Action<string>? ForegroundChanged;
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
+            this.IsStarted = true;
             return Task.CompletedTask;
         }
 
@@ -167,7 +171,7 @@ public class ForegroundWatcherTests
         await watcher.StartAsync(cts.Token);
 
         // Assert
-        Assert.True(true); // No exception
+        Assert.True(watcher.IsStarted);
     }
 
     // ── AppId format ─────────────────────────────────────────────────
@@ -212,5 +216,54 @@ public class ForegroundWatcherTests
             Assert.DoesNotContain(" ", appId); // No window title with spaces
             Assert.StartsWith(appId, appId); // Just package/process name
         }
+    }
+
+    [Fact]
+    public void ObservationKeepsCanonicalAppIdSeparateFromExactProcessTarget()
+    {
+        const string AppId = "publisher|family|canonical";
+        var startedAt = new DateTimeOffset(2026, 8, 10, 12, 0, 0, TimeSpan.Zero);
+
+        var observation = ForegroundWatcher.CreateObservation(AppId, 42, 4, startedAt);
+
+        Assert.Equal(AppId, observation.AppId);
+        Assert.Equal(new ObservedProcessTarget(42, 4, startedAt), observation.Target);
+    }
+
+    [Fact]
+    public void ExactTargetIsReturnedOnlyForItsCanonicalAppObservation()
+    {
+        IForegroundWatcher watcher = new FakeForegroundWatcher
+        {
+            CurrentAppId = "current-app",
+            CurrentTarget = new ObservedProcessTarget(42, 4, DateTimeOffset.UtcNow),
+        };
+
+        Assert.Equal(watcher.CurrentTarget, watcher.GetCurrentTarget("current-app"));
+        Assert.Null(watcher.GetCurrentTarget("stale-app"));
+    }
+
+    [Fact]
+    public void ObservationIdentityUsesOrdinalCanonicalAppIdAndExactTarget()
+    {
+        var startedAt = new DateTimeOffset(2026, 8, 10, 12, 0, 0, TimeSpan.Zero);
+        var current = ForegroundWatcher.CreateObservation(
+            "Publisher|Canonical-App",
+            42,
+            4,
+            startedAt);
+
+        Assert.False(ForegroundWatcher.ShouldPublishObservation(
+            current.AppId,
+            current.Target,
+            current));
+        Assert.True(ForegroundWatcher.ShouldPublishObservation(
+            current.AppId,
+            current.Target,
+            current with { AppId = "publisher|canonical-app" }));
+        Assert.True(ForegroundWatcher.ShouldPublishObservation(
+            current.AppId,
+            current.Target,
+            current with { Target = current.Target! with { ProcessId = 43 } }));
     }
 }

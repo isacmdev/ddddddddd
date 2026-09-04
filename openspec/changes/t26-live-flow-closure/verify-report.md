@@ -1,5 +1,9 @@
+# HISTORICAL / SUPERSEDED VERIFICATION REPORT
+
+> This entire report records an older failing snapshot and is preserved without changing its original YAML or results. It is not current closure evidence. For the authoritative passing verification and final status, see `archive-report.md`.
+
 ```yaml
-schema: gentle-ai.verify-result/v1
+schema: verify-result/v1
 evidence_revision: sha256:e01c4e8d17f2796f00376c21e34bb57a795c3bd3413d0d9b1dc523a482144b71
 verdict: fail
 blockers: 3

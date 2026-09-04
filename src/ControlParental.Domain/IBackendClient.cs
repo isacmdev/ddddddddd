@@ -138,6 +138,9 @@ public class PushTokenRegistrationResult
     /// </summary>
     public string? ErrorMessage { get; init; }
 
+    /// <summary>Gets the credential-free failure category.</summary>
+    public PushTokenRegistrationFailureKind FailureKind { get; init; }
+
     /// <summary>
     /// Crea un resultado exitoso.
     /// </summary>
@@ -147,8 +150,20 @@ public class PushTokenRegistrationResult
     /// <summary>
     /// Crea un resultado de error.
     /// </summary>
-    public static PushTokenRegistrationResult Failed(string error)
-        => new() { Success = false, ErrorMessage = error };
+    public static PushTokenRegistrationResult Failed(
+        string error,
+        PushTokenRegistrationFailureKind failureKind = PushTokenRegistrationFailureKind.RemoteUnavailable)
+        => new() { Success = false, ErrorMessage = error, FailureKind = failureKind };
+}
+
+/// <summary>Redacted push-token failure categories used by Service orchestration.</summary>
+public enum PushTokenRegistrationFailureKind
+{
+    None,
+    RemoteUnavailable,
+    Revoked,
+    Forbidden,
+    RateLimited,
 }
 
 /// <summary>
@@ -171,6 +186,8 @@ public sealed record PairingRequest(
 /// <summary>
 /// T14 — Interfaz para el cliente del backend de Supabase.
 /// Consume el contrato documentado en T14.
+/// Implementations authorize only definitive identity generations and own their bounded retry policy.
+/// Callers must not inject bearer credentials or add an overlapping retry loop.
 /// </summary>
 public interface IBackendClient
 {
@@ -260,13 +277,6 @@ public interface IBackendClient
         IntegrityReport report,
         CancellationToken cancellationToken = default);
 
-    /// <summary>
-    /// Empareja el dispositivo con un padre.
-    /// </summary>
-    /// <param name="request">Request de emparejamiento.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>Resultado del emparejamiento.</returns>
-    Task<PairingHttpResult> PairAsync(PairingRequest request, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -274,7 +284,7 @@ public interface IBackendClient
 /// </summary>
 /// <param name="Success">Indica si el reporte se envió exitosamente.</param>
 /// <param name="Verdict">Veredicto del servidor: "trust", "revoked", o "unknown".</param>
-public sealed record IntegrityReportResult(bool Success, string? Verdict);
+public sealed record IntegrityReportResult(bool Success, string? Verdict, bool IsInvalidEnvelope = false);
 
 /// <summary>
 /// Entrada de log de uso.
@@ -399,6 +409,18 @@ public class TimeRequestEntry
     /// ID de la solicitud.
     /// </summary>
     public required string RequestId { get; init; }
+
+    /// <summary>Stable wire scope; never inferred by a transport caller.</summary>
+    public string? Scope { get; init; }
+
+    /// <summary>Origin of the request on the wire.</summary>
+    public string? Origin { get; init; }
+
+    /// <summary>Policy version observed when the request was created.</summary>
+    public ulong? PolicyVersion { get; init; }
+
+    /// <summary>Informational device identity carried by the wire request.</summary>
+    public Guid? DeviceId { get; init; }
 
     /// <summary>
     /// Minutos solicitados.

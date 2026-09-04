@@ -14,6 +14,9 @@ using System.Diagnostics;
 /// </summary>
 public sealed class ProcessTerminator : IProcessTerminator
 {
+    private readonly Func<int, IExactProcessHandle> openProcess;
+    private readonly TimeSpan gracefulCloseTimeout;
+
     // Procesos del sistema que NUNCA deben ser terminados
     private static readonly HashSet<string> SystemProcessNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -62,28 +65,83 @@ public sealed class ProcessTerminator : IProcessTerminator
         "conhost",
     };
 
+    public ProcessTerminator()
+        : this(pid => new SystemProcessHandle(Process.GetProcessById(pid)), TimeSpan.FromSeconds(3))
+    {
+    }
+
+    public ProcessTerminator(IExactProcessHandle process)
+        : this(_ => process, TimeSpan.FromSeconds(3))
+    {
+    }
+
+    public ProcessTerminator(IExactProcessHandle process, TimeSpan gracefulCloseTimeout)
+        : this(_ => process, gracefulCloseTimeout)
+    {
+    }
+
+    private ProcessTerminator(Func<int, IExactProcessHandle> openProcess, TimeSpan gracefulCloseTimeout)
+    {
+        this.openProcess = openProcess;
+        this.gracefulCloseTimeout = gracefulCloseTimeout;
+    }
+
     /// <inheritdoc />
     public async Task<bool> TerminateAsync(
         string appId,
         string reason,
         CancellationToken cancellationToken = default)
     {
-        if (!this.CanTerminate(appId))
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Cannot terminate protected process: {appId}");
-            return false;
-        }
+        await Task.CompletedTask;
+        return false;
+    }
 
-        var pid = this.GetProcessId(appId);
-        if (!pid.HasValue)
+    public async Task<ActionStatus> TerminateAsync(
+        ObservedProcessTarget target,
+        CancellationToken cancellationToken = default)
+    {
+        try
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Process not found for AppId: {appId}");
-            return false;
-        }
+            using var process = this.openProcess(target.ProcessId);
+            if (process.HasExited)
+            {
+                return ActionStatus.HarmlessAbsence;
+            }
 
-        return await this.TerminateProcessByIdAsync(pid.Value, reason, cancellationToken);
+            var identity = process.ReadIdentity();
+            if (identity.ProcessId != target.ProcessId || identity.SessionId != target.SessionId ||
+                identity.StartedAt != target.StartedAt || !this.CanTerminate(identity.ProcessName))
+            {
+                return ActionStatus.InvalidTarget;
+            }
+
+            process.CloseMainWindow();
+            using var grace = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            grace.CancelAfter(this.gracefulCloseTimeout);
+            try
+            {
+                await process.WaitForExitAsync(grace.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                identity = process.ReadIdentity();
+                if (identity.ProcessId != target.ProcessId || identity.SessionId != target.SessionId ||
+                    identity.StartedAt != target.StartedAt)
+                {
+                    return ActionStatus.InvalidTarget;
+                }
+
+                process.Kill();
+                await process.WaitForExitAsync(cancellationToken);
+            }
+
+            return ActionStatus.Confirmed;
+        }
+        catch (UnauthorizedAccessException) { return ActionStatus.AccessDenied; }
+        catch (ArgumentException) { return ActionStatus.HarmlessAbsence; }
+        catch (InvalidOperationException) { return ActionStatus.HarmlessAbsence; }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return ActionStatus.NativeFailure; }
     }
 
     /// <inheritdoc />
@@ -148,53 +206,4 @@ public sealed class ProcessTerminator : IProcessTerminator
         }
     }
 
-    private async Task<bool> TerminateProcessByIdAsync(
-        int pid,
-        string reason,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(pid);
-
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Terminating process {pid} ({process.ProcessName}): {reason}");
-
-            // Give the process a chance to close gracefully
-            try
-            {
-                process.CloseMainWindow();
-                if (!process.WaitForExit(3000))
-                {
-                    // Force terminate if it doesn't close in 3 seconds
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch (InvalidOperationException)
-            {
-                // Process already exited
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ProcessTerminator] Process {pid} already exited.");
-                return true;
-            }
-
-            await process.WaitForExitAsync(cancellationToken);
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Process {pid} terminated successfully.");
-            return true;
-        }
-        catch (ArgumentException)
-        {
-            // Process no longer exists
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Process {pid} not found (already exited).");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[ProcessTerminator] Error terminating process {pid}: {ex.Message}");
-            return false;
-        }
-    }
 }

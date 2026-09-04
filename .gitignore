@@ -36,3 +36,7 @@ secrets.json
 DvlErrLog.txt
 .atl/
 *.csproj.user
+
+# Python test/cache artifacts
+__pycache__/
+*.py[cod]

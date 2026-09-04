@@ -6,10 +6,10 @@ namespace ControlParental.App.UI;
 
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Windows.ApplicationModel.DynamicDependency;
+using Microsoft.Windows.ApplicationModel.WindowsAppRuntime;
 using Microsoft.UI.Xaml;
 using ControlParental.App.UI.Interop;
 using ControlParental.Domain;
@@ -31,6 +31,7 @@ public partial class App : Application
     private static IServiceProvider? serviceProvider;
     private static OnboardingViewModel? viewModel;
     private static Microsoft.UI.Xaml.Window? mainWindow;
+    private static bool realtimeLifetimeStarted;
 
     /// <summary>
     /// Gets the service provider for DI.
@@ -99,11 +100,14 @@ public partial class App : Application
             mainWindow = new MainWindow(viewModel!);
             Log("MainWindow created, activating...");
             mainWindow.Activate();
+            _ = StartRealtimeLifetimeAsync().ContinueWith(
+                task => Log($"Realtime startup failed: {task.Exception?.GetBaseException().Message}"),
+                TaskScheduler.Default);
             Log("MainWindow activated OK");
         }
         catch (Exception ex)
         {
-            Log($"MainWindow FAILED: {ex.GetType().Name}: {ex.Message}");
+            Log($"MainWindow FAILED: {FormatMainWindowStartupException(ex)}");
 
             // T26 fallback: show a simple window so user sees something
             try
@@ -117,6 +121,9 @@ public partial class App : Application
                 };
                 fallback.Activate();
                 mainWindow = fallback;
+                _ = StartRealtimeLifetimeAsync().ContinueWith(
+                task => Log($"Realtime startup failed: {task.Exception?.GetBaseException().Message}"),
+                TaskScheduler.Default);
                 Log("Fallback window shown");
             }
             catch (Exception ex2)
@@ -125,60 +132,6 @@ public partial class App : Application
             }
         }
 
-        // T26: WinUI 3 unpackaged needs a Win32 message pump on the UI thread so
-        // OnLaunched returning doesn't terminate the process. PeekMessage doesn't
-        // block, allowing the XAML DispatcherQueue to also process.
-        RunMessageLoop();
-    }
-
-    [DllImport("user32.dll")]
-    private static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-
-    [DllImport("user32.dll")]
-    private static extern bool TranslateMessage([In] ref MSG lpMsg);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MSG
-    {
-        public IntPtr hwnd;
-        public uint message;
-        public IntPtr wParam;
-        public IntPtr lParam;
-        public uint time;
-        public POINT pt;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT
-    {
-        public int x;
-        public int y;
-    }
-
-    private static void RunMessageLoop()
-    {
-        Log("Starting message loop");
-        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(mainWindow);
-        var msg = new MSG();
-
-        // GetMessage blocks — this is the correct pattern for WinUI 3 unpackaged.
-        // The blocking loop keeps the UI thread alive so the XAML DispatcherQueue
-        // can process render and input messages.
-        while (GetMessage(out msg, hwnd, 0, 0) != 0)
-        {
-            if (msg.message == 0x0012) // WM_QUIT
-            {
-                break;
-            }
-
-            TranslateMessage(ref msg);
-            DispatchMessage(ref msg);
-        }
-
-        Log("Message loop exited");
     }
 
     private static void ConfigureServices(IServiceCollection services)
@@ -189,6 +142,27 @@ public partial class App : Application
         // of truth (ADR-002).
         services.AddSingleton<IUIChannel, NamedPipeUIChannel>();
         services.AddSingleton<IIpcOnboardingStateService, IpcOnboardingStateService>();
+        services.AddSingleton<IUIPipeClient, NamedPipeUIAdapter>();
+        services.AddSingleton<WindowLifecycleObserver>();
+        services.AddSingleton<IWindowLifecycleObserver>(sp => sp.GetRequiredService<WindowLifecycleObserver>());
+        services.AddSingleton<RealtimeIdentityBridge>();
+        services.AddSingleton<IRealtimeIdentityAuthority>(sp => sp.GetRequiredService<RealtimeIdentityBridge>());
+        services.AddSingleton<SupabaseRealtimeChannels>(sp =>
+            SupabaseRealtimeComposition.CreateFromEnvironment(
+                sp.GetRequiredService<IRealtimeIdentityAuthority>()));
+        services.AddSingleton<IRealtimeSubscriber>(sp =>
+        {
+            var channels = sp.GetRequiredService<SupabaseRealtimeChannels>();
+            var identityAuthority = sp.GetRequiredService<IRealtimeIdentityAuthority>();
+            return new RealtimeSubscriber(
+                channels.Policy,
+                channels.Grants,
+                sp.GetRequiredService<IWindowLifecycleObserver>(),
+                channels.DeviceId ?? string.Empty,
+                sp.GetRequiredService<IUIChannel>(),
+                identityAuthority);
+        });
+        services.AddSingleton<StatusViewModel>();
 
         // T26 PR #14 / Unit 2 — IPC-backed consent service. The App.UI never
         // writes a local consent cache; the Service persists the canonical
@@ -199,5 +173,141 @@ public partial class App : Application
         // owns a local stub; the canonical snapshot comes from the Service over
         // the same UI pipe.
         services.AddSingleton<IEnforcementLevelMonitor, ServiceEnforcementLevelMonitor>();
+        services.AddSingleton<IWnsRegistrationPort, WnsPushNotificationHandler>();
+        services.AddSingleton<WnsPushNotificationHandler>(serviceProvider =>
+            (WnsPushNotificationHandler)serviceProvider.GetRequiredService<IWnsRegistrationPort>());
+        services.AddSingleton<IWnsChannelProvider>(serviceProvider =>
+            serviceProvider.GetRequiredService<WnsPushNotificationHandler>());
+        services.AddSingleton<WnsRegistrationViewModel>();
+        services.AddTransient<WnsRegistrationPage>();
+    }
+
+    private static async Task StartRealtimeLifetimeAsync()
+    {
+        if (realtimeLifetimeStarted || mainWindow is null || serviceProvider is null)
+        {
+            return;
+        }
+
+        await serviceProvider.GetRequiredService<RealtimeIdentityBridge>().StartAsync();
+        var identityBridge = serviceProvider.GetRequiredService<RealtimeIdentityBridge>();
+        var identityDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (identityBridge.Current is null && DateTimeOffset.UtcNow < identityDeadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+        }
+        var lifecycle = serviceProvider.GetRequiredService<WindowLifecycleObserver>();
+        var subscriber = serviceProvider.GetRequiredService<IRealtimeSubscriber>();
+        var statusViewModel = serviceProvider.GetRequiredService<StatusViewModel>();
+        realtimeLifetimeStarted = true;
+        mainWindow.Activated += OnMainWindowActivated;
+        mainWindow.Closed += (_, _) =>
+        {
+            mainWindow.Activated -= OnMainWindowActivated;
+            lifecycle.EnterBackground();
+            subscriber.Dispose();
+            statusViewModel.Dispose();
+            _ = DisposeRealtimeLifetimeAsync(subscriber, serviceProvider);
+        };
+        lifecycle.EnterForeground();
+        _ = InitializeStatusAsync(statusViewModel);
+    }
+
+    private static void OnMainWindowActivated(
+        object sender,
+        WindowActivatedEventArgs args)
+    {
+        _ = sender;
+        if (serviceProvider is null)
+        {
+            return;
+        }
+
+        var lifecycle = serviceProvider.GetRequiredService<WindowLifecycleObserver>();
+        if (args.WindowActivationState == WindowActivationState.Deactivated)
+        {
+            lifecycle.EnterBackground();
+        }
+        else
+        {
+            lifecycle.EnterForeground();
+        }
+    }
+
+    private static async Task InitializeStatusAsync(StatusViewModel statusViewModel)
+    {
+        try
+        {
+            await statusViewModel.InitializeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Log($"Realtime status initialization failed: {exception.Message}");
+        }
+    }
+
+    private static async Task DisposeRealtimeLifetimeAsync(
+        IRealtimeSubscriber subscriber,
+        IServiceProvider provider)
+    {
+        try
+        {
+            if (subscriber is RealtimeSubscriber realtimeSubscriber)
+            {
+                await realtimeSubscriber.LifecycleTask;
+            }
+            await provider.GetRequiredService<RealtimeIdentityBridge>().StopAsync();
+        }
+        finally
+        {
+            (provider as IDisposable)?.Dispose();
+        }
+    }
+
+    private static string FormatMainWindowStartupException(Exception exception)
+        => FormatStartupException(exception, "XamlFile=MainWindow.xaml TargetType=MainWindow ResourceKey=PageHost");
+
+    private static string FormatStartupException(Exception exception, string? xamlContext = null)
+    {
+        var details = new System.Text.StringBuilder();
+        if (!string.IsNullOrWhiteSpace(xamlContext))
+        {
+            details.Append(xamlContext);
+            details.Append(' ');
+        }
+
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (details.Length > 0)
+            {
+                details.Append(" | Inner: ");
+            }
+
+            details.Append(current.GetType().Name);
+            details.Append(": ");
+            details.Append(current.Message);
+            details.Append(" HResult=0x");
+            details.Append(current.HResult.ToString("X8", System.Globalization.CultureInfo.InvariantCulture));
+
+            AppendXamlLocation(details, current);
+        }
+
+        return details.ToString();
+    }
+
+    private static void AppendXamlLocation(System.Text.StringBuilder details, Exception exception)
+    {
+        var type = exception.GetType();
+        foreach (var propertyName in new[] { "LineNumber", "LinePosition" })
+        {
+            var property = type.GetProperty(propertyName);
+            if (property?.GetValue(exception) is int value && value >= 0)
+            {
+                details.Append(' ');
+                details.Append(propertyName);
+                details.Append('=');
+                details.Append(value);
+            }
+        }
     }
 }

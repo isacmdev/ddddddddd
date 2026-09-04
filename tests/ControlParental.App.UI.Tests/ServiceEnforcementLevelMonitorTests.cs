@@ -176,8 +176,8 @@ public sealed class ServiceEnforcementLevelMonitorTests
         }
 
         public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
-            where TQuery : ControlParental.App.UI.IUIMessage
-            where TResponse : class, ControlParental.App.UI.IUIMessage
+            where TQuery : ControlParental.Domain.IUIMessage
+            where TResponse : class, ControlParental.Domain.IUIMessage
         {
             // Match by runtime type name to sidestep the Domain/App.UI
             // record duplication (both namespaces define GetEnforcementLevel).
@@ -197,7 +197,7 @@ public sealed class ServiceEnforcementLevelMonitorTests
         }
 
         public Task SendAsync<T>(T message, CancellationToken ct = default)
-            where T : ControlParental.App.UI.IUIMessage
+            where T : ControlParental.Domain.IUIMessage
         {
             this.sent.Enqueue(message!);
             return Task.CompletedTask;

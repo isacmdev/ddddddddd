@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "startedAtUtc": "2026-08-11T14:34:54.0967998+00:00",
+  "finishedAtUtc": "2026-08-11T14:35:24.827549+00:00",
+  "environment": {
+    "os": "Microsoft Windows 10.0.26200",
+    "runtime": ".NET 9.0.18",
+    "architecture": "X64",
+    "processorCount": 12,
+    "stopwatchFrequency": 10000000,
+    "commit": "90a5a2a44299d99b67aff18da2a9182bc167fc75",
+    "worktreeContext": "104 modified/untracked entries; cleanliness is not assumed"
+  },
+  "command": "$env:CONTROL_PARENTAL_PERFORMANCE_EVIDENCE=\u003Cabsolute-change-root\u003E/performance-evidence.json; dotnet test tests/ControlParental.Service.Tests/ControlParental.Service.Tests.csproj --no-restore --no-build --filter FullyQualifiedName~SessionCoordinatorPerformanceEvidenceTests --verbosity minimal --blame-hang --blame-hang-timeout 60s",
+  "exitCode": 0,
+  "parameters": {
+    "executorTimeoutSeconds": 120,
+    "testHostHangTimeoutSeconds": 60,
+    "repetitions": 3,
+    "allocationWarmup": 2000,
+    "allocationSamples": 20000,
+    "latencyWarmup": 500,
+    "latencySamples": 2000,
+    "queueCapacity": 256,
+    "queueRepetitions": 2,
+    "timerPeriodMs": 1000,
+    "timerSamples": 10
+  },
+  "methodology": {
+    "allocations": "Production SessionSafetyLoop unchanged-decision ticks; loop setup and warmup precede forced GC and the measured window; GC total allocated bytes divided by fully processed ticks.",
+    "queue": "A running item is gated, exactly 256 critical items are admitted, and the next producer must block. The load is drained and repeated on a fresh coordinator.",
+    "timer": "Task.Delay periodic strategy equivalent to production is measured with monotonic Stopwatch timestamps; drift is actual interval minus requested period.",
+    "latency": "End-to-end time starts before SessionSafetyLoop.Tick and ends when its coordinator is idle after the unchanged O(1) decision; continuous sequential load and warmup are finite."
+  },
+  "allocationsBytesPerEvent": [
+    {
+      "SampleSize": 20000,
+      "P50": 784.9596,
+      "P95": 784.9596,
+      "Maximum": 784.9596
+    },
+    {
+      "SampleSize": 20000,
+      "P50": 784.0256,
+      "P95": 784.0256,
+      "Maximum": 784.0256
+    },
+    {
+      "SampleSize": 20000,
+      "P50": 784.04,
+      "P95": 784.04,
+      "Maximum": 784.04
+    }
+  ],
+  "queue": [
+    {
+      "HighWater": 256,
+      "ExtraProducerBlocked": true,
+      "Drained": true
+    },
+    {
+      "HighWater": 256,
+      "ExtraProducerBlocked": true,
+      "Drained": true
+    }
+  ],
+  "timerDriftMicroseconds": [
+    {
+      "SampleSize": 10,
+      "P50": 10161.4,
+      "P95": 15745.5,
+      "Maximum": 15745.5
+    },
+    {
+      "SampleSize": 10,
+      "P50": 2367.9,
+      "P95": 15738.7,
+      "Maximum": 15738.7
+    },
+    {
+      "SampleSize": 10,
+      "P50": 7143.2,
+      "P95": 15884.8,
+      "Maximum": 15884.8
+    }
+  ],
+  "processingLatencyMicroseconds": [
+    {
+      "SampleSize": 2000,
+      "P50": 5.3,
+      "P95": 7.7,
+      "Maximum": 172.8
+    },
+    {
+      "SampleSize": 2000,
+      "P50": 2.3,
+      "P95": 3.6,
+      "Maximum": 12.3
+    },
+    {
+      "SampleSize": 2000,
+      "P50": 2.2,
+      "P95": 2.9,
+      "Maximum": 9.5
+    }
+  ],
+  "summary": {
+    "bytesPerEventMedianOfRuns": 784.04,
+    "queueHighWaterMaximum": 256,
+    "timerDriftP50": 8694,
+    "timerDriftP95": 15745.5,
+    "timerDriftMaximum": 15884.8,
+    "processingLatencyP50": 2.5,
+    "processingLatencyP95": 6.5,
+    "processingLatencyMaximum": 172.8
+  }
+}

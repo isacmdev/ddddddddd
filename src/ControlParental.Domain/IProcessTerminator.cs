@@ -19,6 +19,10 @@ public interface IProcessTerminator
     /// <returns>True si el proceso fue terminado exitosamente.</returns>
     Task<bool> TerminateAsync(string appId, string reason, CancellationToken cancellationToken = default);
 
+    Task<ActionStatus> TerminateAsync(
+        ObservedProcessTarget target,
+        CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Verifica si un AppId puede ser terminado (no es proceso del sistema).
     /// </summary>

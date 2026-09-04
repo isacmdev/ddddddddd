@@ -50,6 +50,79 @@ public class ProgramBackupArgsTests
         result.Should().BeFalse();
         mode.Should().Be(default(BackupMode));
     }
+
+    [Fact]
+    public void TryParseBackupMode_WithMultipleModes_ReturnsFalse()
+    {
+        var result = Program.TryParseBackupMode(
+            new[] { "--backup-heartbeat", "--backup-outbox" },
+            out var mode);
+
+        result.Should().BeFalse();
+        mode.Should().Be(default(BackupMode));
+    }
+
+    [Fact]
+    public void TryParseBackupMode_WithAmbiguousArguments_ReturnsFalse()
+    {
+        foreach (var args in new[]
+        {
+            new[] { "--backup-heartbeat", "normal" },
+            new[] { "--backup-heartbeat", "--backup-heartbeat" },
+            new[] { "--backup-outbox", "--backup-reconcile" },
+        })
+        {
+            Program.TryParseBackupMode(args, out var mode).Should().BeFalse();
+            mode.Should().Be(default(BackupMode));
+        }
+    }
+
+    [Fact]
+    public void NormalArgumentsDoNotSelectBackupMode()
+    {
+        Program.TryParseBackupMode(new[] { "--service" }, out _).Should().BeFalse();
+    }
+
+    [Fact]
+    public void AmbiguousBackupArguments_AreRejectedByTheProductionAdmissionGate()
+    {
+        var accepted = Program.TryParseBackupRequest(
+            new[] { "--backup-heartbeat", "--backup-outbox" },
+            out var isBackupMode,
+            out var mode);
+
+        accepted.Should().BeFalse();
+        isBackupMode.Should().BeFalse();
+        mode.Should().Be(default(BackupMode));
+    }
+
+    [Fact]
+    public async Task Main_WithAmbiguousBackupArguments_RejectsBeforeCompositionBoundary()
+    {
+        var compositionStarted = false;
+
+        await Program.RunMainAsync(
+            new[] { "--backup-heartbeat", "--backup-outbox" },
+            () => compositionStarted = true);
+
+        compositionStarted.Should().BeFalse();
+    }
+
+
+    [Theory]
+    [InlineData(new[] { "--backup-outbox" }, true, true)]
+    [InlineData(new[] { "--service" }, true, false)]
+    [InlineData(new[] { "--backup-outbox", "--backup-heartbeat" }, false, false)]
+    public void TryParseBackupRequest_SeparatesInvalidAndNormalRequests(
+        string[] args,
+        bool expectedValid,
+        bool expectedBackup)
+    {
+        var result = Program.TryParseBackupRequest(args, out var isBackupMode, out _);
+
+        result.Should().Be(expectedValid);
+        isBackupMode.Should().Be(expectedBackup);
+    }
 }
 
 /// <summary>

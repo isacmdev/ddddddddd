@@ -4,10 +4,10 @@
 
 namespace ControlParental.Service;
 
-using System.Net;
 using System.Net.Http;
 using System.Net.Security;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using ControlParental.Domain;
 
@@ -16,15 +16,20 @@ using ControlParental.Domain;
 /// </summary>
 public sealed class CertificatePinningPolicy : ITlsPolicy
 {
-    private readonly string? certPin;
+    private const int Sha256Bytes = 32;
+    private const int MaximumRotatingPins = 2;
+    private readonly HashSet<string> certPins;
+    private readonly Func<DateTimeOffset> utcNow;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="CertificatePinningPolicy"/> class.
     /// </summary>
-    /// <param name="certPin">Optional SPKI pin (Base64 SHA-256 of the certificate's SubjectPublicKeyInfo).</param>
-    public CertificatePinningPolicy(string? certPin = null)
+    /// <param name="certPins">Optional semicolon-delimited current and next SPKI pins.</param>
+    /// <param name="utcNow">Clock used for explicit certificate-validity checks.</param>
+    public CertificatePinningPolicy(string? certPins = null, Func<DateTimeOffset>? utcNow = null)
     {
-        this.certPin = certPin;
+        this.certPins = ParsePins(certPins);
+        this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     /// <inheritdoc />
@@ -35,7 +40,8 @@ public sealed class CertificatePinningPolicy : ITlsPolicy
     {
         var handler = new HttpClientHandler
         {
-            SslProtocols = SslProtocols.Tls13,
+            SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            CheckCertificateRevocationList = true,
             ServerCertificateCustomValidationCallback = this.RemoteCertificateValidationCallback,
         };
 
@@ -48,24 +54,74 @@ public sealed class CertificatePinningPolicy : ITlsPolicy
         X509Chain? chain,
         SslPolicyErrors errors)
     {
-        if (certificate == null)
+        if (request.RequestUri is null || request.RequestUri.Scheme != Uri.UriSchemeHttps)
         {
-            return this.certPin == null;
+            return false;
         }
 
-        if (string.IsNullOrWhiteSpace(this.certPin))
+        if (certificate is null || errors != SslPolicyErrors.None)
         {
-            return errors == SslPolicyErrors.None;
+            return false;
+        }
+
+        var now = this.utcNow().UtcDateTime;
+        if (now < certificate.NotBefore.ToUniversalTime() || now > certificate.NotAfter.ToUniversalTime())
+        {
+            return false;
+        }
+
+        if (this.certPins.Count == 0)
+        {
+            return true;
         }
 
         try
         {
-            _ = CertificatePinningValidator.Validate(this.certPin, certificate);
-            return true;
+            var computedPin = CertificatePinningValidator.CalculateSpkiPin(certificate);
+            return this.certPins.Contains(computedPin);
         }
-        catch (CertificatePinValidationException)
+        catch (CryptographicException)
         {
             return false;
         }
+    }
+
+    private static HashSet<string> ParsePins(string? configuredPins)
+    {
+        var pins = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(configuredPins))
+        {
+            return pins;
+        }
+
+        var candidates = configuredPins.Split(
+            ';',
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (candidates.Length is < 1 or > MaximumRotatingPins)
+        {
+            throw new ArgumentException("TLS pin configuration must contain one or two pins.", nameof(configuredPins));
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var normalizedCandidate = candidate.StartsWith("sha256/", StringComparison.Ordinal)
+                ? candidate[7..]
+                : candidate;
+            try
+            {
+                if (Convert.FromBase64String(normalizedCandidate).Length != Sha256Bytes)
+                {
+                    throw new ArgumentException("TLS pin configuration is invalid.", nameof(configuredPins));
+                }
+            }
+            catch (FormatException exception)
+            {
+                throw new ArgumentException("TLS pin configuration is invalid.", nameof(configuredPins), exception);
+            }
+
+            _ = pins.Add(normalizedCandidate);
+        }
+
+        return pins;
     }
 }

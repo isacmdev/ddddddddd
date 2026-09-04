@@ -27,7 +27,7 @@ public class HostRegistrationTests
     {
         string source = ReadProgramSource();
 
-        int occurrences = CountOccurrences(source, "AddSingleton<NamedPipeUIServer>();");
+        int occurrences = CountOccurrences(source, "AddSingleton<NamedPipeUIServer>(");
 
         occurrences.Should().Be(1,
             "NamedPipeUIServer must be registered exactly once so the UI pipe has a single ACL-authoritative instance.");
@@ -75,6 +75,24 @@ public class HostRegistrationTests
 
         occurrences.Should().Be(1,
             "NamedPipeUIServerHostedAdapter must be registered exactly once as the hosted lifecycle owner for the UI pipe.");
+    }
+
+    [Fact]
+    public void ProgramCs_RegistersDurableWnsCoordinatorAndReconciliation_ExactlyOnce()
+    {
+        string source = ReadProgramSource();
+
+        CountOccurrences(source, "AddSingleton<IWnsRegistrationCoordinator>(").Should().Be(1);
+        CountOccurrences(source, "AddHostedService<WnsRegistrationReconciliationService>();").Should().Be(1);
+    }
+
+    [Fact]
+    public void ProgramCs_DoesNotRegisterLegacyWnsOwners()
+    {
+        string source = ReadProgramSource();
+
+        source.Should().NotContain("AddSingleton<IPushNotificationService>");
+        source.Should().NotContain("AddHostedService<WnsNotificationServiceHostedAdapter>();");
     }
 
     [Fact]

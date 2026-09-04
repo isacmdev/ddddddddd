@@ -8,26 +8,8 @@ using ControlParental.Domain;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
-public class OutboxManagerTests : IDisposable
+public sealed class OutboxManagerTests : OutboxManagerTestFixture
 {
-    private readonly ControlParentalDbContext db;
-    private readonly OutboxManager manager;
-
-    public OutboxManagerTests()
-    {
-        var options = new DbContextOptionsBuilder<ControlParentalDbContext>()
-            .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
-            .Options;
-
-        this.db = new ControlParentalDbContext(options);
-        this.manager = new OutboxManager(this.db);
-    }
-
-    public void Dispose()
-    {
-        this.db.Dispose();
-    }
-
     [Fact]
     public async Task EnqueueAsync_ValidPayload_EnqueuesEntry()
     {
@@ -47,6 +29,7 @@ public class OutboxManagerTests : IDisposable
         Assert.Contains("test", entry.PayloadJson);
         Assert.Equal(dedupKey, entry.DedupKey);
         Assert.Equal(0, entry.Attempts);
+        Assert.Equal(FixedNow, entry.CreatedAt);
     }
 
     [Fact]
@@ -63,9 +46,9 @@ public class OutboxManagerTests : IDisposable
         // like SQLite, but the manager handles gracefully
         await this.manager.EnqueueAsync("usage_logs", payload, dedupKey);
 
-        // Assert - both entries exist in InMemory (duplicate key only enforced in SQLite)
+        // Assert - SQLite enforces the unique key and the manager keeps the first row
         var count = await this.db.Outbox.CountAsync();
-        Assert.Equal(2, count);
+        Assert.Equal(1, count);
     }
 
     [Fact]
@@ -73,9 +56,9 @@ public class OutboxManagerTests : IDisposable
     {
         // Arrange
         await this.db.Outbox.AddRangeAsync(
-            new OutboxDbEntity { EventType = "a", PayloadJson = "{}", DedupKey = "k1", CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2) },
-            new OutboxDbEntity { EventType = "b", PayloadJson = "{}", DedupKey = "k2", CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1) },
-            new OutboxDbEntity { EventType = "c", PayloadJson = "{}", DedupKey = "k3", CreatedAt = DateTimeOffset.UtcNow });
+            new OutboxDbEntity { EventType = "a", PayloadJson = "{}", DedupKey = "k1", CreatedAt = FixedNow.AddMinutes(-2) },
+            new OutboxDbEntity { EventType = "b", PayloadJson = "{}", DedupKey = "k2", CreatedAt = FixedNow.AddMinutes(-1) },
+            new OutboxDbEntity { EventType = "c", PayloadJson = "{}", DedupKey = "k3", CreatedAt = FixedNow });
         await this.db.SaveChangesAsync();
 
         // Act
@@ -99,7 +82,7 @@ public class OutboxManagerTests : IDisposable
                 EventType = $"type_{i}",
                 PayloadJson = "{}",
                 DedupKey = $"key_{i}",
-                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(i),
+                CreatedAt = FixedNow.AddMinutes(i),
             });
         }
 
@@ -113,97 +96,6 @@ public class OutboxManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task MarkSentAsync_RemovesEntry()
-    {
-        // Arrange
-        var entry = new OutboxDbEntity
-        {
-            EventType = "test",
-            PayloadJson = "{}",
-            DedupKey = Guid.NewGuid().ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-        };
-        await this.db.Outbox.AddAsync(entry);
-        await this.db.SaveChangesAsync();
-        var entryId = entry.Id;
-
-        // Act
-        await this.manager.MarkSentAsync(entryId);
-
-        // Assert
-        var count = await this.db.Outbox.CountAsync();
-        Assert.Equal(0, count);
-    }
-
-    [Fact]
-    public async Task MarkSentAsync_NonExistentId_DoesNotThrow()
-    {
-        // Act & Assert — should not throw
-        await this.manager.MarkSentAsync(99999);
-    }
-
-    [Fact]
-    public async Task MarkFailedAsync_IncrementsAttempts()
-    {
-        // Arrange
-        var entry = new OutboxDbEntity
-        {
-            EventType = "test",
-            PayloadJson = "{}",
-            DedupKey = Guid.NewGuid().ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-            Attempts = 0,
-        };
-        await this.db.Outbox.AddAsync(entry);
-        await this.db.SaveChangesAsync();
-        var entryId = entry.Id;
-
-        // Act
-        await this.manager.MarkFailedAsync(entryId, "Network error");
-
-        // Assert
-        var updated = await this.db.Outbox.FindAsync(entryId);
-        Assert.NotNull(updated);
-        Assert.Equal(1, updated.Attempts);
-        Assert.Equal("Network error", updated.LastError);
-        Assert.NotNull(updated.LastAttemptAt);
-    }
-
-    [Fact]
-    public async Task MarkFailedAsync_TruncatesLongError()
-    {
-        // Arrange
-        var entry = new OutboxDbEntity
-        {
-            EventType = "test",
-            PayloadJson = "{}",
-            DedupKey = Guid.NewGuid().ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-            Attempts = 0,
-        };
-        await this.db.Outbox.AddAsync(entry);
-        await this.db.SaveChangesAsync();
-        var entryId = entry.Id;
-
-        var longError = new string('x', 600);
-
-        // Act
-        await this.manager.MarkFailedAsync(entryId, longError);
-
-        // Assert
-        var updated = await this.db.Outbox.FindAsync(entryId);
-        Assert.NotNull(updated);
-        Assert.Equal(500, updated.LastError!.Length);
-    }
-
-    [Fact]
-    public async Task MarkFailedAsync_NonExistentId_DoesNotThrow()
-    {
-        // Act & Assert — should not throw
-        await this.manager.MarkFailedAsync(99999, "error");
-    }
-
-    [Fact]
     public async Task GetPendingCountAsync_ReturnsCorrectCount()
     {
         // Arrange
@@ -214,7 +106,7 @@ public class OutboxManagerTests : IDisposable
                 EventType = $"type_{i}",
                 PayloadJson = "{}",
                 DedupKey = $"key_{i}",
-                CreatedAt = DateTimeOffset.UtcNow,
+                CreatedAt = FixedNow,
             });
         }
 
@@ -231,7 +123,7 @@ public class OutboxManagerTests : IDisposable
     public async Task EnqueueIntegrityNotificationAsync_CreatesEntryWithCorrectPayload()
     {
         // Arrange
-        var timestamp = DateTimeOffset.UtcNow;
+        var timestamp = FixedNow;
         var notificationType = "integrity_warning";
         var title = "Test Title";
         var body = "Test Body";
@@ -249,7 +141,42 @@ public class OutboxManagerTests : IDisposable
         Assert.Contains("integrity_warning", entry.PayloadJson);
         Assert.Contains("Test Title", entry.PayloadJson);
         Assert.Contains("Test Body", entry.PayloadJson);
-        Assert.StartsWith("integrity_", entry.DedupKey);
+        Assert.Equal($"integrity_integrity_warning_{timestamp.ToUnixTimeMilliseconds()}", entry.DedupKey);
+    }
+
+    [Fact]
+    public async Task EnqueueIntegrityNotificationAsync_ExplicitKeyIsPersistedVerbatim()
+    {
+        var key = "integrity/device-a/integrity-binary/8/13/notification";
+
+        await this.manager.EnqueueIntegrityNotificationAsync(
+            "integrity_degrade_pending",
+            "Test Title",
+            "Test Body",
+            FixedNow,
+            key,
+            CancellationToken.None);
+
+        var entry = (await this.manager.GetPendingEntriesAsync()).Single();
+        Assert.Equal(key, entry.DedupKey);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task EnqueueIntegrityNotificationAsync_ExplicitKeyRejectsNullOrEmptyBeforePersistence(string? key)
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() => this.manager.EnqueueIntegrityNotificationAsync(
+            "integrity_warning", "Test Title", "Test Body", FixedNow, key!, CancellationToken.None));
+        Assert.Empty(await this.manager.GetPendingEntriesAsync());
+    }
+
+    [Fact]
+    public async Task EnqueueIntegrityNotificationAsync_LegacyFiveArgumentDefaultBindsLegacyOverload()
+    {
+        await this.manager.EnqueueIntegrityNotificationAsync("integrity_warning", "Test Title", "Test Body", FixedNow, default);
+        var entry = Assert.Single(await this.manager.GetPendingEntriesAsync());
+        Assert.Equal($"integrity_integrity_warning_{FixedNow.ToUnixTimeMilliseconds()}", entry.DedupKey);
     }
 
     [Fact]
@@ -276,27 +203,4 @@ public class OutboxManagerTests : IDisposable
         Assert.Empty(entries);
     }
 
-    [Fact]
-    public async Task MarkSentAsync_AfterMarkFailed_EntriesHaveCorrectAttempts()
-    {
-        // Arrange
-        var entry = new OutboxDbEntity
-        {
-            EventType = "test",
-            PayloadJson = "{}",
-            DedupKey = Guid.NewGuid().ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-            Attempts = 2,
-        };
-        await this.db.Outbox.AddAsync(entry);
-        await this.db.SaveChangesAsync();
-        var entryId = entry.Id;
-
-        // Act
-        await this.manager.MarkSentAsync(entryId);
-
-        // Assert
-        var count = await this.db.Outbox.CountAsync();
-        Assert.Equal(0, count);
-    }
 }

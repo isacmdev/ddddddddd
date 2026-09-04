@@ -17,6 +17,10 @@ public sealed class WorkstationLockManager : IWorkstationLockManager
     // ── Dependencies ────────────────────────────────────────────────────
 
     private IIpcChannel? ipcChannel;
+    private Func<AgentCommandEnvelope, CancellationToken, ValueTask<AgentActionResult>>? commandExecutor;
+    private int sessionId;
+    private long generation;
+    private long intentVersion;
 
     // ── State ──────────────────────────────────────────────────────────
 
@@ -77,30 +81,47 @@ public sealed class WorkstationLockManager : IWorkstationLockManager
 
         try
         {
-            // Check if IPC is connected
-            if (this.ipcChannel == null || !this.ipcChannel.IsConnected)
+            Func<AgentCommandEnvelope, CancellationToken, ValueTask<AgentActionResult>>? executor;
+            int currentSession;
+            long currentGeneration;
+            lock (this.lockObj)
             {
-                Debug.WriteLine("[WorkstationLockManager] IPC not connected, cannot lock.");
-                this.RecordResult(LockResult.Failed(timestamp, "IPC not connected"));
+                executor = this.commandExecutor;
+                currentSession = this.sessionId;
+                currentGeneration = this.generation;
+            }
+
+            if (executor is null)
+            {
+                this.RecordResult(LockResult.Failed(
+                    timestamp, "Typed command authority not connected", ActionStatus.InvalidState));
                 return false;
             }
 
-            // Send LockWorkstation command to the agent
-            var lockCommand = new LockWorkstation();
-            await this.ipcChannel.SendAsync(lockCommand, cancellationToken);
+            var command = new AgentCommandEnvelope(
+                Guid.NewGuid(), currentSession, currentGeneration,
+                Interlocked.Increment(ref this.intentVersion), AgentCommandKind.LockWorkstation,
+                timestamp.AddSeconds(LockTimeoutSeconds));
+            var result = await executor(command, cancellationToken);
+            var correlated = result.CommandId == command.CommandId &&
+                result.SessionId == command.SessionId &&
+                result.ConnectionGeneration == command.ConnectionGeneration &&
+                result.IntentVersion == command.IntentVersion;
+            if (correlated && result.Status == ActionStatus.Confirmed)
+            {
+                this.RecordResult(LockResult.Succeeded(timestamp));
+                return true;
+            }
 
-            Debug.WriteLine("[WorkstationLockManager] LockWorkstation command sent to agent.");
-
-            // Note: We don't wait for confirmation from the agent
-            // The agent executes LockWorkStation() and the OS handles it
-            // Success means the command was sent, not that the station is locked
-            this.RecordResult(LockResult.Succeeded(timestamp));
-            return true;
+            var status = correlated ? result.Status : ActionStatus.Stale;
+            this.RecordResult(LockResult.Failed(
+                timestamp, $"Workstation lock was not confirmed: {status}", status));
+            return false;
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"[WorkstationLockManager] Failed to send lock command: {ex.Message}");
-            this.RecordResult(LockResult.Failed(timestamp, ex.Message));
+            this.RecordResult(LockResult.Failed(timestamp, ex.Message, ActionStatus.NativeFailure));
             return false;
         }
         finally
@@ -128,6 +149,21 @@ public sealed class WorkstationLockManager : IWorkstationLockManager
     public void SetIpcChannel(IIpcChannel channel)
     {
         this.ipcChannel = channel;
+    }
+
+    public void SetCommandExecutor(
+        int sessionId,
+        long generation,
+        Func<AgentCommandEnvelope, CancellationToken, ValueTask<AgentActionResult>> executor)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(sessionId);
+        ArgumentNullException.ThrowIfNull(executor);
+        lock (this.lockObj)
+        {
+            this.sessionId = sessionId;
+            this.generation = generation;
+            this.commandExecutor = executor;
+        }
     }
 
     // ── Private Methods ───────────────────────────────────────────────

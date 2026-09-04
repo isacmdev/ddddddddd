@@ -1,0 +1,30 @@
+<Page
+    x:Class="ControlParental.App.UI.WnsRegistrationPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Padding="24">
+        <StackPanel MaxWidth="600" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+            <TextBlock Text="Register notifications" FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="Notifications are registered through the protection Service." TextWrapping="Wrap" />
+            <TextBlock
+                AutomationProperties.AutomationId="WnsRegistrationStatus"
+                AutomationProperties.Name="{Binding StatusText}"
+                AutomationProperties.HelpText="Registration status"
+                Text="{Binding StatusText}"
+                TextWrapping="Wrap" />
+            <Grid
+                AutomationProperties.AutomationId="WnsRegistrationProgress"
+                AutomationProperties.Name="Registration in progress"
+                Visibility="Visible">
+                <ProgressRing IsActive="{Binding IsBusy}" />
+            </Grid>
+            <Button
+                x:Name="RegisterButton"
+                AutomationProperties.AutomationId="WnsRegistrationButton"
+                AutomationProperties.Name="Register notifications"
+                Content="Register notifications"
+                IsEnabled="{Binding CanRegister}"
+                Click="OnRegisterClick" />
+        </StackPanel>
+    </Grid>
+</Page>

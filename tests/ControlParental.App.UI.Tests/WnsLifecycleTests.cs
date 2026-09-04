@@ -7,6 +7,7 @@ namespace ControlParental.App.UI.Tests;
 using System.Text;
 using System.Text.Json;
 using ControlParental.App.UI;
+using ControlParental.App.UI.Interop;
 using ControlParental.Domain;
 using Xunit;
 
@@ -136,26 +137,157 @@ public class WnsLifecycleTests
     }
 
     [Fact]
-    public async Task HandleRawNotificationAsyncWithMalformedPayloadEmitsTypedTriggerSync()
+    public async Task RegisterChannelAsync_SendsRegisterWnsChannelOverTypedServiceIpc()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+        var expiresAt = new DateTimeOffset(2026, 8, 22, 0, 0, 0, TimeSpan.Zero);
+        var expected = new WnsRegistrationResult("operation", WnsRegistrationStatus.Accepted, "correlation");
+        channel.QueryResult = expected;
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            expiresAt,
+            CancellationToken.None);
+
+        Assert.Same(expected, result);
+        var message = Assert.IsType<RegisterWnsChannel>(channel.Messages.Single());
+        Assert.Equal("https://db3p.notify.windows.com/?token=abc", message.ChannelUri);
+        Assert.Equal("wns", message.Channel);
+        Assert.Equal(expiresAt, message.ExpiresAt);
+        Assert.False(string.IsNullOrWhiteSpace(message.OperationId));
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_ServiceUnavailable_FailsClosedWithoutBackendFallback()
+    {
+        var channel = new RecordingUIChannel
+        {
+            SendException = new InvalidOperationException("Service unavailable."),
+        };
+        var sut = new WnsPushNotificationHandler(channel);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None));
+
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Theory]
+    [InlineData(WnsRegistrationStatus.Denied)]
+    [InlineData(WnsRegistrationStatus.Retryable)]
+    public async Task RegisterChannelAsync_PreservesTypedNonAcceptedResultWithoutRetry(WnsRegistrationStatus status)
+    {
+        var channel = new RecordingUIChannel
+        {
+            QueryResult = new WnsRegistrationResult("operation", status, "correlation"),
+        };
+        var sut = new WnsPushNotificationHandler(channel);
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        Assert.Equal(channel.QueryResult, result);
+        Assert.Equal(status, result!.Status);
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_NullResultFailsClosedWithoutFallback()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        var result = await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Single(channel.Messages);
+        Assert.Empty(channel.SentMessages);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_SeparateInvocationsUseDistinctOperationIds()
+    {
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+        await sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            CancellationToken.None);
+
+        var requests = channel.Messages.Cast<RegisterWnsChannel>().ToArray();
+        Assert.Equal(2, requests.Length);
+        Assert.All(requests, request => Assert.False(string.IsNullOrWhiteSpace(request.OperationId)));
+        Assert.NotEqual(requests[0].OperationId, requests[1].OperationId);
+    }
+
+    [Fact]
+    public async Task RegisterChannelAsync_PropagatesCancellationToTypedServiceIpc()
+    {
+        using var cts = new CancellationTokenSource();
+        var channel = new RecordingUIChannel();
+        var sut = new WnsPushNotificationHandler(channel);
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sut.RegisterChannelAsync(
+            "https://db3p.notify.windows.com/?token=abc",
+            DateTimeOffset.UtcNow.AddDays(1),
+            cts.Token));
+
+            Assert.Equal(cts.Token, channel.CancellationToken);
+    }
+
+    [Fact]
+    public async Task HandleRawNotificationAsyncWithMalformedPayloadDoesNotEmitTriggerSync()
     {
         var malformedPayload = Encoding.UTF8.GetBytes("{not-json");
 
         var json = await CaptureTriggerSyncJsonAsync(malformedPayload).ConfigureAwait(false);
 
-        AssertTriggerSync(json);
+        Assert.Null(json);
     }
 
     [Fact]
     public async Task HandleRawNotificationAsyncWithValidPayloadEmitsTypedTriggerSync()
     {
-        var validPayload = Encoding.UTF8.GetBytes("{\"event\":\"sync\",\"version\":42}");
+        var validPayload = Encoding.UTF8.GetBytes("{\"contract\":\"control-parental.windows\",\"version\":1,\"message_type\":\"wns.hint\",\"correlation_id\":\"00000000-0000-4000-8000-000000000001\",\"payload\":{\"hint_type\":\"sync\"}}");
 
         var json = await CaptureTriggerSyncJsonAsync(validPayload).ConfigureAwait(false);
 
-        AssertTriggerSync(json);
+        Assert.NotNull(json);
+        AssertTriggerSync(json!);
     }
 
-    private static async Task<string> CaptureTriggerSyncJsonAsync(ReadOnlyMemory<byte> rawPayload)
+    [Fact(DisplayName = "CT-11 productive WNS seam accepts the 1024-byte hint and rejects the 1025-byte hint")]
+    [Trait("ContractTest", "CT-11")]
+    public async Task CT11_ProductiveWnsSeamAcceptsOnlyBoundedHints()
+    {
+        var valid = await CaptureTriggerSyncJsonAsync(
+            Encoding.UTF8.GetBytes(ReadFixture("valid-hint-1024.json"))).ConfigureAwait(false);
+        var oversized = await CaptureTriggerSyncJsonAsync(
+            Encoding.UTF8.GetBytes(ReadFixture("invalid-hint-1025.json"))).ConfigureAwait(false);
+
+        Assert.NotNull(valid);
+        AssertTriggerSync(valid!);
+        Assert.Null(oversized);
+    }
+
+    private static async Task<string?> CaptureTriggerSyncJsonAsync(ReadOnlyMemory<byte> rawPayload)
     {
         var capturedJson = string.Empty;
         var signalTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -176,10 +308,39 @@ public class WnsLifecycleTests
         var completedTask = await Task.WhenAny(signalTcs.Task, Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token)).ConfigureAwait(false);
         if (completedTask != signalTcs.Task)
         {
-            throw new TimeoutException("Timed out waiting for TriggerSync serialization capture.");
+            return null;
         }
 
         return capturedJson;
+    }
+
+    private static string ReadFixture(string fixture)
+    {
+        var root = RepositoryRootLocator.Locate(typeof(WnsLifecycleTests));
+        return File.ReadAllText(
+            Path.Combine(root, "openspec", "changes", "shared-contracts-freeze", "fixtures", fixture),
+            Encoding.UTF8);
+    }
+
+    [Fact]
+    public void ExtractRawPayload_ConsumesByteArrayPayloadProperty()
+    {
+        var payload = new byte[] { 1, 2, 3 };
+        var args = new FakeWnsEventArgs(payload);
+        var method = typeof(WnsPushNotificationHandler).GetMethod(
+            "ExtractRawPayload",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+
+        Assert.NotNull(method);
+        var result = (ReadOnlyMemory<byte>)method!.Invoke(null, new object[] { args })!;
+
+        Assert.Equal(payload, result.ToArray());
+    }
+
+    private sealed class FakeWnsEventArgs
+    {
+        public FakeWnsEventArgs(byte[] payload) => this.Payload = payload;
+        public byte[] Payload { get; }
     }
 
     [Fact]
@@ -206,5 +367,48 @@ public class WnsLifecycleTests
 
         Assert.NotNull(message);
         Assert.Equal(nameof(TriggerSync), message!.MessageType);
+    }
+
+    private sealed class RecordingUIChannel : IUIChannel
+    {
+        public List<object> Messages { get; } = new();
+
+        public List<object> SentMessages { get; } = new();
+
+        public Exception? SendException { get; init; }
+
+        public WnsRegistrationResult? QueryResult { get; set; }
+
+        public CancellationToken CancellationToken { get; private set; }
+
+        public Task<TResponse?> QueryAsync<TQuery, TResponse>(TQuery query, CancellationToken ct = default)
+            where TQuery : ControlParental.Domain.IUIMessage
+            where TResponse : class, ControlParental.Domain.IUIMessage
+        {
+            this.CancellationToken = ct;
+            this.Messages.Add(query);
+            if (ct.IsCancellationRequested)
+            {
+                return Task.FromCanceled<TResponse?>(ct);
+            }
+
+            return this.SendException is null
+                ? Task.FromResult(this.QueryResult as TResponse)
+                : Task.FromException<TResponse?>(this.SendException);
+        }
+
+        public Task SendAsync<T>(T message, CancellationToken ct = default)
+            where T : ControlParental.Domain.IUIMessage
+        {
+            this.CancellationToken = ct;
+            this.Messages.Add(message);
+            this.SentMessages.Add(message);
+            if (ct.IsCancellationRequested)
+            {
+                return Task.FromCanceled(ct);
+            }
+
+            return this.SendException is null ? Task.CompletedTask : Task.FromException(this.SendException);
+        }
     }
 }

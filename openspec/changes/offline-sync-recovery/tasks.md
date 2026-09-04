@@ -1,0 +1,59 @@
+# Tasks: Offline Sync Recovery
+
+## Review Workload Forecast
+
+| Field | Value |
+|---|---|
+| Estimated changed lines | 1,300–1,700 additions/deletions; task 2.2 is 520–700 touched CODE+TEST lines |
+| 400-line budget risk | High |
+| Chained PRs recommended | Yes |
+| Suggested split | PR1A claim admission; PR1B1 completion/failure; PR1B2a recovery; PR1B2b bridge; PR1C schema; PR2 coordinator/REST; PR3 reconciliation/backup; PR4 evidence |
+| Delivery strategy | exception-ok within feature-branch-chain |
+| Chain strategy | feature-branch-chain |
+| Maintainer cap / exception | 800 touched CODE+TEST lines per work unit; `size:exception` accepted for 401–800; no further decision needed |
+
+Decision needed before apply: No
+Chained PRs recommended: Yes
+Chain strategy: feature-branch-chain
+400-line budget risk: High
+
+## Governance / Closure Criterion
+
+The audited baseline commit `7b74a0a4b6430610b344cea0afa9da7493e1a084` is the accepted SDD6 foundation anchor for tasks 1.1A, 1.1B1, 1.1B2a, and 1.1B2b. Existing green behavior/runtime/coverage evidence is sufficient for closure of those four tasks once the fresh current foundation-focused green gate passes. Missing historical standalone RED and per-unit immutable pre-baseline diffs remain explicit warnings and MUST NOT be fabricated; they are no longer blockers under this governance decision. This does not relax strict TDD, feature-branch-chain, real-worktree, behavioral verification, or ≤800-line requirements for post-baseline units.
+
+**Current gate status (2026-08-20):** Foundation implementation evidence is green in the preserved apply history. The fresh combined foundation suite passed 28, the scheduler suite passed 89, and the Domain suite passed 97 after minimal locked restore/build asset generation for only `ControlParental.Domain.Tests.csproj`. Task 3.2 remediation has runtime composition evidence, fresh changed-scope coverage, and controlled-mutation discrimination under the user's explicit closure exception. Task 4.1 is independently approved with its narrow historical warning. Final task 4.2 evidence reports 379/390 changed executable lines (97.18%), 107/116 branches (92.24%), focused 315/315, and exactly one full Service regression 1,156/1,156. Current formal count is **11/11**; live backend, unsupported Windows matrix, SDD5, SDD7, and SDD8 remain explicitly pending/not claimed.
+
+### Suggested Work Units
+
+| Unit | Goal | PR | Base / budget |
+|---|---|---|---|
+| 1.1A | Claim admission/fixture | PR1A | tracker; ≤800 lines |
+| 1.1B1 | Conditional completion/failure | PR1B1 | immediate PR1A; ≤800 lines |
+| 1.1B2a | Recovery/restart | PR1B2a | immediate PR1B1; ≤800 lines |
+| 1.1B2b | Bridge/integration | PR1B2b | immediate PR1B2a; ≤800 lines |
+| 1.2 | Schema adoption | PR1C | immediate PR1B2b; ≤800 lines |
+| 2.2 | Coordinator/REST ownership | PR2 | immediate PR1C; 520–700 touched CODE+TEST lines; one autonomous unit, ≤800 |
+| 3–4 | Downstream behavior/evidence | PR3–PR4 | each immediate parent; ≤800 lines |
+
+## Phase 1: Durable Foundation
+
+- [x] 1.1A **RED → minimal GREEN → TRIANGULATE/REFACTOR** in dedicated `tests/ControlParental.Service.Tests/OutboxClaimAdmissionTests.cs` with shared fixture support owned by A: combine contracts/status/entities with real claim admission, eligibility/order-before-`LIMIT`, bounded pages, and concurrent claims in `src/ControlParental.Domain/IOutboxManager.cs`, `OutboxEntryStatus.cs`, `OutboxEntry.cs`, `src/ControlParental.Service/PolicyDbEntity.cs`, `OutboxManager.cs`, and `ControlParentalDbContext.cs`; later children reuse helpers with no double-count. Preserve unrelated pre-existing `OutboxManagerTests.cs` content. Behavior proves invariants; enum/input-only assertions are forbidden.
+- [x] 1.1B1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `tests/ControlParental.Service.Tests/OutboxLifecycleCompletionTests.cs` using 1.1A support: implement conditional complete/fail, reclaim generations/stale guards, mixed outcomes, exhaustion/dead-letter, and parameterized SQL in `src/ControlParental.Service/OutboxManager.cs` and `ControlParentalDbContext.cs`; ≤400 lines.
+- [x] 1.1B2a **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxRecoveryTests.cs`: implement bounded expired recovery, real file-backed restart/no-double-effect, cancellation/busy bound, and transaction rollback in the relevant `OutboxManager.cs`/`ControlParentalDbContext.cs` hunks; ≤400 lines.
+- [x] 1.1B2b **RED → minimal GREEN → TRIANGULATE/REFACTOR** in owned `tests/ControlParental.Service.Tests/OutboxBridgeIntegrationTests.cs`: implement audit/authorized idempotent requeue, redaction, invalid-source guards, and real scheduler success/failure integration in `OutboxManager.cs`, `ScheduledWorkService.cs`, and scheduler tests; keep production-compatible `MarkSentAsync`/`MarkFailedAsync` durable and non-deleting until Unit 2 migrates ownership—never no-op active calls; ≤400 lines.
+- [x] 1.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `tests/ControlParental.Service.Tests/OutboxManagerTests.cs`: test fresh/existing `EnsureCreated`, adoption, schema version/checksum, backfill, defaults/constraints/indexes, restart/rollback; add bootstrap/version wiring and remove invalid migration/snapshot artifacts.
+
+## Phase 2: Delivery and Admission (PR2)
+
+- [x] 2.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `BackendClientTests.cs`, `BackendClientSingleRequestTests.cs`, and `AuthenticatedBackendClientTests.cs`; update `BackendClient.cs`/`IBackendClient.cs` for T10-B identity gating, idempotency, redacted outcomes, bounded transport retry, timeout, and cancellation.
+- [x] 2.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `ScheduledWorkServiceTests.cs`, `ScheduledWorkServiceBackoffDecrementTests.cs`, `ScheduledWorkServiceAsyncDispatchTests.cs`, and `ScheduledWorkServiceIdentityTests.cs`; update `ScheduledWorkService.cs` for one owner, finite backoff/scans, connectivity, non-overlap, lifecycle, and shutdown bounds; remove bridge. Controlled replay evidence is green; cumulative task2.2 delta is 561 touched CODE+TEST lines, under the 800-line cap.
+
+## Phase 3: Restart and Backup Composition (PR3)
+
+- [x] 3.1 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `UsageReconcilerTests.cs`; update `UsageReconciler.cs`/`IUsageReconciler.cs` for bounded cancellable checkpoints, applied markers, restart continuity, duplicate safety, and single-flight.
+- [x] 3.2 **RED → minimal GREEN → TRIANGULATE/REFACTOR** in `TaskSchedulerBackupServiceTests.cs`, `ProgramBackupArgsTests.cs`, and `ProgramHardeningTests.cs`; update backup interfaces/service and `Program.cs` for trigger-only shared admission and lifecycle ordering. Historical final-remediation RED is unrecoverable because the v5 baseline was already green; the user's explicit exception authorizes separately labeled controlled mutation evidence, with all three required mutants killed. Final test-only cleanup removed the process-global `Console.SetError` hook; the updated ambiguous mutant remains killed through the per-call composition observer.
+
+## Phase 4: Final Verification (PR4)
+
+- [x] 4.1 Require each child to have an immutable sequential patch or actual branch/commit diff with exhaustive no-double-count numstat; verify ≤800-line boundaries, security, complexity, concurrency, restart, cancellation, bounds, and branch evidence. Closed with the user's explicit narrow historical exception for only the unrecoverable foundation-terminal → first task-1.2 pre-state link; task-1.2 whole-child numstat remains UNKNOWN under that exception. Corrected totals and committed task-3.2 authority are preserved in the task-4.1 evidence artifacts. Task 4.2 is now closed by its final evidence artifact.
+- [x] 4.2 Report changed-scope line coverage >80% and final evidence; mark live backend, unsupported Windows matrix, SDD5, SDD7, and SDD8 pending—no fabricated runtime claims.

@@ -1,0 +1,1 @@
+{"contract":"control-parental.windows","version":1,"message_type":"set_protected_account.response","correlation_id":"00000000-0000-4000-8000-000000000008","payload":{"operation_id":"00000000-0000-4000-8000-000000000002","status":"accepted","activation_state":"activating","correlation_id":"00000000-0000-4000-8000-000000000008","reason_code":"accepted"}}

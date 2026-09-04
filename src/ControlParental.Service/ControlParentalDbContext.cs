@@ -37,6 +37,9 @@ public sealed class ControlParentalDbContext : DbContext
             entity.HasKey(e => e.DeviceId);
             entity.Property(e => e.DeviceId).HasColumnName("device_id");
             entity.Property(e => e.Version).HasColumnName("version");
+            entity.Property(e => e.SnapshotHash).HasColumnName("snapshot_hash");
+            entity.Property(e => e.IsQuarantined).HasColumnName("is_quarantined");
+            entity.Property(e => e.QuarantineReason).HasColumnName("quarantine_reason");
             entity.Property(e => e.PolicyJson).HasColumnName("policy_json");
             entity.Property(e => e.LastUpdated).HasColumnName("last_updated");
             entity.Property(e => e.CategoryAssignmentsJson).HasColumnName("category_assignments_json");
@@ -91,6 +94,7 @@ public sealed class ControlParentalDbContext : DbContext
             entity.HasKey(e => new { e.AppId, e.ServerDate });
             entity.Property(e => e.AppId).HasColumnName("app_id");
             entity.Property(e => e.ServerDate).HasColumnName("server_date");
+            entity.Property(e => e.ElapsedSeconds).HasColumnName("elapsed_seconds");
             entity.Property(e => e.Minutes).HasColumnName("minutes");
             entity.Property(e => e.LastUpdated).HasColumnName("last_updated");
         });
@@ -108,8 +112,18 @@ public sealed class ControlParentalDbContext : DbContext
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.LastAttemptAt).HasColumnName("last_attempt_at");
             entity.Property(e => e.LastError).HasColumnName("last_error");
+            entity.Property(e => e.Status).HasColumnName("status").HasDefaultValue(OutboxEntryStatus.Pending);
+            entity.Property(e => e.OperationId).HasColumnName("operation_id").HasDefaultValue(string.Empty);
+            entity.Property(e => e.ClaimVersion).HasColumnName("claim_version").HasDefaultValue(0L);
+            entity.Property(e => e.ClaimedUntil).HasColumnName("claimed_until");
+            entity.Property(e => e.NextEligibleAt).HasColumnName("next_eligible_at");
+            entity.Property(e => e.DeadLetteredAt).HasColumnName("dead_lettered_at");
+            entity.Property(e => e.SafeFailureCode).HasColumnName("safe_failure_code");
+            entity.Property(e => e.AuditReference).HasColumnName("audit_reference");
             entity.HasIndex(e => e.DedupKey).IsUnique();
             entity.HasIndex(e => e.CreatedAt);
+            entity.HasIndex(e => new { e.Status, e.NextEligibleAt, e.CreatedAt });
+            entity.HasIndex(e => e.OperationId);
         });
 
         // ── ForegroundEvents (T05/T07) ─────────────────────────────────────
